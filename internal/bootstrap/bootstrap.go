@@ -28,10 +28,14 @@ import (
 	appauth "github.com/jaenster/hoardarr/internal/app/auth"
 	appdeliver "github.com/jaenster/hoardarr/internal/app/deliver"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
+	appextract "github.com/jaenster/hoardarr/internal/app/extract"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
 	adapterfs "github.com/jaenster/hoardarr/internal/adapter/fs"
+	adapterrar "github.com/jaenster/hoardarr/internal/adapter/rar"
+
+	"github.com/jaenster/hoardarr/internal/domain/extract"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
@@ -69,6 +73,7 @@ type App struct {
 	Orchestrator *appdownload.OrchestratorService
 	Verify       *appverify.Service
 	Deliver      *appdeliver.Service
+	Extract      *appextract.Service
 
 	LiveHub *sse.Hub
 
@@ -87,12 +92,20 @@ type BuildOption func(*buildOptions)
 
 type buildOptions struct {
 	nntpDialer nntp.Dialer
+	extractor  extract.Extractor
 }
 
 // WithNNTPDialer overrides the default network dialer used by all
 // NNTP pools. Tests use this to plug in recording / replay wrappers.
 func WithNNTPDialer(d nntp.Dialer) BuildOption {
 	return func(o *buildOptions) { o.nntpDialer = d }
+}
+
+// WithExtractor overrides the RAR-backed extract.Extractor with a
+// substitute. Tests use this to bypass real RAR parsing while still
+// exercising the deliver/extract orchestration flow.
+func WithExtractor(e extract.Extractor) BuildOption {
+	return func(o *buildOptions) { o.extractor = e }
 }
 
 // Build wires the runtime: ensures data directories exist, opens the
@@ -187,6 +200,24 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Logger:        logger,
 	})
 
+	extractRepo := sqlite.NewExtractRepo(db)
+	categoryRepoForExtract := sqlite.NewCategoryRepo(db)
+	extractor := bo.extractor
+	if extractor == nil {
+		extractor = adapterrar.Extractor{}
+	}
+	extractSvc := appextract.New(appextract.ServiceParams{
+		JobRepo:       jobRepo,
+		ExtractRepo:   extractRepo,
+		CategoryRepo:  categoryRepoForExtract,
+		Extractor:     extractor,
+		Bus:           bus,
+		TxManager:     txm,
+		IncompleteDir: cfg.Paths.IncompleteDir,
+		CompleteDir:   cfg.Paths.CompleteDir,
+		Logger:        logger,
+	})
+
 	userRepo := sqlite.NewUserRepo(db)
 	sessionRepo := sqlite.NewSessionRepo(db)
 	hasher := &bcrypt.Hasher{}
@@ -262,6 +293,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Orchestrator:  orch,
 		Verify:        verifySvc,
 		Deliver:       deliverSvc,
+		Extract:       extractSvc,
 		AuthService:   authSvc,
 		SystemService: systemSvc,
 		StartedAt:     startedAt,
@@ -301,6 +333,9 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Deliver.Start(ctx); err != nil {
 		return fmt.Errorf("start deliver: %w", err)
 	}
+	if err := a.Extract.Start(ctx); err != nil {
+		return fmt.Errorf("start extract: %w", err)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -337,6 +372,9 @@ func (a *App) Shutdown() error {
 			if err := a.LiveHub.Close(); err != nil && a.shutdownErr == nil {
 				a.shutdownErr = fmt.Errorf("live hub close: %w", err)
 			}
+		}
+		if err := a.Extract.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("extract stop: %w", err)
 		}
 		if err := a.Deliver.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("deliver stop: %w", err)
