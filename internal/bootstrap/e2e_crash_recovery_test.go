@@ -235,18 +235,33 @@ func (s *gatedStubNNTP) handle(c net.Conn) {
 	// Long deadline so the test exercises the orchestrator's
 	// ctx-cancel-closes-conn path, not the stub timing out.
 	_ = c.SetDeadline(time.Now().Add(20 * time.Second))
-	br := bufio.NewReader(c)
 
 	if _, err := c.Write([]byte("200 hoardarr-gated ready\r\n")); err != nil {
 		return
 	}
 
+	// One reader goroutine owns the bufio.Reader for the lifetime of
+	// the connection. The main switch consumes lines from a channel,
+	// which is how we detect peer close during a gate wait without
+	// touching bufio state from a second goroutine (-race tripwire).
+	lines := make(chan string)
+	go func() {
+		defer close(lines)
+		br := bufio.NewReader(c)
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			lines <- strings.TrimRight(line, "\r\n")
+		}
+	}()
+
 	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
+		cmd, ok := <-lines
+		if !ok {
 			return
 		}
-		cmd := strings.TrimRight(line, "\r\n")
 		switch {
 		case strings.HasPrefix(strings.ToUpper(cmd), "AUTHINFO USER "):
 			_, _ = c.Write([]byte("381 password required\r\n"))
@@ -266,11 +281,18 @@ func (s *gatedStubNNTP) handle(c net.Conn) {
 				_, _ = c.Write([]byte("430 no such article\r\n"))
 				continue
 			}
-			// Wait for the test to release the gate (or for the
-			// connection to die).
+			// Wait for the test to release the gate or for the peer
+			// to drop the connection. lines closing == reader saw
+			// EOF/error, which is exactly the signal we need.
 			select {
 			case <-gate:
-			case <-readerClosedNotify(br):
+			case _, ok := <-lines:
+				if !ok {
+					return
+				}
+				// A real command arrived mid-BODY. NNTP is
+				// request/response so this shouldn't happen with the
+				// orchestrator; treat as protocol violation and bail.
 				return
 			}
 			if _, err := c.Write([]byte(fmt.Sprintf("222 0 <%s>\r\n", mid))); err != nil {
@@ -290,25 +312,6 @@ func (s *gatedStubNNTP) handle(c net.Conn) {
 			_, _ = c.Write([]byte("500 unknown\r\n"))
 		}
 	}
-}
-
-// readerClosedNotify returns a channel closed when br's underlying
-// reader returns EOF or error. Probes by Peek(1). Used so a gated
-// handler can abort if the orchestrator closed its connection while
-// we were waiting on the gate.
-func readerClosedNotify(br *bufio.Reader) <-chan struct{} {
-	done := make(chan struct{})
-	go func() {
-		// Peek with no actual read advance, in a tight loop.
-		for {
-			if _, err := br.Peek(1); err != nil {
-				close(done)
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}()
-	return done
 }
 
 // --- helpers ---------------------------------------------------------
