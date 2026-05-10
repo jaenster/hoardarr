@@ -26,10 +26,12 @@ import (
 	"github.com/jaenster/hoardarr/internal/api/rest"
 	"github.com/jaenster/hoardarr/internal/api/sse"
 	appauth "github.com/jaenster/hoardarr/internal/app/auth"
+	appdeliver "github.com/jaenster/hoardarr/internal/app/deliver"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
+	adapterfs "github.com/jaenster/hoardarr/internal/adapter/fs"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
@@ -66,6 +68,7 @@ type App struct {
 	Pools        map[domainserver.ServerID]*nntp.Pool
 	Orchestrator *appdownload.OrchestratorService
 	Verify       *appverify.Service
+	Deliver      *appdeliver.Service
 
 	LiveHub *sse.Hub
 
@@ -170,6 +173,20 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Logger:        logger,
 	})
 
+	deliveryRepo := sqlite.NewDeliveryRepo(db)
+	categoryRepoForDeliver := sqlite.NewCategoryRepo(db)
+	deliverSvc := appdeliver.New(appdeliver.ServiceParams{
+		JobRepo:       jobRepo,
+		DeliveryRepo:  deliveryRepo,
+		CategoryRepo:  categoryRepoForDeliver,
+		FS:            adapterfs.Default,
+		Bus:           bus,
+		TxManager:     txm,
+		IncompleteDir: cfg.Paths.IncompleteDir,
+		CompleteDir:   cfg.Paths.CompleteDir,
+		Logger:        logger,
+	})
+
 	userRepo := sqlite.NewUserRepo(db)
 	sessionRepo := sqlite.NewSessionRepo(db)
 	hasher := &bcrypt.Hasher{}
@@ -244,6 +261,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Pools:         pools,
 		Orchestrator:  orch,
 		Verify:        verifySvc,
+		Deliver:       deliverSvc,
 		AuthService:   authSvc,
 		SystemService: systemSvc,
 		StartedAt:     startedAt,
@@ -279,6 +297,9 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	if err := a.Verify.Start(ctx); err != nil {
 		return fmt.Errorf("start verify: %w", err)
+	}
+	if err := a.Deliver.Start(ctx); err != nil {
+		return fmt.Errorf("start deliver: %w", err)
 	}
 
 	errCh := make(chan error, 1)
@@ -316,6 +337,9 @@ func (a *App) Shutdown() error {
 			if err := a.LiveHub.Close(); err != nil && a.shutdownErr == nil {
 				a.shutdownErr = fmt.Errorf("live hub close: %w", err)
 			}
+		}
+		if err := a.Deliver.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("deliver stop: %w", err)
 		}
 		if err := a.Verify.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("verify stop: %w", err)

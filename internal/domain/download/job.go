@@ -411,6 +411,37 @@ func (j *Job) completeDownloadPhase(now time.Time) {
 	})
 }
 
+// MarkCompleted finalises the Job after delivery (or extract+deliver)
+// has finished moving files into complete/. Idempotent: if the Job is
+// already in a terminal state, no event is emitted.
+func (j *Job) MarkCompleted(now time.Time) {
+	if j.state == JobStateCompleted {
+		return
+	}
+	j.state = JobStateCompleted
+	j.finishedAt = now
+	j.events = append(j.events, JobCompleted{
+		JobID: j.id,
+		At:    now,
+	})
+}
+
+// MarkFailed transitions the Job to a terminal failed state with the
+// given reason. Idempotent.
+func (j *Job) MarkFailed(reason string, now time.Time) {
+	if j.state == JobStateFailed {
+		return
+	}
+	j.state = JobStateFailed
+	j.errorMsg = reason
+	j.finishedAt = now
+	j.events = append(j.events, JobFailed{
+		JobID: j.id,
+		Err:   reason,
+		At:    now,
+	})
+}
+
 func (j *Job) countMissingSegments() int {
 	n := 0
 	for _, f := range j.files {

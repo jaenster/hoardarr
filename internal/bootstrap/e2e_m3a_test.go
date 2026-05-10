@@ -14,6 +14,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,6 +25,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/adapter/par2"
 	"github.com/jaenster/hoardarr/internal/bootstrap"
 	"github.com/jaenster/hoardarr/internal/config"
+	"github.com/jaenster/hoardarr/internal/domain/download"
 	"github.com/jaenster/hoardarr/internal/domain/event"
 )
 
@@ -144,13 +146,29 @@ func TestM3a_E2E_VerifyOK(t *testing.T) {
 		t.Errorf("VerifyFailed events = %d; want 0", verifyFailed.Load())
 	}
 
-	// Final state should be download_complete.
-	final, err := app.QueueService.Get(ctx, finalJobID(jobID))
-	if err != nil {
-		t.Fatalf("Get final: %v", err)
+	// Final state should be `completed`: download → verify → deliver.
+	// Poll briefly because deliver runs async after VerifyOK.
+	final := waitForJobState(t, app, jobID, "completed", 15*time.Second)
+	if final == nil {
+		t.Fatalf("job did not reach completed state")
 	}
-	if string(final.State()) != "download_complete" {
-		t.Errorf("job state = %s; want download_complete", final.State())
+
+	// Files should now live at <complete>/<release>/<filename>.
+	// Default category is "*" with empty subdir, so target is
+	// <complete>/m3a-release/release.bin.
+	delivered := filepath.Join(cfg.Paths.CompleteDir, "m3a-release", dataName)
+	got, err := os.ReadFile(delivered)
+	if err != nil {
+		t.Fatalf("delivered file %s: %v", delivered, err)
+	}
+	if !bytes.Equal(got, dataPayload) {
+		t.Errorf("delivered bytes != original (got %d, want %d)", len(got), len(dataPayload))
+	}
+
+	// Incomplete dir for this job should be cleaned up.
+	jobDir := filepath.Join(cfg.Paths.IncompleteDir, strconv.FormatInt(jobID, 10))
+	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
+		t.Errorf("expected incomplete dir %s removed; got err=%v", jobDir, err)
 	}
 
 	cancel()
@@ -159,6 +177,25 @@ func TestM3a_E2E_VerifyOK(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Errorf("Run did not return within 5s")
 	}
+}
+
+// waitForJobState polls until the job hits the want state or timeout.
+// Returns the job at the moment it reached the state, or nil on
+// timeout. Used by M3a/M4 e2e where state transitions are async.
+func waitForJobState(t *testing.T, app *bootstrap.App, jobID int64, want string, timeout time.Duration) *download.Job {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		j, err := app.QueueService.Get(context.Background(), finalJobID(jobID))
+		if err == nil && string(j.State()) == want {
+			return j
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if j, err := app.QueueService.Get(context.Background(), finalJobID(jobID)); err == nil {
+		t.Errorf("job state = %q; want %q", j.State(), want)
+	}
+	return nil
 }
 
 // nzbEntry is a per-file shape for the M3a fixture builder.

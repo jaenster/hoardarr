@@ -151,3 +151,27 @@ type JobDownloadFailed struct {
 func (e JobDownloadFailed) Topic() string         { return TopicPrefix + "job.download_failed" }
 func (e JobDownloadFailed) AggregateID() string   { return jobAggregateID(e.JobID) }
 func (e JobDownloadFailed) OccurredAt() time.Time { return e.At }
+
+// JobCompleted — terminal success: files have been verified and
+// moved into complete/<category>/<release>/. Emitted by MarkCompleted.
+type JobCompleted struct {
+	JobID JobID     `json:"job_id"`
+	At    time.Time `json:"at"`
+}
+
+func (e JobCompleted) Topic() string         { return TopicPrefix + "job.completed" }
+func (e JobCompleted) AggregateID() string   { return jobAggregateID(e.JobID) }
+func (e JobCompleted) OccurredAt() time.Time { return e.At }
+
+// JobFailed — terminal failure. Distinct from JobDownloadFailed:
+// JobDownloadFailed covers download-phase errors only; JobFailed is
+// any post-processing service deciding the Job will not recover.
+type JobFailed struct {
+	JobID JobID     `json:"job_id"`
+	Err   string    `json:"err"`
+	At    time.Time `json:"at"`
+}
+
+func (e JobFailed) Topic() string         { return TopicPrefix + "job.failed" }
+func (e JobFailed) AggregateID() string   { return jobAggregateID(e.JobID) }
+func (e JobFailed) OccurredAt() time.Time { return e.At }

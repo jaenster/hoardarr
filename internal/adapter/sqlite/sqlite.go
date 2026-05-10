@@ -57,7 +57,16 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.MaxOpenConns == 0 {
-		o.MaxOpenConns = 16
+		// SQLite + WAL allows concurrent readers but only one writer.
+		// Multiple Go connections each holding a snapshot trip
+		// SQLITE_BUSY_SNAPSHOT (517) when one writes mid-snapshot —
+		// busy_timeout doesn't fix snapshot conflicts. Pinning the
+		// pool at 1 connection serializes everything; for hoardarr's
+		// load (handful of goroutines, batched commits) this is
+		// strictly cheaper than the alternative (separate r/w pools)
+		// and trivially correct. Revisit when read latency becomes
+		// a measured bottleneck.
+		o.MaxOpenConns = 1
 	}
 	if o.MaxIdleConns == 0 {
 		o.MaxIdleConns = o.MaxOpenConns
