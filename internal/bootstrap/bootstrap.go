@@ -26,6 +26,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/api/sse"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
+	appverify "github.com/jaenster/hoardarr/internal/app/verify"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
@@ -50,6 +51,7 @@ type App struct {
 
 	Pools        map[domainserver.ServerID]*nntp.Pool
 	Orchestrator *appdownload.OrchestratorService
+	Verify       *appverify.Service
 
 	LiveHub *sse.Hub
 
@@ -144,6 +146,16 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Logger:        logger,
 	})
 
+	verifyRepo := sqlite.NewVerifyRepo(db)
+	verifySvc := appverify.New(appverify.ServiceParams{
+		JobRepo:       jobRepo,
+		VerifyRepo:    verifyRepo,
+		Bus:           bus,
+		TxManager:     txm,
+		IncompleteDir: cfg.Paths.IncompleteDir,
+		Logger:        logger,
+	})
+
 	categoryRepo := sqlite.NewCategoryRepo(db)
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
 	if err != nil {
@@ -189,6 +201,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		QueueService:  queueService,
 		Pools:         pools,
 		Orchestrator:  orch,
+		Verify:        verifySvc,
 		LiveHub:       liveHub,
 		HTTP:          srv,
 		HTTPServer:    httpSrv,
@@ -218,6 +231,9 @@ func (a *App) Run(ctx context.Context) error {
 
 	if err := a.Orchestrator.Start(ctx); err != nil {
 		return fmt.Errorf("start orchestrator: %w", err)
+	}
+	if err := a.Verify.Start(ctx); err != nil {
+		return fmt.Errorf("start verify: %w", err)
 	}
 
 	errCh := make(chan error, 1)
@@ -255,6 +271,9 @@ func (a *App) Shutdown() error {
 			if err := a.LiveHub.Close(); err != nil && a.shutdownErr == nil {
 				a.shutdownErr = fmt.Errorf("live hub close: %w", err)
 			}
+		}
+		if err := a.Verify.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("verify stop: %w", err)
 		}
 		if err := a.Orchestrator.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("orchestrator stop: %w", err)
