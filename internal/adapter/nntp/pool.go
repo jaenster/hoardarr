@@ -27,6 +27,7 @@ import (
 type Pool struct {
 	srv    *server.UsenetServer
 	logger *slog.Logger
+	dialer Dialer
 
 	staleThreshold time.Duration
 	idleTTL        time.Duration
@@ -50,6 +51,10 @@ type PoolOptions struct {
 	// it. Default 60s.
 	IdleTTL time.Duration
 
+	// Dialer overrides the network dial. Defaults to DefaultDialer
+	// (TCP + optional TLS). Tests substitute recording / replay wrappers.
+	Dialer Dialer
+
 	// Logger is used for reaper/health diagnostics.
 	Logger *slog.Logger
 }
@@ -70,9 +75,14 @@ func (o PoolOptions) withDefaults() PoolOptions {
 // NewPool constructs a Pool for s. Starts a background reaper.
 func NewPool(s *server.UsenetServer, opts PoolOptions) *Pool {
 	opts = opts.withDefaults()
+	dialer := opts.Dialer
+	if dialer == nil {
+		dialer = DefaultDialer
+	}
 	p := &Pool{
 		srv:            s,
 		logger:         opts.Logger,
+		dialer:         dialer,
 		staleThreshold: opts.StaleThreshold,
 		idleTTL:        opts.IdleTTL,
 		sem:            make(chan struct{}, s.MaxConns()),
@@ -159,7 +169,7 @@ func (p *Pool) checkout(ctx context.Context) (*Conn, error) {
 	}
 
 	// No idle conn — dial new.
-	c, err := Dial(ctx, p.srv)
+	c, err := Dial(ctx, p.srv, WithDialer(p.dialer))
 	if err != nil {
 		return nil, err
 	}

@@ -47,36 +47,74 @@ type Conn struct {
 	closed   bool
 }
 
-// Dial opens an NNTP connection to s and reads the greeting. TLS is
-// negotiated when s.TLS() is true. On failure, the underlying socket
-// is closed before returning.
+// Dialer abstracts the network-level connection setup so tests can
+// substitute recording / replay wrappers. The returned net.Conn is
+// post-TLS (cleartext NNTP) so wrappers can observe the application
+// protocol without dealing with handshake bytes.
 //
-// The dial respects ctx for both the TCP connect and the TLS handshake.
-func Dial(ctx context.Context, s *server.UsenetServer) (*Conn, error) {
-	addr := net.JoinHostPort(s.Host(), strconv.Itoa(s.Port()))
+// Production: DefaultDialer does TCP + optional TLS handshake.
+type Dialer interface {
+	Dial(ctx context.Context, s *server.UsenetServer) (net.Conn, error)
+}
 
+// DefaultDialer does production TCP + optional TLS dial. The single
+// instance is safe for concurrent use.
+var DefaultDialer Dialer = defaultDialer{}
+
+type defaultDialer struct{}
+
+func (defaultDialer) Dial(ctx context.Context, s *server.UsenetServer) (net.Conn, error) {
+	addr := net.JoinHostPort(s.Host(), strconv.Itoa(s.Port()))
 	d := &net.Dialer{}
 	rawConn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
+	if !s.TLS() {
+		return rawConn, nil
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: s.Host(),
+		MinVersion: tls.VersionTLS12,
+	})
+	if dl, ok := ctx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(dl)
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	_ = tlsConn.SetDeadline(time.Time{})
+	return tlsConn, nil
+}
 
-	netConn := rawConn
-	if s.TLS() {
-		tlsConn := tls.Client(rawConn, &tls.Config{
-			ServerName: s.Host(),
-			MinVersion: tls.VersionTLS12,
-		})
-		// Honour ctx for the handshake.
-		if dl, ok := ctx.Deadline(); ok {
-			_ = tlsConn.SetDeadline(dl)
-		}
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = rawConn.Close()
-			return nil, fmt.Errorf("tls handshake: %w", err)
-		}
-		_ = tlsConn.SetDeadline(time.Time{})
-		netConn = tlsConn
+// DialOption configures Dial.
+type DialOption func(*dialConfig)
+
+type dialConfig struct {
+	dialer Dialer
+}
+
+// WithDialer overrides the production dialer. Used by record / replay
+// wrappers in tests.
+func WithDialer(d Dialer) DialOption {
+	return func(c *dialConfig) { c.dialer = d }
+}
+
+// Dial opens an NNTP connection to s and reads the greeting. TLS is
+// negotiated when s.TLS() is true (handled by DefaultDialer).
+// On failure, the underlying socket is closed before returning.
+//
+// The dial respects ctx for both the TCP connect and the TLS handshake.
+func Dial(ctx context.Context, s *server.UsenetServer, opts ...DialOption) (*Conn, error) {
+	cfg := dialConfig{dialer: DefaultDialer}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	netConn, err := cfg.dialer.Dial(ctx, s)
+	if err != nil {
+		return nil, err
 	}
 
 	tp := textproto.NewConn(netConn)

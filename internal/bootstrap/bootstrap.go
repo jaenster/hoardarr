@@ -62,6 +62,20 @@ type App struct {
 	shutdownErr  error
 }
 
+// BuildOption configures Build. Used by tests / alternative entry
+// points (e.g. cassette replay) without bloating Build's signature.
+type BuildOption func(*buildOptions)
+
+type buildOptions struct {
+	nntpDialer nntp.Dialer
+}
+
+// WithNNTPDialer overrides the default network dialer used by all
+// NNTP pools. Tests use this to plug in recording / replay wrappers.
+func WithNNTPDialer(d nntp.Dialer) BuildOption {
+	return func(o *buildOptions) { o.nntpDialer = d }
+}
+
 // Build wires the runtime: ensures data directories exist, opens the
 // SQLite database, applies migrations, constructs the transaction
 // manager and outbox event bus, builds NNTP pools for enabled servers,
@@ -69,9 +83,13 @@ type App struct {
 //
 // On error, all partially-initialised resources are released before
 // returning. Callers may pass the returned App to Run.
-func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slog.Logger) (*App, error) {
+func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slog.Logger, opts ...BuildOption) (*App, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	bo := buildOptions{}
+	for _, o := range opts {
+		o(&bo)
 	}
 
 	if err := ensureDirs(cfg); err != nil {
@@ -110,7 +128,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		IncompleteDir: cfg.Paths.IncompleteDir,
 	})
 
-	pools, err := buildPools(ctx, serverRepo, logger)
+	pools, err := buildPools(ctx, serverRepo, logger, bo.nntpDialer)
 	if err != nil {
 		_ = bus.Close()
 		_ = db.Close()
@@ -289,14 +307,20 @@ func openDB(ctx context.Context, cfg config.Config) (*sqlite.DB, error) {
 // buildPools opens an nntp.Pool for every enabled server in the
 // registry. Empty result is fine — orchestrator tolerates "no servers
 // yet" and just sits idle.
-func buildPools(ctx context.Context, repo *sqlite.ServerRepo, logger *slog.Logger) (map[domainserver.ServerID]*nntp.Pool, error) {
+//
+// dialer overrides the network dialer for every pool. Pass nil for
+// production (DefaultDialer); tests pass recording / replay wrappers.
+func buildPools(ctx context.Context, repo *sqlite.ServerRepo, logger *slog.Logger, dialer nntp.Dialer) (map[domainserver.ServerID]*nntp.Pool, error) {
 	servers, err := repo.ListEnabled(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[domainserver.ServerID]*nntp.Pool, len(servers))
 	for _, s := range servers {
-		out[s.ID()] = nntp.NewPool(s, nntp.PoolOptions{Logger: logger})
+		out[s.ID()] = nntp.NewPool(s, nntp.PoolOptions{
+			Logger: logger,
+			Dialer: dialer,
+		})
 	}
 	return out, nil
 }

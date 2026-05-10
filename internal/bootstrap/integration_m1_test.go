@@ -198,7 +198,22 @@ func TestM1_LiveProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get server: %v", err)
 	}
-	pool := nntp.NewPool(srv, nntp.PoolOptions{})
+
+	// Optional recording: HOARDARR_TEST_RECORD=1 with
+	// HOARDARR_TEST_CASSETTE_PATH set captures the NNTP session to a
+	// JSONL cassette (with AUTHINFO PASS redacted). The cassette can
+	// then be committed and replayed in CI without creds.
+	var dialer nntp.Dialer
+	if os.Getenv("HOARDARR_TEST_RECORD") == "1" {
+		path := os.Getenv("HOARDARR_TEST_CASSETTE_PATH")
+		if path == "" {
+			t.Fatal("HOARDARR_TEST_RECORD=1 requires HOARDARR_TEST_CASSETTE_PATH")
+		}
+		dialer = &nntp.RecordingDialer{Inner: nntp.DefaultDialer, Path: path}
+		t.Logf("recording NNTP session → %s", path)
+	}
+
+	pool := nntp.NewPool(srv, nntp.PoolOptions{Dialer: dialer})
 	defer pool.Close()
 	fetcher := appdownload.NewPoolFetcher(pool)
 	orch := appdownload.NewOrchestrator(
@@ -235,40 +250,3 @@ func TestM1_LiveProvider(t *testing.T) {
 
 // silence unused
 var _ = io.EOF
-
-// resolveTestPath returns path unchanged when absolute. Relative paths
-// are resolved against the project root (the nearest ancestor of cwd
-// containing go.mod) so values in .env work regardless of which package
-// directory `go test` was invoked from.
-func resolveTestPath(path string) (string, error) {
-	if path == "" {
-		return "", errors.New("empty path")
-	}
-	if filepath.IsAbs(path) {
-		return path, nil
-	}
-	root, err := projectRoot()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(root, path), nil
-}
-
-// projectRoot walks up from cwd until it finds a directory containing
-// go.mod. Returns an error if none is found.
-func projectRoot() (string, error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", errors.New("project root not found (no go.mod ancestor)")
-		}
-		dir = parent
-	}
-}
