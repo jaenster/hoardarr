@@ -1,0 +1,27 @@
+# Build output
+/hoardarr
+/dist/
+/bin/
+
+# Frontend
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/frontend/*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Runtime / data
+/data/
+*.db
+*.db-journal
+*.log
+
+# Local config
+config.local.yaml
+.env
+.env.local
