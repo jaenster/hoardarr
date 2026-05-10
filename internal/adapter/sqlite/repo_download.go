@@ -56,6 +56,9 @@ func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
 		j.NZBBlob(),
 	)
 	if err != nil {
+		if isNZBHashUniqueViolation(err) {
+			return download.ErrDuplicateNZBHash
+		}
 		return fmt.Errorf("insert job: %w", err)
 	}
 	jobID, err := res.LastInsertId()
@@ -469,6 +472,21 @@ func nullableMillis(t time.Time) any {
 	return t.UnixMilli()
 }
 
-// strings package import workaround (used by surrounding files; this
-// package shares the file with helpers that may grow).
-var _ = strings.HasPrefix
+// isNZBHashUniqueViolation detects the modernc/sqlite error string for
+// a UNIQUE constraint failure on jobs.nzb_hash.
+//
+// modernc.org/sqlite formats these as "constraint failed: UNIQUE
+// constraint failed: jobs.nzb_hash (2067)". Matching by substring is
+// brittle but pragmatic — the alternative is asserting on the
+// concrete error type, which the driver reserves for future use and
+// could change. Worst case of a miss: the error bubbles up wrapped
+// instead of as our sentinel; AddJob falls through to the generic
+// failure path.
+func isNZBHashUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed: jobs.nzb_hash") ||
+		strings.Contains(msg, "UNIQUE constraint failed: jobs_nzb_hash")
+}

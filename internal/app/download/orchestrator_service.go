@@ -48,6 +48,8 @@ type OrchestratorService struct {
 	logger        *slog.Logger
 	now           func() time.Time
 	flushInterval time.Duration
+	maxAttempts   int
+	baseBackoff   time.Duration
 
 	mu      sync.Mutex
 	runners map[download.JobID]*runnerHandle
@@ -69,6 +71,8 @@ type OrchestratorServiceParams struct {
 	Logger        *slog.Logger
 	Now           func() time.Time
 	FlushInterval time.Duration // optional, default 100ms
+	MaxAttempts   int           // optional, default 3
+	BaseBackoff   time.Duration // optional, default 200ms
 }
 
 // NewOrchestratorService constructs the service.
@@ -94,6 +98,8 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		logger:        p.Logger,
 		now:           p.Now,
 		flushInterval: p.FlushInterval,
+		maxAttempts:   p.MaxAttempts,
+		baseBackoff:   p.BaseBackoff,
 		runners:       make(map[download.JobID]*runnerHandle),
 		rootCtx:       rootCtx,
 		cancel:        cancel,
@@ -101,11 +107,18 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 }
 
 // Start subscribes to bus events and kicks off runners for any active
-// (non-paused, non-terminal) jobs in the DB. Idempotent.
+// (non-paused, non-terminal) jobs in the DB.
+//
+// Idempotent across calls; restartable after Stop. Each Start
+// (re)creates the internal rootCtx so a previously-cancelled service
+// can be revived (the crash-recovery flow exercises this).
 func (s *OrchestratorService) Start(ctx context.Context) error {
 	if s.started {
 		return nil
 	}
+	// Reset rootCtx — Stop cancelled the previous one, but a Start
+	// after Stop must hand fresh contexts to new runners.
+	s.rootCtx, s.cancel = context.WithCancel(context.Background())
 
 	subs, err := s.subscribe()
 	if err != nil {
@@ -153,6 +166,15 @@ func (s *OrchestratorService) Stop() error {
 
 	s.cancel()
 	s.wg.Wait()
+
+	// Drop idle pool conns so the next Start dials fresh — avoids
+	// reusing conns that were idle when their previous holder
+	// cancelled. The pools themselves remain alive and ready for
+	// new acquires.
+	for _, p := range s.pools {
+		p.CloseIdle()
+	}
+
 	s.logger.Info("orchestrator service stopped")
 	return nil
 }
@@ -291,6 +313,8 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 			Logger:        s.logger,
 			Now:           s.now,
 			FlushInterval: s.flushInterval,
+			MaxAttempts:   s.maxAttempts,
+			BaseBackoff:   s.baseBackoff,
 		},
 	)
 

@@ -98,12 +98,14 @@ func TestJobRepo_DuplicateHashRejected(t *testing.T) {
 	dup, _ := download.NewJob(download.NewJobParams{
 		NZBHash: "hash-" + t.Name(),
 		Name:    "dup",
+		NZBBlob: []byte("<nzb/>"),
 		Files: []download.NewFileParams{
 			{Filename: "x", Segments: []download.NewSegmentParams{{SeqIndex: 1, MessageID: "x@h", Bytes: 1}}},
 		},
 	}, time.Now())
-	if err := repo.Save(context.Background(), dup); err == nil {
-		t.Fatal("expected unique-violation error on duplicate hash")
+	err := repo.Save(context.Background(), dup)
+	if !errors.Is(err, download.ErrDuplicateNZBHash) {
+		t.Errorf("err = %v; want ErrDuplicateNZBHash", err)
 	}
 }
 

@@ -44,6 +44,10 @@ type Orchestrator struct {
 	// drainer cadence
 	flushInterval time.Duration
 	flushBatchMax int
+
+	// segment retry
+	maxAttempts int
+	baseBackoff time.Duration
 }
 
 // OrchestratorOptions tunes runtime behaviour. Zero values are sensible.
@@ -60,6 +64,20 @@ type OrchestratorOptions struct {
 	// FlushBatchMax forces a flush when batch reaches this size.
 	// Default 256.
 	FlushBatchMax int
+
+	// MaxAttempts caps the number of fetch attempts before a
+	// segment moves to terminal "failed". 1 = no retry (the only
+	// attempt is the first). Default 3.
+	//
+	// ErrArticleMissing (430) bypasses retry — that's a definitive
+	// "no such article", and re-asking the same server won't help.
+	// Multi-server failover (M7) will fan 430s out to the next
+	// server before terminal-missing.
+	MaxAttempts int
+
+	// BaseBackoff is the first-retry delay; each subsequent retry
+	// doubles. Default 200ms (so 200 / 400 / 800 ms for 3 attempts).
+	BaseBackoff time.Duration
 
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -92,6 +110,12 @@ func NewOrchestrator(
 	if opts.FlushBatchMax == 0 {
 		opts.FlushBatchMax = 256
 	}
+	if opts.MaxAttempts == 0 {
+		opts.MaxAttempts = 3
+	}
+	if opts.BaseBackoff == 0 {
+		opts.BaseBackoff = 200 * time.Millisecond
+	}
 	if workers <= 0 {
 		workers = 1
 	}
@@ -110,6 +134,8 @@ func NewOrchestrator(
 		incompleteDir: incompleteDir,
 		flushInterval: opts.FlushInterval,
 		flushBatchMax: opts.FlushBatchMax,
+		maxAttempts:   opts.MaxAttempts,
+		baseBackoff:   opts.BaseBackoff,
 	}
 }
 
@@ -219,9 +245,51 @@ func (o *Orchestrator) workerLoop(
 	}
 }
 
-// processSegment runs one segment end-to-end: fetch via NNTP, decode
-// yEnc, write to disk at the computed offset.
+// processSegment runs one segment to completion, retrying transient
+// failures up to maxAttempts. ErrArticleMissing (430) is terminal on
+// the first attempt — re-asking the same server won't help.
 func (o *Orchestrator) processSegment(
+	ctx context.Context,
+	job *download.Job,
+	jobDir string,
+	seg *download.Segment,
+) segmentResult {
+	var res segmentResult
+	for attempt := 1; attempt <= o.maxAttempts; attempt++ {
+		res = o.attemptSegment(ctx, job, jobDir, seg)
+		if res.done || res.missing {
+			return res
+		}
+		if ctx.Err() != nil {
+			// Don't mark this segment failed — the runner is being
+			// torn down. Leave it pending so a fresh start picks
+			// it up.
+			return segmentResult{seg: seg, cancelled: true}
+		}
+		if attempt < o.maxAttempts {
+			o.logger.Debug("orchestrator: retrying segment",
+				"job_id", int64(job.ID()),
+				"segment_id", int64(seg.ID()),
+				"attempt", attempt,
+				"err", res.err,
+			)
+			delay := o.baseBackoff << (attempt - 1)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return segmentResult{seg: seg, cancelled: true}
+			}
+		}
+	}
+	if res.err != nil {
+		res.err = fmt.Errorf("after %d attempts: %w", o.maxAttempts, res.err)
+	}
+	return res
+}
+
+// attemptSegment performs a single fetch + decode + write. The outer
+// processSegment retries on non-missing failures.
+func (o *Orchestrator) attemptSegment(
 	ctx context.Context,
 	job *download.Job,
 	jobDir string,
@@ -330,10 +398,17 @@ func (o *Orchestrator) drainerLoop(ctx context.Context, job *download.Job, in <-
 // flushBatch applies a batch of results to the aggregate and persists
 // in one transaction (segment row updates + job state save + outbox
 // events).
+//
+// Cancelled segments are skipped (no state mutation, no DB update);
+// they remain pending and will be re-dispatched on restart.
 func (o *Orchestrator) flushBatch(ctx context.Context, job *download.Job, batch []segmentResult) error {
 	now := o.now()
+	persisted := batch[:0]
 	for _, r := range batch {
 		switch {
+		case r.cancelled:
+			// Skip — leave segment pending for the next runner.
+			continue
 		case r.done:
 			if err := job.MarkSegmentDone(download.SegmentResult{
 				SegmentID:   r.seg.ID(),
@@ -355,8 +430,9 @@ func (o *Orchestrator) flushBatch(ctx context.Context, job *download.Job, batch 
 				o.logger.Error("MarkSegmentFailed", "err", err)
 			}
 		}
+		persisted = append(persisted, r)
 	}
-	return o.flushAggregate(ctx, job, batch)
+	return o.flushAggregate(ctx, job, persisted)
 }
 
 // flushAggregate persists the current job state and publishes pending
@@ -406,10 +482,19 @@ func buildSegmentUpdates(job *download.Job, batch []segmentResult) []download.Se
 }
 
 // segmentResult is the orchestrator's worker → drainer message.
+//
+// Exactly one of done/missing/cancelled may be true at a time. When
+// none are set and err != nil, the result is a terminal failure
+// (retry budget exhausted).
 type segmentResult struct {
 	seg         *download.Segment
 	done        bool
 	missing     bool
+	// cancelled means the worker exited due to ctx cancellation
+	// before resolving the segment. The drainer leaves these
+	// segments in the pending state so a restart picks them up
+	// cleanly (this is the crash-recovery path).
+	cancelled   bool
 	bytesOnDisk int64
 	fileOffset  int64
 	err         error

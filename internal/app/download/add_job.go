@@ -87,7 +87,7 @@ func (s *AddJobService) AddJob(ctx context.Context, cmd AddJobCmd) (download.Job
 
 	var id download.JobID
 	err = s.tx.InTx(ctx, func(ctx context.Context) error {
-		// Dedupe.
+		// Fast-path dedupe by hash.
 		if existing, err := s.repo.ByNZBHash(ctx, hash); err == nil {
 			id = existing.ID()
 			return ErrDuplicateNZB
@@ -109,6 +109,15 @@ func (s *AddJobService) AddJob(ctx context.Context, cmd AddJobCmd) (download.Job
 			return err
 		}
 		if err := s.repo.Save(ctx, j); err != nil {
+			// Race safety net: the pre-check passed but a concurrent
+			// upload won the INSERT first. Map UNIQUE-violation back
+			// to ErrDuplicateNZB and look up the winner's id.
+			if errors.Is(err, download.ErrDuplicateNZBHash) {
+				if winner, lerr := s.repo.ByNZBHash(ctx, hash); lerr == nil {
+					id = winner.ID()
+				}
+				return ErrDuplicateNZB
+			}
 			return fmt.Errorf("save job: %w", err)
 		}
 		id = j.ID()

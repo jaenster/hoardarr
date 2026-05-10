@@ -41,6 +41,16 @@ type SegmentUpdate struct {
 // ErrJobNotFound is returned by repo lookups when the id has no row.
 var ErrJobNotFound = errors.New("download: job not found")
 
+// ErrDuplicateNZBHash is returned by JobRepository.Save when an
+// insert violates the UNIQUE(nzb_hash) constraint. The application
+// service catches this and converts to its public ErrDuplicateNZB
+// (looking up the existing job's ID for the response).
+//
+// Race scenario: two concurrent uploads of identical NZB bytes both
+// pass a ByNZBHash pre-check before either commits. The first INSERT
+// wins; the second hits this error.
+var ErrDuplicateNZBHash = errors.New("download: nzb hash already exists")
+
 // ArticleFetcher fetches one article body from a configured Usenet
 // server. Implementations: internal/adapter/nntp.Pool.
 //

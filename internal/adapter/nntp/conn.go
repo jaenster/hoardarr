@@ -160,9 +160,14 @@ func (c *Conn) Authenticate(ctx context.Context) error {
 }
 
 // ModeReader sends "MODE READER". Some transit-mode NNTP servers need
-// this before they will serve articles to readers. Servers that don't
-// understand it return 500/501; both are treated as success here so
-// the caller can blindly invoke it.
+// this before they will serve articles to readers. Many providers don't
+// support the command at all and respond with various 5xx codes — in
+// every case the right move is to proceed since article-fetch commands
+// (BODY/STAT) work regardless. Recognised "ignore me" codes:
+//
+//	500 — command not recognised
+//	501 — syntax error
+//	502 — command unavailable / not allowed (some providers)
 func (c *Conn) ModeReader(ctx context.Context) error {
 	if err := c.send(ctx, "MODE READER"); err != nil {
 		return err
@@ -175,8 +180,8 @@ func (c *Conn) ModeReader(ctx context.Context) error {
 	case code == 200 || code == 201:
 		c.touch()
 		return nil
-	case code == 500 || code == 501:
-		// Not implemented by some servers; treat as no-op.
+	case code == 500 || code == 501 || code == 502:
+		// Provider doesn't implement / allow MODE READER; harmless.
 		c.touch()
 		return nil
 	default:
@@ -213,6 +218,12 @@ func (c *Conn) Date(ctx context.Context) (time.Time, error) {
 // bytes. The caller MUST drain to EOF (or call Close) before issuing
 // another command on this Conn — the underlying stream is shared.
 //
+// Cancellation: while the body is being read, a watcher goroutine
+// observes ctx.Done(). If the caller cancels mid-read, the underlying
+// connection is closed, which makes the in-progress Read error out
+// immediately. Without this, an idle peer can block reads indefinitely
+// regardless of ctx.
+//
 // On 430, ErrArticleMissing is returned and the connection remains
 // usable for further commands.
 func (c *Conn) Body(ctx context.Context, messageID string) (io.ReadCloser, error) {
@@ -227,7 +238,22 @@ func (c *Conn) Body(ctx context.Context, messageID string) (io.ReadCloser, error
 		return nil, classifyResponse(&ProtocolError{Code: code, Message: msg})
 	}
 	c.touch()
-	return &bodyReader{r: c.tp.DotReader()}, nil
+
+	br := &bodyReader{r: c.tp.DotReader(), done: make(chan struct{})}
+	go bodyWatcher(ctx, c, br)
+	return br, nil
+}
+
+// bodyWatcher closes the underlying conn when ctx is cancelled,
+// unblocking any in-flight Read on the body. Returns when the body
+// reader is closed normally.
+func bodyWatcher(ctx context.Context, c *Conn, br *bodyReader) {
+	select {
+	case <-ctx.Done():
+		_ = c.netConn.Close()
+	case <-br.done:
+		return
+	}
 }
 
 // Stat checks whether messageID exists on this server without
@@ -276,22 +302,37 @@ func (c *Conn) send(ctx context.Context, line string) error {
 
 func (c *Conn) touch() { c.lastUsed = time.Now() }
 
-// readCodeLineCtx applies ctx's deadline (if any) to the next read,
-// then delegates to textproto.ReadCodeLine. expectCode 0 disables the
-// stdlib's automatic class check; we inspect the code explicitly.
+// readCodeLineCtx applies ctx's deadline (if any) and watches for
+// ctx cancellation, closing the underlying conn if cancelled mid-read.
+// Without that, an idle peer can hold the read open indefinitely
+// regardless of ctx.
 func readCodeLineCtx(ctx context.Context, c *Conn, expectCode int) (int, string, error) {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetReadDeadline(dl)
 		defer func() { _ = c.netConn.SetReadDeadline(time.Time{}) }()
 	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = c.netConn.Close()
+		case <-done:
+		}
+	}()
 	return c.tp.ReadCodeLine(expectCode)
 }
 
 // bodyReader wraps the textproto DotReader; closing it drains any
-// remaining bytes so the underlying conn stays in sync.
+// remaining bytes so the underlying conn stays in sync, and signals
+// the cancellation watcher in Body() to exit.
 type bodyReader struct {
 	r      io.Reader
 	closed bool
+	// done is closed when Close runs. The watcher goroutine spawned
+	// by Body() selects on this to know when to exit without forcing
+	// the conn closed.
+	done chan struct{}
 }
 
 func (b *bodyReader) Read(p []byte) (int, error) { return b.r.Read(p) }
@@ -303,6 +344,9 @@ func (b *bodyReader) Close() error {
 	}
 	b.closed = true
 	_, _ = io.Copy(io.Discard, b.r)
+	if b.done != nil {
+		close(b.done)
+	}
 	return nil
 }
 

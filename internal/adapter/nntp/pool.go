@@ -248,5 +248,20 @@ func (p *Pool) IdleCount() int {
 	return len(p.idle)
 }
 
+// CloseIdle closes every conn currently in the idle stack without
+// stopping the pool. Useful between orchestrator runs (e.g. after a
+// pause/resume cycle) so a fresh runner always dials clean conns and
+// can't trip over stale half-closed sockets that were idle when their
+// previous holder cancelled.
+func (p *Pool) CloseIdle() {
+	p.mu.Lock()
+	idle := p.idle
+	p.idle = nil
+	p.mu.Unlock()
+	for _, c := range idle {
+		_ = c.Close()
+	}
+}
+
 // ErrPoolClosed is returned by Acquire after Close.
 var ErrPoolClosed = errors.New("nntp: pool closed")

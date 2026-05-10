@@ -352,24 +352,28 @@ func TestDate(t *testing.T) {
 }
 
 func TestModeReader_TolerantOf500(t *testing.T) {
-	addr, cleanup := startStubServer(t, func(s *stubSession) {
-		s.Send("200 ready")
-		s.ExpectLine("MODE READER")
-		s.Send("500 unknown command")
-		s.ExpectLine("QUIT")
-		s.Send("205 closing")
-	})
-	defer cleanup()
+	for _, code := range []string{"500 unknown command", "501 syntax", "502 not allowed"} {
+		t.Run(code, func(t *testing.T) {
+			addr, cleanup := startStubServer(t, func(s *stubSession) {
+				s.Send("200 ready")
+				s.ExpectLine("MODE READER")
+				s.Send("%s", code)
+				s.ExpectLine("QUIT")
+				s.Send("205 closing")
+			})
+			defer cleanup()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	c, err := Dial(ctx, stubUsenetServer(t, addr))
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	defer c.Quit(ctx)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			c, err := Dial(ctx, stubUsenetServer(t, addr))
+			if err != nil {
+				t.Fatalf("Dial: %v", err)
+			}
+			defer c.Quit(ctx)
 
-	if err := c.ModeReader(ctx); err != nil {
-		t.Errorf("ModeReader on 500 should succeed; got %v", err)
+			if err := c.ModeReader(ctx); err != nil {
+				t.Errorf("ModeReader on %q should succeed; got %v", code, err)
+			}
+		})
 	}
 }

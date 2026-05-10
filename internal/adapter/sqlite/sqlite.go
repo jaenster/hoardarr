@@ -90,7 +90,14 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		}
 	}
 
-	conn, err := sql.Open("sqlite", path)
+	// Build a DSN that embeds per-connection pragmas so every fresh
+	// connection from the sql.DB pool starts with the right settings.
+	// Without this, sql.DB hands out a new connection that hasn't seen
+	// our applyPragmas() and ignores busy_timeout, leading to spurious
+	// SQLITE_BUSY errors under contention.
+	dsn := buildDSN(path, opts)
+
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("sql.Open: %w", err)
 	}
@@ -105,12 +112,42 @@ func Open(ctx context.Context, path string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 
+	// applyPragmas runs additional one-shot setup that the DSN doesn't
+	// cover (e.g. for in-memory DBs which skip WAL).
 	if err := db.applyPragmas(ctx, opts); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("apply pragmas: %w", err)
 	}
 
 	return db, nil
+}
+
+// buildDSN composes a modernc/sqlite DSN with per-connection pragmas.
+// Every new conn the pool dials picks up these settings; the matching
+// applyPragmas pass is a defence-in-depth.
+func buildDSN(path string, opts Options) string {
+	if path == ":memory:" {
+		return path
+	}
+	pragmas := []string{
+		"_pragma=journal_mode(wal)",
+		"_pragma=synchronous(normal)",
+		"_pragma=foreign_keys(on)",
+		fmt.Sprintf("_pragma=busy_timeout(%d)", opts.BusyTimeout),
+		fmt.Sprintf("_pragma=cache_size(%d)", opts.CacheSizeKB),
+	}
+	return "file:" + path + "?" + joinAmpersand(pragmas)
+}
+
+func joinAmpersand(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += "&"
+		}
+		out += p
+	}
+	return out
 }
 
 func (db *DB) applyPragmas(ctx context.Context, opts Options) error {
