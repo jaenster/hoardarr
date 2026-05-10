@@ -76,7 +76,12 @@ func (h *Handlers) listQueue(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) addNZB(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// 256 MiB is generous for any real NZB. The largest releases I've
+	// seen ship NZBs around 5-10 MB; 256 MiB leaves a wide safety
+	// margin without exposing us to memory exhaustion via a single
+	// hostile request.
+	const maxNZBBytes = 256 << 20
+	if err := r.ParseMultipartForm(maxNZBBytes); err != nil {
 		h.writeError(w, http.StatusBadRequest, fmt.Errorf("parse form: %w", err))
 		return
 	}

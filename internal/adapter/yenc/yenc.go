@@ -234,9 +234,13 @@ func parseBeginLine(line []byte, h *Header) error {
 			}
 		}
 	}
-	if h.Size <= 0 {
-		return fmt.Errorf("yenc: =ybegin missing size: %q", line)
+	if h.Size < 0 {
+		return fmt.Errorf("yenc: =ybegin negative size: %q", line)
 	}
+	// size=0 is valid (zero-byte article); size attribute simply
+	// being absent (not parsed as 0 — strconv would have failed)
+	// would also leave h.Size at its zero-value default. Reject only
+	// the genuinely impossible.
 	return nil
 }
 

@@ -152,6 +152,9 @@ func convertSegment(s xmlSegment) (Segment, error) {
 	}
 	mid = strings.TrimPrefix(mid, "<")
 	mid = strings.TrimSuffix(mid, ">")
+	if err := validateMessageID(mid); err != nil {
+		return Segment{}, err
+	}
 	num, err := strconv.Atoi(s.Number)
 	if err != nil || num < 1 {
 		return Segment{}, fmt.Errorf("bad segment number %q", s.Number)
@@ -162,6 +165,28 @@ func convertSegment(s xmlSegment) (Segment, error) {
 		Number:    num,
 		MessageID: mid,
 	}, nil
+}
+
+// validateMessageID rejects message-ids containing characters that
+// would corrupt NNTP command lines. NNTP uses CRLF as command
+// terminator; a CR/LF inside a message-id would let a malicious NZB
+// inject a second BODY (or any other) command on the same connection.
+//
+// Spec-wise, RFC 5536 limits message-ids to printable US-ASCII
+// excluding angle brackets, whitespace, and a few reserved chars.
+// We use a permissive but injection-safe filter: reject control
+// characters and whitespace.
+func validateMessageID(mid string) error {
+	if mid == "" {
+		return errors.New("nzb: empty message-id")
+	}
+	for i := 0; i < len(mid); i++ {
+		b := mid[i]
+		if b < 0x21 || b == 0x7f {
+			return fmt.Errorf("nzb: message-id contains control or whitespace byte 0x%02x at offset %d", b, i)
+		}
+	}
+	return nil
 }
 
 // parseFilenameFromSubject tries to recover the filename from a Usenet

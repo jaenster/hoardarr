@@ -56,6 +56,8 @@ type App struct {
 	HTTP       *server.Server
 	HTTPServer *http.Server
 
+	dataDirLock *fileLock
+
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
@@ -76,8 +78,14 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		return nil, err
 	}
 
+	lock, err := acquireDataDirLock(cfg.Server.DataDir)
+	if err != nil {
+		return nil, err
+	}
+
 	db, err := openDB(ctx, cfg)
 	if err != nil {
+		_ = lock.Release()
 		return nil, err
 	}
 
@@ -137,9 +145,17 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	})
 	srv.MountSSE(liveHub)
 	httpSrv := &http.Server{
-		Addr:              cfg.Server.Listen,
-		Handler:           srv,
+		Addr:    cfg.Server.Listen,
+		Handler: srv,
+		// Slow-loris defence on header reads.
 		ReadHeaderTimeout: 10 * time.Second,
+		// Recycle idle keep-alive conns. SSE connections aren't
+		// "idle" — the heartbeat (~15s) keeps them active — so this
+		// cap only catches actual zombie conns.
+		IdleTimeout: 90 * time.Second,
+		// Deliberately unset: ReadTimeout would kill slow large
+		// multipart NZB uploads; WriteTimeout would kill long-lived
+		// SSE streams. We use per-handler context for timeouts.
 	}
 
 	return &App{
@@ -158,6 +174,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		LiveHub:       liveHub,
 		HTTP:          srv,
 		HTTPServer:    httpSrv,
+		dataDirLock:   lock,
 	}, nil
 }
 
@@ -234,6 +251,9 @@ func (a *App) Shutdown() error {
 		}
 		if err := a.DB.Close(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("db close: %w", err)
+		}
+		if err := a.dataDirLock.Release(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("release data-dir lock: %w", err)
 		}
 	})
 	return a.shutdownErr

@@ -32,10 +32,11 @@ type OutboxBus struct {
 	db     *DB
 	logger *slog.Logger
 
-	pollInterval   time.Duration
-	batchSize      int
-	backoffBase    time.Duration
-	backoffMax     time.Duration
+	pollInterval        time.Duration
+	batchSize           int
+	backoffBase         time.Duration
+	backoffMax          time.Duration
+	maxDeliveryAttempts int
 
 	now func() time.Time // injectable for tests
 
@@ -70,6 +71,14 @@ type OutboxOptions struct {
 	// BackoffMax caps the per-retry delay. Default: 10m.
 	BackoffMax time.Duration
 
+	// MaxDeliveryAttempts is the cap on per-event retries. Once a
+	// row's attempts reach this count it stops being picked up by the
+	// dispatcher (it's "poisoned" and parked). The row stays in
+	// outbox_subs with delivered_at NULL and last_error populated, so
+	// an operator can inspect and either clear the row (manual retry)
+	// or accept the loss. Default: 20.
+	MaxDeliveryAttempts int
+
 	// Logger is the slog used for dispatcher diagnostics. Defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -91,6 +100,9 @@ func (o OutboxOptions) withDefaults() OutboxOptions {
 	if o.BackoffMax == 0 {
 		o.BackoffMax = 10 * time.Minute
 	}
+	if o.MaxDeliveryAttempts == 0 {
+		o.MaxDeliveryAttempts = 20
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -108,17 +120,18 @@ func NewOutboxBus(db *DB, opts OutboxOptions) *OutboxBus {
 	opts = opts.withDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
 	return &OutboxBus{
-		db:           db,
-		logger:       opts.Logger,
-		pollInterval: opts.PollInterval,
-		batchSize:    opts.BatchSize,
-		backoffBase:  opts.BackoffBase,
-		backoffMax:   opts.BackoffMax,
-		now:          opts.Now,
-		byName:       make(map[string]*outboxSub),
-		byTopic:      make(map[string]map[string]*outboxSub),
-		ctx:          ctx,
-		cancel:       cancel,
+		db:                  db,
+		logger:              opts.Logger,
+		pollInterval:        opts.PollInterval,
+		batchSize:           opts.BatchSize,
+		backoffBase:         opts.BackoffBase,
+		backoffMax:          opts.BackoffMax,
+		maxDeliveryAttempts: opts.MaxDeliveryAttempts,
+		now:                 opts.Now,
+		byName:              make(map[string]*outboxSub),
+		byTopic:             make(map[string]map[string]*outboxSub),
+		ctx:                 ctx,
+		cancel:              cancel,
 	}
 }
 
@@ -304,7 +317,13 @@ func (b *OutboxBus) dispatchLoop(sub *outboxSub) {
 		for {
 			n, err := b.processBatch(sub)
 			if err != nil {
-				b.logger.Error("outbox dispatch", "subscription", sub.name, "err", err)
+				if errors.Is(err, context.Canceled) || isSQLiteBusy(err) {
+					// Shutdown or transient lock — next tick retries.
+					b.logger.Debug("outbox dispatch interrupted",
+						"subscription", sub.name, "err", err)
+				} else {
+					b.logger.Error("outbox dispatch", "subscription", sub.name, "err", err)
+				}
 				break
 			}
 			if n == 0 {
@@ -316,6 +335,9 @@ func (b *OutboxBus) dispatchLoop(sub *outboxSub) {
 
 // processBatch fetches up to batchSize pending rows for sub and delivers
 // each. Returns the number of rows attempted (regardless of success).
+//
+// Rows whose attempts have hit MaxDeliveryAttempts are skipped — they
+// stay in the table with last_error populated for operator inspection.
 func (b *OutboxBus) processBatch(sub *outboxSub) (int, error) {
 	rows, err := b.db.QueryContext(b.ctx, `
 		SELECT s.event_id, s.attempts, o.topic, o.aggregate_id, o.occurred_at, o.payload
@@ -323,11 +345,12 @@ func (b *OutboxBus) processBatch(sub *outboxSub) (int, error) {
 		JOIN outbox o ON o.id = s.event_id
 		WHERE s.subscription = ?
 		  AND s.delivered_at IS NULL
+		  AND s.attempts < ?
 		  AND o.topic = ?
 		  AND (s.next_retry_at IS NULL OR s.next_retry_at <= ?)
 		ORDER BY s.event_id
 		LIMIT ?
-	`, sub.name, sub.topic, b.now().UnixMilli(), b.batchSize)
+	`, sub.name, b.maxDeliveryAttempts, sub.topic, b.now().UnixMilli(), b.batchSize)
 	if err != nil {
 		return 0, fmt.Errorf("query pending: %w", err)
 	}
@@ -367,7 +390,7 @@ func (b *OutboxBus) processBatch(sub *outboxSub) (int, error) {
 			Payload:     append(json.RawMessage(nil), it.payload...),
 			Attempts:    it.attempts + 1,
 		}
-		err = sub.handler(b.ctx, env)
+		err = b.invokeHandler(sub, env)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return len(batch), nil
@@ -380,19 +403,33 @@ func (b *OutboxBus) processBatch(sub *outboxSub) (int, error) {
 	return len(batch), nil
 }
 
+// invokeHandler runs sub.handler with a deferred recover. A panicking
+// handler would otherwise kill the dispatcher goroutine and silently
+// stop delivery for that subscription. Treat panic-as-failure so the
+// retry/backoff/poison machinery applies uniformly.
+func (b *OutboxBus) invokeHandler(sub *outboxSub, env event.Envelope) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("handler panic: %v", r)
+			b.logger.Error("outbox: handler panic recovered",
+				"subscription", sub.name, "topic", env.Topic, "panic", r)
+		}
+	}()
+	return sub.handler(b.ctx, env)
+}
+
 func (b *OutboxBus) markDelivered(sub *outboxSub, id []byte) {
 	if _, err := b.db.ExecContext(b.ctx, `
 		UPDATE outbox_subs
 		SET delivered_at = ?, last_error = NULL, next_retry_at = NULL
 		WHERE subscription = ? AND event_id = ?
 	`, b.now().UnixMilli(), sub.name, id); err != nil {
-		// SQLITE_BUSY is expected under heavy write contention with WAL;
-		// the next dispatcher tick retries (the handler ran fine, only
-		// the bookkeeping update lost the race). Log at debug.
+		// SQLITE_BUSY (transient WAL contention) and context.Canceled
+		// (shutdown) are recoverable — next dispatcher tick retries.
 		// Anything else is a real error.
-		if isSQLiteBusy(err) {
-			b.logger.Debug("outbox: mark delivered busy; will retry",
-				"subscription", sub.name)
+		if isSQLiteBusy(err) || errors.Is(err, context.Canceled) {
+			b.logger.Debug("outbox: mark delivered interrupted; will retry",
+				"subscription", sub.name, "err", err)
 			return
 		}
 		b.logger.Error("outbox: mark delivered", "subscription", sub.name, "err", err)

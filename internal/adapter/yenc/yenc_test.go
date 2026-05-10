@@ -157,6 +157,78 @@ func TestDecode_DanglingEscape(t *testing.T) {
 	}
 }
 
+// Truncation: stream ends mid-body without =yend. Common when the
+// NNTP conn drops mid-article. Must error cleanly, not panic, and
+// not silently accept a partial decode.
+func TestDecode_Truncated(t *testing.T) {
+	full := encodeForTest("trunc.bin", []byte("here are some bytes"), 0, 0, 0, 0, 80)
+	// Drop the trailing =yend line.
+	idx := bytes.Index(full, []byte("=yend"))
+	if idx < 0 {
+		t.Fatal("test fixture missing =yend")
+	}
+	truncated := full[:idx]
+	_, _, _, err := Decode(bytes.NewReader(truncated))
+	if err == nil {
+		t.Fatal("expected error for truncated body")
+	}
+	if !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "=yend") {
+		t.Errorf("err = %v; want a message about missing =yend / EOF", err)
+	}
+}
+
+// A zero-byte article (size=0) is valid yEnc — no body bytes between
+// =ybegin and =yend. Decoder should return an empty slice, no error.
+func TestDecode_EmptyBody(t *testing.T) {
+	body := "=ybegin line=128 size=0 name=empty.bin\r\n=yend size=0 crc32=00000000\r\n"
+	got, hdr, trl, err := Decode(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("body length = %d; want 0", len(got))
+	}
+	if hdr.Size != 0 {
+		t.Errorf("Size = %d; want 0", hdr.Size)
+	}
+	if !trl.HasCRC {
+		t.Errorf("HasCRC = false; want true (single-part)")
+	}
+}
+
+// Trailer size can drift from the actual decoded length (poster
+// rounding, encoder bugs). We don't fail on this — CRC is the real
+// integrity check — but the test documents the contract.
+func TestDecode_TrailerSizeMismatch_NotFatal(t *testing.T) {
+	payload := []byte("six bytes? no, 14 bytes here")
+	enc := encodeForTest("x.bin", payload, 0, 0, 0, 0, 128)
+	// Replace the =yend size= value with a wrong number, keep crc32 valid.
+	idx := bytes.Index(enc, []byte("=yend size="))
+	if idx < 0 {
+		t.Fatal("test fixture missing =yend size=")
+	}
+	// Overwrite the digits after "size=" up to the next space with "999".
+	pre := append([]byte(nil), enc[:idx+len("=yend size=")]...)
+	rest := enc[idx+len("=yend size="):]
+	spaceAt := bytes.IndexByte(rest, ' ')
+	if spaceAt < 0 {
+		t.Fatal("malformed fixture")
+	}
+	mangled := append(pre, []byte("999")...)
+	mangled = append(mangled, rest[spaceAt:]...)
+
+	got, _, trl, err := Decode(bytes.NewReader(mangled))
+	if err != nil {
+		t.Fatalf("Decode (size mismatch should not fail): %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("payload mismatch on size-mismatch trailer")
+	}
+	if trl.Size != 999 {
+		t.Errorf("trailer Size = %d; want the bogus 999 we wrote", trl.Size)
+	}
+}
+
 func TestDecodeLine_BasicShift(t *testing.T) {
 	// Manually craft: "X" encoded is X+42 = 130 = 0x82. No critical
 	// bytes here, so it's not escaped.

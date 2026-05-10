@@ -86,6 +86,12 @@ func New(p NewParams, now time.Time) (*UsenetServer, error) {
 	if maxConns < 1 {
 		return nil, fmt.Errorf("server: max_conns %d must be > 0", maxConns)
 	}
+	if err := validateNNTPCredField("username", p.Username); err != nil {
+		return nil, err
+	}
+	if err := validateNNTPCredField("password", p.Password); err != nil {
+		return nil, err
+	}
 
 	s := &UsenetServer{
 		name:      name,
@@ -227,13 +233,23 @@ func (s *UsenetServer) Update(p UpdateParams, now time.Time) error {
 		s.tls = *p.TLS
 		changed = true
 	}
-	if p.Username != nil && *p.Username != s.username {
-		s.username = *p.Username
-		changed = true
+	if p.Username != nil {
+		if err := validateNNTPCredField("username", *p.Username); err != nil {
+			return err
+		}
+		if *p.Username != s.username {
+			s.username = *p.Username
+			changed = true
+		}
 	}
-	if p.Password != nil && *p.Password != s.password {
-		s.password = *p.Password
-		changed = true
+	if p.Password != nil {
+		if err := validateNNTPCredField("password", *p.Password); err != nil {
+			return err
+		}
+		if *p.Password != s.password {
+			s.password = *p.Password
+			changed = true
+		}
 	}
 	if p.MaxConns != nil {
 		if *p.MaxConns < 1 {
@@ -262,4 +278,22 @@ func (s *UsenetServer) PullEvents() []event.Event {
 	out := s.events
 	s.events = nil
 	return out
+}
+
+// validateNNTPCredField rejects credentials containing characters
+// that could corrupt the NNTP wire protocol. NNTP commands are line-
+// terminated by CRLF; a CR/LF in a username or password would let an
+// operator (or attacker who can write to config) inject extra
+// commands on the same connection.
+//
+// Allow empty (anonymous-access servers exist). Reject any byte that
+// is a control character or NUL.
+func validateNNTPCredField(name, v string) error {
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b == '\r' || b == '\n' || b == 0 {
+			return fmt.Errorf("server: %s contains control byte 0x%02x at offset %d", name, b, i)
+		}
+	}
+	return nil
 }

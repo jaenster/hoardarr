@@ -289,13 +289,35 @@ func (c *Conn) Quit(ctx context.Context) error {
 
 // send writes one command line and flushes. Honours ctx via the
 // underlying conn deadline.
+//
+// Any control character (CR, LF, NUL) in line is rejected before write
+// to defend against command-injection: an attacker-controlled
+// substring (e.g. a malicious AUTHINFO password or NZB message-id)
+// could otherwise terminate the current command and inject a second
+// one on the same connection. This is defence-in-depth — callers
+// also validate at parse time.
 func (c *Conn) send(ctx context.Context, line string) error {
+	if err := validateCommandLine(line); err != nil {
+		return err
+	}
 	if dl, ok := ctx.Deadline(); ok {
 		_ = c.netConn.SetWriteDeadline(dl)
 	}
 	defer func() { _ = c.netConn.SetWriteDeadline(time.Time{}) }()
 	if _, err := c.tp.Cmd("%s", line); err != nil {
 		return fmt.Errorf("send %q: %w", firstWord(line), err)
+	}
+	return nil
+}
+
+// validateCommandLine rejects any byte that would split a command in
+// the wire protocol or be misinterpreted by the server.
+func validateCommandLine(line string) error {
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\r', '\n', 0:
+			return fmt.Errorf("nntp: command contains control character (byte 0x%02x at offset %d) — possible injection", line[i], i)
+		}
 	}
 	return nil
 }

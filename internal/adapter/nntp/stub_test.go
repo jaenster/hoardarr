@@ -11,6 +11,7 @@ package nntp
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -348,6 +349,112 @@ func TestDate(t *testing.T) {
 	}
 	if got.Year() != 2026 || got.Month() != 5 || got.Day() != 10 {
 		t.Errorf("date = %v", got)
+	}
+}
+
+// TestDial_ServerClosesAfterGreeting ensures the client surfaces a
+// clean error if the server sends greeting and immediately closes
+// (denied silently). Without ctx-cancel we'd risk hanging.
+func TestDial_ServerClosesAfterGreeting(t *testing.T) {
+	addr, cleanup := startStubServer(t, func(s *stubSession) {
+		s.Send("200 hello")
+		// Handler returns; conn closes.
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, stubUsenetServer(t, addr))
+	if err != nil {
+		// Could fail at dial too, depending on race; either way is acceptable.
+		return
+	}
+	defer c.Close()
+
+	if err := c.Authenticate(ctx); err == nil {
+		t.Error("expected error when server closed after greeting")
+	}
+}
+
+// TestBody_AuthRequired480 ensures a 480 response on BODY surfaces
+// as ErrAuthRequired rather than a generic protocol error. The
+// orchestrator's retry policy will then dial a fresh authed conn.
+func TestBody_AuthRequired480(t *testing.T) {
+	addr, cleanup := startStubServer(t, func(s *stubSession) {
+		s.Send("200 ready")
+		s.ExpectLine("AUTHINFO USER user")
+		s.Send("381 password required")
+		s.ExpectLine("AUTHINFO PASS pass")
+		s.Send("281 authenticated")
+		s.ExpectLine("BODY <msg@host>")
+		s.Send("480 authentication required")
+		s.ExpectLine("QUIT")
+		s.Send("205 closing")
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, stubUsenetServer(t, addr))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Quit(ctx)
+
+	if err := c.Authenticate(ctx); err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+
+	_, err = c.Body(ctx, "msg@host")
+	if !errors.Is(err, ErrAuthRequired) {
+		t.Errorf("err = %v; want ErrAuthRequired", err)
+	}
+}
+
+// TestAuthenticate_BadCredentials481 ensures a 481 on AUTHINFO PASS
+// surfaces as ErrAuthFailed.
+func TestAuthenticate_BadCredentials481(t *testing.T) {
+	addr, cleanup := startStubServer(t, func(s *stubSession) {
+		s.Send("200 ready")
+		s.ExpectLine("AUTHINFO USER user")
+		s.Send("381 password required")
+		s.ExpectLine("AUTHINFO PASS pass")
+		s.Send("481 authentication rejected")
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := Dial(ctx, stubUsenetServer(t, addr))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	err = c.Authenticate(ctx)
+	if !errors.Is(err, ErrAuthFailed) {
+		t.Errorf("err = %v; want ErrAuthFailed", err)
+	}
+}
+
+// Defence-in-depth: send() must reject control characters that would
+// split the command, even if upstream validation slipped.
+func TestSend_RejectsControlCharacters(t *testing.T) {
+	cases := []string{
+		"AUTHINFO USER good\r\nQUIT",
+		"AUTHINFO PASS bad\npassword",
+		"BODY <evil\r\n>",
+		"BODY \x00 nullbyte",
+	}
+	for _, line := range cases {
+		t.Run(line, func(t *testing.T) {
+			if err := validateCommandLine(line); err == nil {
+				t.Errorf("validateCommandLine(%q) = nil; want error", line)
+			}
+		})
+	}
+	if err := validateCommandLine("BODY <safe@host>"); err != nil {
+		t.Errorf("validateCommandLine(safe) = %v; want nil", err)
 	}
 }
 

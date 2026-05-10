@@ -255,6 +255,88 @@ func TestOutbox_Subscribe_RejectsDuplicate(t *testing.T) {
 	}
 }
 
+// A handler that always errors must not pin the dispatcher in a
+// retry loop forever. After MaxDeliveryAttempts, the row is parked
+// and the dispatcher stops trying it.
+func TestOutbox_PoisonMessage_ParksAfterMaxAttempts(t *testing.T) {
+	db := openMigratedDB(t)
+	bus := NewOutboxBus(db, OutboxOptions{
+		Logger:              quietLogger(),
+		PollInterval:        5 * time.Millisecond,
+		BackoffBase:         1 * time.Millisecond,
+		BackoffMax:          5 * time.Millisecond,
+		MaxDeliveryAttempts: 3,
+	})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	var calls atomic.Int32
+	if _, err := bus.Subscribe("poison", "topic", func(_ context.Context, _ event.Envelope) error {
+		calls.Add(1)
+		return errors.New("always fails")
+	}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	if err := bus.Publish(context.Background(), newOutboxEvt("topic", "x", "v", time.Time{})); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	// Wait long enough that all retries have happened. Stable state:
+	// calls.Load() should equal MaxDeliveryAttempts.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && calls.Load() < 3 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Give the dispatcher more polls to confirm no more calls happen
+	// past the cap.
+	time.Sleep(200 * time.Millisecond)
+	final := calls.Load()
+	if final != 3 {
+		t.Errorf("calls = %d; want exactly MaxDeliveryAttempts (3)", final)
+	}
+}
+
+// A handler that panics must not kill the dispatcher. Recovery treats
+// the panic as a regular error and applies the normal retry path.
+func TestOutbox_HandlerPanic_Recovered(t *testing.T) {
+	db := openMigratedDB(t)
+	bus := NewOutboxBus(db, OutboxOptions{
+		Logger:              quietLogger(),
+		PollInterval:        5 * time.Millisecond,
+		BackoffBase:         1 * time.Millisecond,
+		BackoffMax:          5 * time.Millisecond,
+		MaxDeliveryAttempts: 5,
+	})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	var calls atomic.Int32
+	done := make(chan struct{})
+	var doneOnce sync.Once
+
+	if _, err := bus.Subscribe("panicker", "topic", func(_ context.Context, _ event.Envelope) error {
+		c := calls.Add(1)
+		if c <= 2 {
+			panic("intentional test panic")
+		}
+		doneOnce.Do(func() { close(done) })
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	if err := bus.Publish(context.Background(), newOutboxEvt("topic", "x", "v", time.Time{})); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	select {
+	case <-done:
+		// Recovered panics + eventual success: dispatcher survived.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("dispatcher did not recover from panic; calls=%d", calls.Load())
+	}
+}
+
 func TestOutbox_Close_StopsDispatchers(t *testing.T) {
 	db := openMigratedDB(t)
 	bus := NewOutboxBus(db, OutboxOptions{
