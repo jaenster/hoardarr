@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -385,8 +386,15 @@ func (b *OutboxBus) markDelivered(sub *outboxSub, id []byte) {
 		SET delivered_at = ?, last_error = NULL, next_retry_at = NULL
 		WHERE subscription = ? AND event_id = ?
 	`, b.now().UnixMilli(), sub.name, id); err != nil {
-		// We can't recover from this — log and let the next tick retry.
-		// At-least-once: handler may run again.
+		// SQLITE_BUSY is expected under heavy write contention with WAL;
+		// the next dispatcher tick retries (the handler ran fine, only
+		// the bookkeeping update lost the race). Log at debug.
+		// Anything else is a real error.
+		if isSQLiteBusy(err) {
+			b.logger.Debug("outbox: mark delivered busy; will retry",
+				"subscription", sub.name)
+			return
+		}
 		b.logger.Error("outbox: mark delivered", "subscription", sub.name, "err", err)
 	}
 }
@@ -445,3 +453,13 @@ func (s *outboxSub) Close() error {
 
 // Ensure imports stay live for future error-typed comparisons.
 var _ = sql.ErrNoRows
+
+// isSQLiteBusy returns true when err is a SQLITE_BUSY (5) — the
+// transient lock-contention condition that resolves on retry.
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
+}

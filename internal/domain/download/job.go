@@ -198,6 +198,39 @@ func (j *Job) MarkStarted(now time.Time) {
 	j.events = append(j.events, JobStarted{ID: j.id, At: now})
 }
 
+// Pause transitions downloading|queued → paused. The orchestrator
+// observes the JobPaused event and stops dispatching segments for
+// this job. Already-paused / terminal-state calls are no-ops.
+func (j *Job) Pause(now time.Time) {
+	switch j.state {
+	case JobStateQueued, JobStateDownloading:
+		j.state = JobStatePaused
+		j.events = append(j.events, JobPaused{ID: j.id, At: now})
+	}
+}
+
+// Resume transitions paused → downloading (or queued if no work has
+// started yet). The orchestrator observes the JobResumed event and
+// re-enables segment dispatch. Non-paused calls are no-ops.
+func (j *Job) Resume(now time.Time) {
+	if j.state != JobStatePaused {
+		return
+	}
+	if j.startedAt.IsZero() {
+		j.state = JobStateQueued
+	} else {
+		j.state = JobStateDownloading
+	}
+	j.events = append(j.events, JobResumed{ID: j.id, At: now})
+}
+
+// MarkRemoved is called by the application service before deleting
+// the row. It records JobRemoved on the aggregate so the bus delivers
+// the event in the same tx as the DELETE.
+func (j *Job) MarkRemoved(now time.Time) {
+	j.events = append(j.events, JobRemoved{ID: j.id, At: now})
+}
+
 // SegmentByID looks up a segment within the aggregate. Returns nil if
 // the id is not part of this job.
 func (j *Job) SegmentByID(id SegmentID) (*File, *Segment) {

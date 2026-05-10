@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jaenster/hoardarr/internal/api/rest"
+	"github.com/jaenster/hoardarr/internal/api/sse"
 	"github.com/jaenster/hoardarr/internal/config"
 )
 
@@ -48,6 +50,25 @@ func New(cfg config.Config, logger *slog.Logger, web fs.FS) *Server {
 // ServeHTTP makes Server an http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
+}
+
+// MountREST registers the /api/v1/* routes from rest.Handlers under
+// the server's API-key middleware. Called by bootstrap after the
+// services are wired.
+//
+// /api/v1/health remains unauthenticated (liveness probe registered
+// in routes()); every other /api/v1/* route requires the API key.
+func (s *Server) MountREST(h *rest.Handlers) {
+	h.Mount(s.mux, apiKeyMiddleware(s.cfg.Auth.APIKey))
+}
+
+// MountSSE registers /api/v1/queue/stream backed by the live event hub.
+// Same API-key middleware as REST. EventSource clients pass the key
+// via the apikey query parameter (browsers can't set custom headers
+// on EventSource).
+func (s *Server) MountSSE(hub *sse.Hub) {
+	protect := apiKeyMiddleware(s.cfg.Auth.APIKey)
+	s.mux.Handle("GET /api/v1/queue/stream", protect(sse.Handler(hub)))
 }
 
 // routes mounts the request handlers.
