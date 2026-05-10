@@ -145,3 +145,9 @@ func (s *QueueService) List(ctx context.Context) ([]*download.Job, error) {
 func (s *QueueService) Active(ctx context.Context) ([]*download.Job, error) {
 	return s.repo.Active(ctx)
 }
+
+// History returns terminal-state jobs ordered by finished_at DESC,
+// applying any filters the caller supplies. See download.HistoryQuery.
+func (s *QueueService) History(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
+	return s.repo.History(ctx, q)
+}

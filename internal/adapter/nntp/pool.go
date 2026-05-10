@@ -258,6 +258,26 @@ func (p *Pool) IdleCount() int {
 	return len(p.idle)
 }
 
+// PoolStats is a point-in-time snapshot of a Pool's connection
+// accounting. Returned by Stats; surfaced through the REST API.
+type PoolStats struct {
+	MaxConns int
+	InUse    int // semaphore tokens currently issued
+	Idle     int // conns sitting in the idle stack
+}
+
+// Stats returns a snapshot of pool occupancy. The values are sampled
+// independently — Idle and InUse may not sum to anything meaningful
+// across the boundary, but each value is internally consistent.
+func (p *Pool) Stats() PoolStats {
+	idle := p.IdleCount()
+	return PoolStats{
+		MaxConns: p.srv.MaxConns(),
+		InUse:    len(p.sem),
+		Idle:     idle,
+	}
+}
+
 // CloseIdle closes every conn currently in the idle stack without
 // stopping the pool. Useful between orchestrator runs (e.g. after a
 // pause/resume cycle) so a fresh runner always dials clean conns and

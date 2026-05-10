@@ -28,11 +28,19 @@ import (
 	appauth "github.com/jaenster/hoardarr/internal/app/auth"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
+	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
 )
+
+// buildVersion identifies the running binary in /api/v1/system/status
+// and (eventually) in the SAB-compat version mode. Bumped per release;
+// dev builds use the -dev suffix so consumers can detect "not a tagged
+// build". A future link-time -ldflags override could replace this with
+// a git sha at build time.
+const buildVersion = "0.0.1-dev"
 
 // App is the wired-together hoardarr runtime. Construct via Build, run
 // via Run, tear down via Shutdown.
@@ -51,6 +59,9 @@ type App struct {
 	AddJobService *appdownload.AddJobService
 	QueueService  *appdownload.QueueService
 	AuthService   *appauth.Service
+	SystemService *appsystem.Service
+
+	StartedAt time.Time
 
 	Pools        map[domainserver.ServerID]*nntp.Pool
 	Orchestrator *appdownload.OrchestratorService
@@ -171,6 +182,15 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	})
 
 	categoryRepo := sqlite.NewCategoryRepo(db)
+
+	startedAt := time.Now().UTC()
+	systemSvc := appsystem.New(appsystem.Params{
+		Version:   buildVersion,
+		StartedAt: startedAt,
+		Jobs:      jobRepo,
+		Pools:     pools,
+	})
+
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
 	if err != nil {
 		closePools(pools)
@@ -187,7 +207,13 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Servers:    serverService,
 		Categories: categoryRepo,
 		Auth:       authSvc,
-		Logger:     logger,
+		System:     systemSvc,
+		Paths: &rest.PathsView{
+			DataDir:       cfg.Server.DataDir,
+			IncompleteDir: cfg.Paths.IncompleteDir,
+			CompleteDir:   cfg.Paths.CompleteDir,
+		},
+		Logger: logger,
 	})
 	srv.MountSSE(liveHub)
 	httpSrv := &http.Server{
@@ -219,6 +245,8 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Orchestrator:  orch,
 		Verify:        verifySvc,
 		AuthService:   authSvc,
+		SystemService: systemSvc,
+		StartedAt:     startedAt,
 		LiveHub:       liveHub,
 		HTTP:          srv,
 		HTTPServer:    httpSrv,

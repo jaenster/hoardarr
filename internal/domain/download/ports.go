@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/jaenster/hoardarr/internal/domain/server"
 )
@@ -20,11 +21,24 @@ type JobRepository interface {
 	ByNZBHash(ctx context.Context, hash string) (*Job, error)
 	List(ctx context.Context) ([]*Job, error)
 	Active(ctx context.Context) ([]*Job, error)
+	History(ctx context.Context, q HistoryQuery) ([]*Job, error)
 	Delete(ctx context.Context, id JobID) error
 
 	// UpdateSegmentBatch applies many small segment-completion updates
 	// in a single tx. Used by the orchestrator's 100ms drainer.
 	UpdateSegmentBatch(ctx context.Context, updates []SegmentUpdate) error
+}
+
+// HistoryQuery filters terminal-state jobs returned by JobRepository.History.
+// All fields are optional; empty filters mean "no constraint".
+//
+// Limit is clamped by the repo to a sane upper bound (500 today) so a
+// runaway client can't drag the whole history into memory.
+type HistoryQuery struct {
+	Since    *time.Time // finished_at > since
+	Category string     // exact match
+	State    JobState   // optional restriction; zero-value = any terminal state
+	Limit    int        // 0 → repo default (100); negative treated as default
 }
 
 // SegmentUpdate is a single mutation pushed by the orchestrator's

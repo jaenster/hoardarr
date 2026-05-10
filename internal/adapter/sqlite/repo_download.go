@@ -183,6 +183,49 @@ func (r *JobRepo) Active(ctx context.Context) ([]*download.Job, error) {
 	return r.queryJobs(ctx, selectActiveJobs)
 }
 
+// History returns terminal-state jobs (completed/failed/aborted) ordered
+// by finished_at DESC, with optional Since / Category / State filters.
+//
+// Limit is clamped to [1, 500]. Zero or negative → 100. The clamp is
+// hard so a misbehaving client can't drag the whole archive into memory.
+//
+// State filter: if the caller asks for a non-terminal state we still
+// constrain to terminal rows — we never return active jobs from history.
+func (r *JobRepo) History(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	// Build the WHERE clause incrementally. Args are positional in the
+	// order they appear in the clause; we keep both lists in lockstep.
+	clauses := []string{"state IN ('completed','failed','aborted')"}
+	args := []any{}
+	if q.State != "" && (q.State == download.JobStateCompleted ||
+		q.State == download.JobStateFailed ||
+		q.State == download.JobStateAborted) {
+		clauses = []string{"state = ?"}
+		args = append(args, string(q.State))
+	}
+	if q.Since != nil {
+		clauses = append(clauses, "finished_at > ?")
+		args = append(args, q.Since.UnixMilli())
+	}
+	if q.Category != "" {
+		clauses = append(clauses, "category = ?")
+		args = append(args, q.Category)
+	}
+	where := "WHERE " + strings.Join(clauses, " AND ")
+	query := `SELECT ` + jobColumns + ` FROM jobs ` + where +
+		` ORDER BY finished_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	return r.queryJobs(ctx, query, args...)
+}
+
 // Delete removes the job (cascades to files/segments).
 func (r *JobRepo) Delete(ctx context.Context, id download.JobID) error {
 	res, err := r.db.ExecCtx(ctx, `DELETE FROM jobs WHERE id = ?`, int64(id))

@@ -79,3 +79,34 @@ export type User = {
   username: string;
   role: string;
 };
+
+export type SystemStatus = {
+  service: string;
+  version: string;
+  started_at: string;
+  uptime_ms: number;
+  queue: {
+    active: number;
+    total: number;
+  };
+  pools: PoolStatus[];
+};
+
+export type PoolStatus = {
+  server_id: number;
+  server_name: string;
+  host: string;
+  port: number;
+  max_conns: number;
+  in_use: number;
+  idle: number;
+  enabled: boolean;
+};
+
+export type Paths = {
+  data_dir: string;
+  incomplete_dir: string;
+  complete_dir: string;
+  runtime_mutable: boolean;
+  requires_restart: boolean;
+};

@@ -6,7 +6,7 @@
 // in the server middleware for *arr clients but the web UI no longer
 // uses it.
 
-import type { Category, Job, Server, User } from "./types";
+import type { Category, Job, Paths, Server, SystemStatus, User } from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown, msg: string) {
@@ -100,13 +100,62 @@ export const api = {
     return req("DELETE", `/api/v1/queue/${id}`);
   },
 
+  // --- history ----------------------------------------------------
+  listHistory(opts: HistoryOpts = {}): Promise<{ jobs: Job[] | null }> {
+    const qs = new URLSearchParams();
+    if (opts.state) qs.set("state", opts.state);
+    if (opts.category) qs.set("category", opts.category);
+    if (opts.since) qs.set("since", opts.since);
+    if (opts.limit) qs.set("limit", String(opts.limit));
+    const tail = qs.toString();
+    return req("GET", "/api/v1/history" + (tail ? "?" + tail : ""));
+  },
+
   // --- servers + categories --------------------------------------
   listServers(): Promise<{ servers: Server[] | null }> {
     return req("GET", "/api/v1/servers");
   },
+  addServer(body: AddServerBody): Promise<{ id: number }> {
+    return jsonReq("POST", "/api/v1/servers", body);
+  },
+  removeServer(id: number): Promise<void> {
+    return req("DELETE", `/api/v1/servers/${id}`);
+  },
   listCategories(): Promise<{ categories: Category[] | null }> {
     return req("GET", "/api/v1/categories");
   },
+  upsertCategory(body: Category): Promise<Category> {
+    return jsonReq("POST", "/api/v1/categories", body);
+  },
+  removeCategory(name: string): Promise<void> {
+    return req("DELETE", `/api/v1/categories/${encodeURIComponent(name)}`);
+  },
+
+  // --- system + config -------------------------------------------
+  systemStatus(): Promise<SystemStatus> {
+    return req("GET", "/api/v1/system/status");
+  },
+  paths(): Promise<Paths> {
+    return req("GET", "/api/v1/config/paths");
+  },
+};
+
+export type HistoryOpts = {
+  state?: "completed" | "failed" | "aborted";
+  category?: string;
+  since?: string;
+  limit?: number;
+};
+
+export type AddServerBody = {
+  name: string;
+  host: string;
+  port: number;
+  tls?: boolean;
+  username?: string;
+  password?: string;
+  max_conns?: number;
+  priority?: number;
 };
 
 // streamURL returns the URL for the SSE endpoint. The session cookie

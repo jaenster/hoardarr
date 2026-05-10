@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,10 +9,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
+	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	"github.com/jaenster/hoardarr/internal/domain/download"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 )
@@ -22,8 +25,26 @@ type Handlers struct {
 	AddJob     *appdownload.AddJobService
 	Servers    *appserver.Service
 	Categories *sqlite.CategoryRepo
-	Auth       Auther // optional; nil disables /api/v1/auth/*
+	Auth       Auther         // optional; nil disables /api/v1/auth/*
+	System     SystemStatuser // optional; nil disables /api/v1/system/status
+	Paths      *PathsView     // optional; nil disables /api/v1/config/paths
 	Logger     *slog.Logger
+}
+
+// PathsView exposes the resolved data and category dirs for read-only
+// display in the UI. Mutation lives at the config.toml layer (M6 will
+// promote it to runtime once we have a safe drain strategy).
+type PathsView struct {
+	DataDir       string
+	IncompleteDir string
+	CompleteDir   string
+}
+
+// SystemStatuser is the slice of app/system.Service that the REST
+// handler needs. Defined here as an interface so tests can pass a
+// fake without dragging the full service in.
+type SystemStatuser interface {
+	Status(ctx context.Context) (appsystem.Status, error)
 }
 
 // Mount registers the /api/v1/* routes on mux. The caller is responsible
@@ -50,6 +71,9 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	register("POST", "/api/v1/queue/{id}/resume", h.resumeJob)
 	register("DELETE", "/api/v1/queue/{id}", h.removeJob)
 
+	// History.
+	register("GET", "/api/v1/history", h.listHistory)
+
 	// Servers.
 	register("GET", "/api/v1/servers", h.listServers)
 	register("POST", "/api/v1/servers", h.addServer)
@@ -57,6 +81,19 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 
 	// Categories.
 	register("GET", "/api/v1/categories", h.listCategories)
+	register("POST", "/api/v1/categories", h.upsertCategory)
+	register("DELETE", "/api/v1/categories/{name}", h.removeCategory)
+
+	// System status.
+	if h.System != nil {
+		register("GET", "/api/v1/system/status", h.systemStatus)
+	}
+
+	// Paths (read-only). Edits require a config.toml change + restart;
+	// runtime mutation is unsafe while jobs hold open files in incomplete/.
+	if h.Paths != nil {
+		register("GET", "/api/v1/config/paths", h.getPaths)
+	}
 }
 
 // --- queue ----------------------------------------------------------
@@ -119,6 +156,49 @@ func (h *Handlers) addNZB(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"job_id": int64(id)})
+}
+
+// listHistory returns terminal-state jobs (completed/failed/aborted)
+// ordered by finished_at DESC. Query params:
+//
+//	?since=<RFC3339>   only jobs finished after this instant
+//	?category=<name>   exact-match filter
+//	?state=<terminal>  one of completed|failed|aborted
+//	?limit=<n>         clamped server-side to [1, 500]
+func (h *Handlers) listHistory(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	hq := download.HistoryQuery{
+		Category: strings.TrimSpace(q.Get("category")),
+	}
+	if s := strings.TrimSpace(q.Get("state")); s != "" {
+		hq.State = download.JobState(s)
+	}
+	if s := strings.TrimSpace(q.Get("since")); s != "" {
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, fmt.Errorf("since: %w", err))
+			return
+		}
+		hq.Since = &t
+	}
+	if s := strings.TrimSpace(q.Get("limit")); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, fmt.Errorf("limit: %w", err))
+			return
+		}
+		hq.Limit = n
+	}
+	jobs, err := h.Queue.History(r.Context(), hq)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]JobDTO, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, jobToDTO(j))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": out})
 }
 
 func (h *Handlers) pauseJob(w http.ResponseWriter, r *http.Request) {
@@ -231,6 +311,52 @@ func (h *Handlers) removeServer(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// --- system status --------------------------------------------------
+
+func (h *Handlers) systemStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := h.System.Status(r.Context())
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	pools := make([]map[string]any, 0, len(st.Pools))
+	for _, p := range st.Pools {
+		pools = append(pools, map[string]any{
+			"server_id":   int64(p.ServerID),
+			"server_name": p.ServerName,
+			"host":        p.Host,
+			"port":        p.Port,
+			"max_conns":   p.MaxConns,
+			"in_use":      p.InUse,
+			"idle":        p.Idle,
+			"enabled":     p.Enabled,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service":    st.Service,
+		"version":    st.Version,
+		"started_at": st.StartedAt.Format(time.RFC3339),
+		"uptime_ms":  st.Uptime.Milliseconds(),
+		"queue": map[string]any{
+			"active": st.QueueActive,
+			"total":  st.QueueTotal,
+		},
+		"pools": pools,
+	})
+}
+
+// --- paths (read-only) ----------------------------------------------
+
+func (h *Handlers) getPaths(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data_dir":           h.Paths.DataDir,
+		"incomplete_dir":     h.Paths.IncompleteDir,
+		"complete_dir":       h.Paths.CompleteDir,
+		"runtime_mutable":    false,
+		"requires_restart":   true,
+	})
+}
+
 // --- categories -----------------------------------------------------
 
 func (h *Handlers) listCategories(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +370,55 @@ func (h *Handlers) listCategories(w http.ResponseWriter, r *http.Request) {
 		out = append(out, categoryToDTO(c))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"categories": out})
+}
+
+type upsertCategoryReq struct {
+	Name     string `json:"name"`
+	Dir      string `json:"dir,omitempty"`
+	Priority int    `json:"priority,omitempty"`
+}
+
+func (h *Handlers) upsertCategory(w http.ResponseWriter, r *http.Request) {
+	var req upsertCategoryReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	c := sqlite.Category{
+		Name:     strings.TrimSpace(req.Name),
+		Dir:      strings.TrimSpace(req.Dir),
+		Priority: req.Priority,
+	}
+	if err := h.Categories.Save(r.Context(), c); err != nil {
+		switch {
+		case errors.Is(err, sqlite.ErrCategoryNameInvalid):
+			h.writeError(w, http.StatusBadRequest, err)
+		default:
+			h.writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, categoryToDTO(c))
+}
+
+func (h *Handlers) removeCategory(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		h.writeError(w, http.StatusBadRequest, errors.New("name required"))
+		return
+	}
+	if err := h.Categories.Delete(r.Context(), name); err != nil {
+		switch {
+		case errors.Is(err, sqlite.ErrCategoryNotFound):
+			h.writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, sqlite.ErrCategoryReserved):
+			h.writeError(w, http.StatusForbidden, err)
+		default:
+			h.writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- helpers --------------------------------------------------------
