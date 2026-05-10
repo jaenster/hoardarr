@@ -3,9 +3,26 @@ package sqlite
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func countEmbeddedMigrations(t *testing.T) int {
+	t.Helper()
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		t.Fatalf("read migrations: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			n++
+		}
+	}
+	return n
+}
 
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
@@ -74,12 +91,17 @@ func TestMigrate_AppliesAndIsIdempotent(t *testing.T) {
 		t.Fatalf("Migrate (second): %v", err)
 	}
 
+	// Re-running should be a no-op — we just check the row count is
+	// stable (matches the number of embedded migration files), not a
+	// hard-coded value, so this test doesn't churn every time we add
+	// a migration.
+	want := countEmbeddedMigrations(t)
 	var n int
 	if err := db.QueryRowCtx(ctx, `SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("schema_migrations row count = %d; want 1", n)
+	if n != want {
+		t.Errorf("schema_migrations row count = %d; want %d", n, want)
 	}
 }
 

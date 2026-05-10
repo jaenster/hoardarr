@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
+	appdownload "github.com/jaenster/hoardarr/internal/app/download"
+	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	"github.com/jaenster/hoardarr/internal/config"
 	"github.com/jaenster/hoardarr/internal/server"
 )
@@ -35,7 +37,13 @@ type App struct {
 	TxMgr *sqlite.TxManager
 	Bus   *sqlite.OutboxBus
 
-	Server     *server.Server
+	ServerRepo *sqlite.ServerRepo
+	JobRepo    *sqlite.JobRepo
+
+	ServerService *appserver.Service
+	AddJobService *appdownload.AddJobService
+
+	HTTP       *server.Server
 	HTTPServer *http.Server
 
 	shutdownOnce sync.Once
@@ -70,6 +78,12 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	txm := sqlite.NewTxManager(db)
 	bus := sqlite.NewOutboxBus(db, sqlite.OutboxOptions{Logger: logger})
 
+	serverRepo := sqlite.NewServerRepo(db)
+	jobRepo := sqlite.NewJobRepo(db)
+
+	serverService := appserver.New(serverRepo, bus, txm, nil)
+	addJobService := appdownload.NewAddJobService(jobRepo, bus, txm, nil)
+
 	srv := server.New(cfg, logger, frontendFS)
 	httpSrv := &http.Server{
 		Addr:              cfg.Server.Listen,
@@ -78,13 +92,17 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	}
 
 	return &App{
-		Cfg:        cfg,
-		Logger:     logger,
-		DB:         db,
-		TxMgr:      txm,
-		Bus:        bus,
-		Server:     srv,
-		HTTPServer: httpSrv,
+		Cfg:           cfg,
+		Logger:        logger,
+		DB:            db,
+		TxMgr:         txm,
+		Bus:           bus,
+		ServerRepo:    serverRepo,
+		JobRepo:       jobRepo,
+		ServerService: serverService,
+		AddJobService: addJobService,
+		HTTP:          srv,
+		HTTPServer:    httpSrv,
 	}, nil
 }
 
