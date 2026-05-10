@@ -17,9 +17,11 @@
 
 # Runtime / data
 /data/
+/tmp/
 *.db
 *.db-journal
 *.log
+*.nzb
 
 # Local config
 config.local.yaml
