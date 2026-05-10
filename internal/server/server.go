@@ -1,3 +1,13 @@
+// Package server is hoardarr's HTTP composition layer.
+//
+// It owns the http.ServeMux, mounts public and API-key-protected routes,
+// and serves the embedded React frontend (with SPA fallback to
+// index.html for client-side routes).
+//
+// Domain logic does not live here. Handlers are thin: they decode HTTP
+// inputs, call into application services (defined in internal/app/*),
+// and encode responses. Application services are wired by internal/bootstrap
+// and injected into Server via constructor options as they land.
 package server
 
 import (
@@ -10,6 +20,8 @@ import (
 	"github.com/jaenster/hoardarr/internal/config"
 )
 
+// Server wraps an http.ServeMux with hoardarr-specific routing,
+// authentication middleware, and the frontend filesystem.
 type Server struct {
 	cfg    config.Config
 	logger *slog.Logger
@@ -17,7 +29,12 @@ type Server struct {
 	web    fs.FS
 }
 
+// New constructs a Server with the given configuration. web may be nil;
+// when nil, requests for the frontend get a dev-placeholder page.
 func New(cfg config.Config, logger *slog.Logger, web fs.FS) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	s := &Server{
 		cfg:    cfg,
 		logger: logger,
@@ -28,12 +45,34 @@ func New(cfg config.Config, logger *slog.Logger, web fs.FS) *Server {
 	return s
 }
 
+// ServeHTTP makes Server an http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// routes mounts the request handlers.
+//
+// Routing convention:
+//   - Public: /api/v1/health (liveness/readiness)
+//   - Protected by API key: every other /api/v1/* route. The middleware
+//     accepts both X-Api-Key header and ?apikey= query param.
+//   - SAB compatibility (M5+): /sabnzbd/api will be mounted similarly,
+//     using the same middleware.
+//   - Frontend (SPA): everything else.
+//
+// Each protected route is wrapped individually so the public health
+// endpoint can co-exist under /api/v1/ without subverting auth.
 func (s *Server) routes() {
+	protect := apiKeyMiddleware(s.cfg.Auth.APIKey)
+
+	// Public.
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+
+	// Protected. Mounted per-route so the public health endpoint is not
+	// accidentally guarded.
+	s.mux.Handle("GET /api/v1/whoami", protect(http.HandlerFunc(s.handleWhoami)))
+
+	// Frontend (SPA fallback).
 	s.mux.Handle("/", s.handleFrontend())
 }
 
@@ -44,9 +83,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// handleFrontend serves the SPA: static files from web FS, with a fallback to
-// index.html for client-side routes. If web is nil (no build present), serves
-// a dev placeholder.
+// handleWhoami is a small protected probe used by clients (and the
+// in-tree e2e tests) to confirm their API key is accepted. It does not
+// reveal the key itself.
+func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"service":       "hoardarr",
+		"version":       "0.0.1-dev",
+		"authenticated": true,
+	})
+}
+
+// handleFrontend serves the SPA: static files from web FS, with a fallback
+// to index.html for client-side routes. If web is nil (no build present),
+// serves a dev placeholder.
 func (s *Server) handleFrontend() http.Handler {
 	if s.web == nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
