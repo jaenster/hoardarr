@@ -20,10 +20,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jaenster/hoardarr/internal/adapter/bcrypt"
 	"github.com/jaenster/hoardarr/internal/adapter/nntp"
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	"github.com/jaenster/hoardarr/internal/api/rest"
 	"github.com/jaenster/hoardarr/internal/api/sse"
+	appauth "github.com/jaenster/hoardarr/internal/app/auth"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
@@ -48,6 +50,7 @@ type App struct {
 	ServerService *appserver.Service
 	AddJobService *appdownload.AddJobService
 	QueueService  *appdownload.QueueService
+	AuthService   *appauth.Service
 
 	Pools        map[domainserver.ServerID]*nntp.Pool
 	Orchestrator *appdownload.OrchestratorService
@@ -156,6 +159,17 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Logger:        logger,
 	})
 
+	userRepo := sqlite.NewUserRepo(db)
+	sessionRepo := sqlite.NewSessionRepo(db)
+	hasher := &bcrypt.Hasher{}
+	authSvc := appauth.New(appauth.ServiceParams{
+		Users:     userRepo,
+		Sessions:  sessionRepo,
+		Hasher:    hasher,
+		Bus:       bus,
+		TxManager: txm,
+	})
+
 	categoryRepo := sqlite.NewCategoryRepo(db)
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
 	if err != nil {
@@ -166,11 +180,13 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	}
 
 	srv := server.New(cfg, logger, frontendFS)
+	srv.SetSessionAuthenticator(authSvc)
 	srv.MountREST(&rest.Handlers{
 		Queue:      queueService,
 		AddJob:     addJobService,
 		Servers:    serverService,
 		Categories: categoryRepo,
+		Auth:       authSvc,
 		Logger:     logger,
 	})
 	srv.MountSSE(liveHub)
@@ -202,6 +218,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Pools:         pools,
 		Orchestrator:  orch,
 		Verify:        verifySvc,
+		AuthService:   authSvc,
 		LiveHub:       liveHub,
 		HTTP:          srv,
 		HTTPServer:    httpSrv,

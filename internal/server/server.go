@@ -25,10 +25,11 @@ import (
 // Server wraps an http.ServeMux with hoardarr-specific routing,
 // authentication middleware, and the frontend filesystem.
 type Server struct {
-	cfg    config.Config
-	logger *slog.Logger
-	mux    *http.ServeMux
-	web    fs.FS
+	cfg     config.Config
+	logger  *slog.Logger
+	mux     *http.ServeMux
+	web     fs.FS
+	session SessionAuthenticator // optional; nil disables session auth (API key only)
 }
 
 // New constructs a Server with the given configuration. web may be nil;
@@ -52,22 +53,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// MountREST registers the /api/v1/* routes from rest.Handlers under
-// the server's API-key middleware. Called by bootstrap after the
-// services are wired.
+// SetSessionAuthenticator installs the session validator used by the
+// auth middleware. Pass nil to disable session auth entirely
+// (API-key-only mode, for tests or stripped-down deployments).
 //
-// /api/v1/health remains unauthenticated (liveness probe registered
-// in routes()); every other /api/v1/* route requires the API key.
+// Must be called before MountREST / MountSSE so the middleware closure
+// captures the right authenticator.
+func (s *Server) SetSessionAuthenticator(sa SessionAuthenticator) {
+	s.session = sa
+}
+
+// MountREST registers the /api/v1/* routes from rest.Handlers under
+// the server's hybrid auth middleware (session cookie OR API key).
+//
+// /api/v1/health and the unauthenticated auth endpoints
+// (/auth/setup, /auth/login, /auth/whoami) bypass the middleware.
 func (s *Server) MountREST(h *rest.Handlers) {
-	h.Mount(s.mux, apiKeyMiddleware(s.cfg.Auth.APIKey))
+	h.Mount(s.mux, authMiddleware(s.cfg.Auth.APIKey, s.session))
 }
 
 // MountSSE registers /api/v1/queue/stream backed by the live event hub.
-// Same API-key middleware as REST. EventSource clients pass the key
-// via the apikey query parameter (browsers can't set custom headers
-// on EventSource).
+// Same hybrid auth as REST. EventSource clients without a session
+// cookie pass the API key via ?apikey= query param (browsers can't
+// set custom headers on EventSource).
 func (s *Server) MountSSE(hub *sse.Hub) {
-	protect := apiKeyMiddleware(s.cfg.Auth.APIKey)
+	protect := authMiddleware(s.cfg.Auth.APIKey, s.session)
 	s.mux.Handle("GET /api/v1/queue/stream", protect(sse.Handler(hub)))
 }
 
@@ -75,16 +85,18 @@ func (s *Server) MountSSE(hub *sse.Hub) {
 //
 // Routing convention:
 //   - Public: /api/v1/health (liveness/readiness)
-//   - Protected by API key: every other /api/v1/* route. The middleware
-//     accepts both X-Api-Key header and ?apikey= query param.
+//   - Public auth bootstrap: /api/v1/auth/{whoami,setup,login} — needed
+//     before the user has any credential
+//   - Protected by hybrid auth (session cookie OR API key): every
+//     other /api/v1/* route, including /api/v1/auth/logout
 //   - SAB compatibility (M5+): /sabnzbd/api will be mounted similarly,
 //     using the same middleware.
 //   - Frontend (SPA): everything else.
 //
-// Each protected route is wrapped individually so the public health
-// endpoint can co-exist under /api/v1/ without subverting auth.
+// Each protected route is wrapped individually so the public endpoints
+// can co-exist under /api/v1/ without subverting auth.
 func (s *Server) routes() {
-	protect := apiKeyMiddleware(s.cfg.Auth.APIKey)
+	protect := authMiddleware(s.cfg.Auth.APIKey, s.session)
 
 	// Public.
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)

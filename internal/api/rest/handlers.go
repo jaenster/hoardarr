@@ -22,6 +22,7 @@ type Handlers struct {
 	AddJob     *appdownload.AddJobService
 	Servers    *appserver.Service
 	Categories *sqlite.CategoryRepo
+	Auth       Auther // optional; nil disables /api/v1/auth/*
 	Logger     *slog.Logger
 }
 
@@ -29,9 +30,17 @@ type Handlers struct {
 // for wrapping individual routes with the api-key middleware (the
 // `protect` helper passed in). /api/v1/health is NOT registered here —
 // that lives in the server package as a public liveness probe.
+//
+// The /api/v1/auth/* endpoints are registered when Handlers.Auth is
+// non-nil. setup, login, and whoami are public; logout is protected.
 func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Handler) {
 	register := func(method, pattern string, fn http.HandlerFunc) {
 		mux.Handle(method+" "+pattern, protect(fn))
+	}
+
+	// Auth (mostly public — see mountAuth).
+	if h.Auth != nil {
+		h.mountAuth(mux, protect)
 	}
 
 	// Queue.

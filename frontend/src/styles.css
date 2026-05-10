@@ -1042,3 +1042,55 @@ a:hover {
   border-color: var(--accent-line);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.auth-field > span {
+  padding-left: 0.15rem;
+}
+.auth-field input {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+}
+
+/* topbar account menu */
+
+.topbar-account {
+  position: relative;
+}
+.topbar-account-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 9rem;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
+  padding: 0.25rem;
+  z-index: 50;
+}
+.topbar-account-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  padding: 0.45rem 0.6rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+}
+.topbar-account-item:hover {
+  background: var(--bg-soft, rgba(255, 255, 255, 0.05));
+}

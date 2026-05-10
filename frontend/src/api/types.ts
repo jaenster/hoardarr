@@ -73,3 +73,9 @@ export type EventEnvelope = {
   Payload: unknown;
   Attempts: number;
 };
+
+export type User = {
+  id: number;
+  username: string;
+  role: string;
+};

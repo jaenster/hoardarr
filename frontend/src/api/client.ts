@@ -1,23 +1,12 @@
-// Tiny fetch wrapper for /api/v1. Reads the API key from localStorage
-// and attaches it as X-Api-Key. SSE uses a separate URL builder because
-// EventSource can't set headers — for SSE we pass the key as a query
-// param.
+// Tiny fetch wrapper for /api/v1.
+//
+// Auth: requests are authenticated by the session cookie that the
+// server issues on /auth/login (HTTP-only, sent automatically by the
+// browser via `credentials: "include"`). The X-Api-Key path remains
+// in the server middleware for *arr clients but the web UI no longer
+// uses it.
 
-import type { Category, Job, Server } from "./types";
-
-const KEY_STORAGE = "hoardarr.apiKey";
-
-export function getApiKey(): string | null {
-  return localStorage.getItem(KEY_STORAGE);
-}
-
-export function setApiKey(k: string): void {
-  localStorage.setItem(KEY_STORAGE, k);
-}
-
-export function clearApiKey(): void {
-  localStorage.removeItem(KEY_STORAGE);
-}
+import type { Category, Job, Server, User } from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown, msg: string) {
@@ -31,10 +20,15 @@ async function req<T>(
   body?: BodyInit | null,
   extraHeaders: Record<string, string> = {},
 ): Promise<T> {
-  const key = getApiKey();
   const headers: Record<string, string> = { ...extraHeaders };
-  if (key) headers["X-Api-Key"] = key;
-  const res = await fetch(path, { method, headers, body });
+  // JSON encoding for plain object bodies happens at call sites that
+  // need it; FormData / file bodies pass through unmodified.
+  const res = await fetch(path, {
+    method,
+    headers,
+    body,
+    credentials: "include",
+  });
   const text = await res.text();
   let parsed: unknown = null;
   if (text) {
@@ -54,13 +48,38 @@ async function req<T>(
   return parsed as T;
 }
 
+function jsonReq<T>(method: string, path: string, body: unknown): Promise<T> {
+  return req(method, path, JSON.stringify(body), {
+    "Content-Type": "application/json",
+  });
+}
+
+export type WhoamiState =
+  | { state: "needs_setup" }
+  | { state: "needs_login" }
+  | { state: "authenticated"; user: User };
+
 export const api = {
+  // --- auth -----------------------------------------------------
+  whoami(): Promise<WhoamiState> {
+    return req("GET", "/api/v1/auth/whoami");
+  },
+  setupAdmin(username: string, password: string): Promise<{ id: number }> {
+    return jsonReq("POST", "/api/v1/auth/setup", { username, password });
+  },
+  login(username: string, password: string): Promise<{ ok: true }> {
+    return jsonReq("POST", "/api/v1/auth/login", { username, password });
+  },
+  logout(): Promise<void> {
+    return req("POST", "/api/v1/auth/logout");
+  },
+
+  // --- public -----------------------------------------------------
   health(): Promise<{ status: string; service: string }> {
     return req("GET", "/api/v1/health");
   },
-  whoami(): Promise<{ service: string; version: string; authenticated: boolean }> {
-    return req("GET", "/api/v1/whoami");
-  },
+
+  // --- queue ------------------------------------------------------
   listQueue(includeAll = false): Promise<{ jobs: Job[] | null }> {
     const qs = includeAll ? "?include=all" : "";
     return req("GET", "/api/v1/queue" + qs);
@@ -80,6 +99,8 @@ export const api = {
   removeJob(id: number): Promise<void> {
     return req("DELETE", `/api/v1/queue/${id}`);
   },
+
+  // --- servers + categories --------------------------------------
   listServers(): Promise<{ servers: Server[] | null }> {
     return req("GET", "/api/v1/servers");
   },
@@ -88,9 +109,8 @@ export const api = {
   },
 };
 
-// streamURL returns the URL for the SSE endpoint with the api key
-// embedded as a query parameter (EventSource can't set headers).
+// streamURL returns the URL for the SSE endpoint. The session cookie
+// is sent automatically; no apikey query param needed.
 export function streamURL(): string {
-  const key = getApiKey();
-  return `/api/v1/queue/stream${key ? "?apikey=" + encodeURIComponent(key) : ""}`;
+  return "/api/v1/queue/stream";
 }

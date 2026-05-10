@@ -1,89 +1,200 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { KeyRound } from "lucide-react";
-import { api, getApiKey, setApiKey } from "../api/client";
+import { KeyRound, UserPlus } from "lucide-react";
+import { api, ApiError, type WhoamiState } from "../api/client";
 import Button from "./Button";
 
-// AuthGate blocks rendering of children until a valid API key is
-// stored in localStorage.
+// AuthGate is the front door. It probes /api/v1/auth/whoami once on
+// mount, then renders one of:
 //
-// On first render: probes /api/v1/whoami with the stored key (if any).
-// If unset or rejected, shows a small splash form. Submitting a key
-// re-probes; on 200 it persists and the gate lifts.
+//   - children                       (state: authenticated)
+//   - <SetupAdminForm/>              (state: needs_setup, first run)
+//   - <LoginForm/>                   (state: needs_login)
 //
-// The key is shown in the daemon's first-run log and in config.toml
-// under [auth] api_key. The user pastes it once.
+// Submitting either form re-probes whoami so the children render
+// without a refresh.
 export default function AuthGate({ children }: { children: ReactNode }) {
-  type Phase = "checking" | "ok" | "needs-key" | "submitting";
-  const [phase, setPhase] = useState<Phase>("checking");
-  const [input, setInput] = useState("");
+  const [state, setState] = useState<WhoamiState | "checking" | "error">("checking");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    if (!getApiKey()) {
-      setPhase("needs-key");
-      return;
-    }
-    api
-      .whoami()
-      .then(() => {
-        if (!cancelled) setPhase("ok");
-      })
-      .catch(() => {
-        if (!cancelled) setPhase("needs-key");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const onSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setPhase("submitting");
+  const refresh = async () => {
+    setState("checking");
     setError(null);
-    setApiKey(input.trim());
     try {
-      await api.whoami();
-      setPhase("ok");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setPhase("needs-key");
+      const w = await api.whoami();
+      setState(w);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setState("error");
     }
   };
 
-  if (phase === "ok") return <>{children}</>;
-  if (phase === "checking") {
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  if (state === "checking") {
     return <div className="auth-gate"><p className="muted">Checking…</p></div>;
   }
+  if (state === "error") {
+    return (
+      <div className="auth-gate">
+        <div className="auth-form">
+          <h1>Can't reach server</h1>
+          <p className="text-err">{error}</p>
+          <Button variant="primary" onClick={() => void refresh()}>Retry</Button>
+        </div>
+      </div>
+    );
+  }
+  if (state.state === "authenticated") {
+    return <>{children}</>;
+  }
+  if (state.state === "needs_setup") {
+    return <SetupAdminForm onDone={refresh} />;
+  }
+  return <LoginForm onDone={refresh} />;
+}
+
+function SetupAdminForm({ onDone }: { onDone: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const valid =
+    username.trim().length > 0 &&
+    password.length >= 8 &&
+    password === confirm;
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!valid) return;
+    setSubmitting(true);
+    setErr(null);
+    try {
+      await api.setupAdmin(username.trim(), password);
+      onDone();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setErr(body?.error ?? e.message);
+      } else {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+      setSubmitting(false);
+    }
+  };
 
   return (
     <div className="auth-gate">
-      <form className="auth-form" onSubmit={onSubmit}>
+      <form className="auth-form" onSubmit={submit}>
+        <div className="auth-icon" aria-hidden="true">
+          <UserPlus size={22} />
+        </div>
+        <h1>Welcome to hoardarr</h1>
+        <p className="muted">
+          No users exist yet. Create the first admin account.
+        </p>
+        <label className="auth-field">
+          <span>Username</span>
+          <input
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="username"
+            autoFocus
+            spellCheck={false}
+          />
+        </label>
+        <label className="auth-field">
+          <span>Password (8+ chars)</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        <label className="auth-field">
+          <span>Confirm password</span>
+          <input
+            type="password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        {err && <p className="text-err">{err}</p>}
+        {confirm && password !== confirm && (
+          <p className="text-err">Passwords don't match.</p>
+        )}
+        <Button variant="primary" type="submit" disabled={!valid || submitting}>
+          {submitting ? "Creating…" : "Create admin"}
+        </Button>
+      </form>
+    </div>
+  );
+}
+
+function LoginForm({ onDone }: { onDone: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const valid = username.trim().length > 0 && password.length > 0;
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!valid) return;
+    setSubmitting(true);
+    setErr(null);
+    try {
+      await api.login(username.trim(), password);
+      onDone();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setErr("Invalid username or password.");
+      } else if (e instanceof Error) {
+        setErr(e.message);
+      } else {
+        setErr(String(e));
+      }
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="auth-gate">
+      <form className="auth-form" onSubmit={submit}>
         <div className="auth-icon" aria-hidden="true">
           <KeyRound size={22} />
         </div>
-        <h1>API key required</h1>
-        <p className="muted">
-          Paste the value from <code className="inline-code">[auth] api_key</code> in
-          your <code className="inline-code">config.toml</code> (or the
-          <code className="inline-code"> hoardarr</code> daemon's first-run log).
-        </p>
-        <input
-          type="password"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="32 hex characters"
-          autoComplete="off"
-          autoFocus
-          spellCheck={false}
-        />
-        {error && <p className="text-err">{error}</p>}
-        <Button
-          variant="primary"
-          type="submit"
-          disabled={phase === "submitting" || input.trim().length === 0}
-        >
-          {phase === "submitting" ? "Verifying…" : "Continue"}
+        <h1>Sign in</h1>
+        <label className="auth-field">
+          <span>Username</span>
+          <input
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="username"
+            autoFocus
+            spellCheck={false}
+          />
+        </label>
+        <label className="auth-field">
+          <span>Password</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="current-password"
+          />
+        </label>
+        {err && <p className="text-err">{err}</p>}
+        <Button variant="primary" type="submit" disabled={!valid || submitting}>
+          {submitting ? "Signing in…" : "Sign in"}
         </Button>
       </form>
     </div>
