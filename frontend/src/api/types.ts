@@ -128,6 +128,20 @@ export type General = {
   sab_base: string;
 };
 
+export type LogEntry = {
+  time: string;
+  level: string;
+  message: string;
+  attrs?: Record<string, string>;
+};
+
+export type Throughput = {
+  window_seconds: number;
+  series: number[];
+  total_bytes: number;
+  current_bytes_per_sec: number;
+};
+
 export type Subscription = {
   id: number;
   name: string;

@@ -15,6 +15,7 @@ import (
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
 	"github.com/jaenster/hoardarr/internal/domain/event"
+	"github.com/jaenster/hoardarr/internal/loghub"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	"github.com/jaenster/hoardarr/internal/domain/download"
@@ -34,6 +35,7 @@ type Handlers struct {
 	General       *GeneralView   // optional; nil disables /api/v1/config/general
 	Subscriptions Subscriptions  // optional; nil disables /api/v1/subscriptions
 	Outbox        EventReader    // optional; nil disables /api/v1/queue/{id}/events
+	LogHub        *loghub.Hub    // optional; nil disables /api/v1/system/logs*
 	Logger        *slog.Logger
 }
 
@@ -77,6 +79,7 @@ type GeneralView struct {
 // fake without dragging the full service in.
 type SystemStatuser interface {
 	Status(ctx context.Context) (appsystem.Status, error)
+	Throughput() *appsystem.Throughput
 }
 
 // Mount registers the /api/v1/* routes on mux. The caller is responsible
@@ -122,6 +125,11 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	// System status.
 	if h.System != nil {
 		register("GET", "/api/v1/system/status", h.systemStatus)
+		register("GET", "/api/v1/system/throughput", h.systemThroughput)
+	}
+	if h.LogHub != nil {
+		register("GET", "/api/v1/system/logs", h.systemLogsSnapshot)
+		register("GET", "/api/v1/system/logs/stream", h.systemLogsStream)
 	}
 
 	// Paths (read-only). Edits require a config.toml change + restart;
@@ -385,6 +393,87 @@ func (h *Handlers) removeServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- system throughput ----------------------------------------------
+
+func (h *Handlers) systemThroughput(w http.ResponseWriter, _ *http.Request) {
+	tp := h.System.Throughput()
+	if tp == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"window_seconds":       appsystem.WindowSize,
+			"series":               []int64{},
+			"total_bytes":          0,
+			"current_bytes_per_sec": 0,
+		})
+		return
+	}
+	s := tp.Sample()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window_seconds":       appsystem.WindowSize,
+		"series":               s.Series,
+		"total_bytes":          s.Total,
+		"current_bytes_per_sec": s.CurrentBytesPerSec,
+	})
+}
+
+// --- system logs ----------------------------------------------------
+
+// systemLogsSnapshot returns the current ring contents oldest -> newest.
+// Used by the System page on first load. The client then opens the
+// SSE stream below for live tail.
+func (h *Handlers) systemLogsSnapshot(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": h.LogHub.Snapshot(),
+	})
+}
+
+// systemLogsStream is an SSE endpoint that flushes one event per log
+// record. The Subscribe channel is drained per ctx cancel.
+func (h *Handlers) systemLogsStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
+
+	ch, cancel := h.LogHub.Subscribe()
+	defer cancel()
+
+	// Send a tiny initial event so the client knows the stream is alive.
+	_, _ = fmt.Fprintf(w, "event: ready\ndata: {}\n\n")
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e, ok := <-ch:
+			if !ok {
+				return
+			}
+			b, err := json.Marshal(e)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "event: log\ndata: %s\n\n", b); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 // --- system status --------------------------------------------------

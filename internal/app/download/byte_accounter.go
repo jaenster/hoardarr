@@ -28,8 +28,9 @@ import (
 
 // ByteAccounter holds the staged deltas. Safe for concurrent Add.
 type ByteAccounter struct {
-	mu     sync.Mutex
-	deltas map[server.ServerID]int64
+	mu       sync.Mutex
+	deltas   map[server.ServerID]int64
+	observer func(n int64) // optional; gets every Add (n only)
 }
 
 // NewByteAccounter constructs an empty accounter.
@@ -37,14 +38,31 @@ func NewByteAccounter() *ByteAccounter {
 	return &ByteAccounter{deltas: make(map[server.ServerID]int64)}
 }
 
-// Add atomically increments the running delta for one server.
+// WithObserver installs a per-Add callback. Used by the throughput
+// tracker to record bytes/sec without coupling fetcher to system.
+// Returns the accounter for chaining.
+func (a *ByteAccounter) WithObserver(fn func(n int64)) *ByteAccounter {
+	a.mu.Lock()
+	a.observer = fn
+	a.mu.Unlock()
+	return a
+}
+
+// Add atomically increments the running delta for one server, then
+// invokes the observer if one is registered. The observer fires
+// outside the lock so it can do its own synchronization without risk
+// of deadlock against Drain.
 func (a *ByteAccounter) Add(id server.ServerID, n int64) {
 	if n <= 0 {
 		return
 	}
 	a.mu.Lock()
 	a.deltas[id] += n
+	obs := a.observer
 	a.mu.Unlock()
+	if obs != nil {
+		obs(n)
+	}
 }
 
 // Drain returns the accumulated deltas and resets the map. Used by

@@ -57,22 +57,24 @@ type ServerStatRepo interface {
 
 // Service composes Status snapshots from authoritative sources.
 type Service struct {
-	version   string
-	startedAt time.Time
-	jobs      download.JobRepository
-	pools     map[domainserver.ServerID]*nntp.Pool
-	servers   ServerStatRepo
-	now       func() time.Time
+	version    string
+	startedAt  time.Time
+	jobs       download.JobRepository
+	pools      map[domainserver.ServerID]*nntp.Pool
+	servers    ServerStatRepo
+	throughput *Throughput
+	now        func() time.Time
 }
 
 // Params gathers Service dependencies.
 type Params struct {
-	Version   string
-	StartedAt time.Time
-	Jobs      download.JobRepository
-	Pools     map[domainserver.ServerID]*nntp.Pool
-	Servers   ServerStatRepo
-	Now       func() time.Time
+	Version    string
+	StartedAt  time.Time
+	Jobs       download.JobRepository
+	Pools      map[domainserver.ServerID]*nntp.Pool
+	Servers    ServerStatRepo
+	Throughput *Throughput
+	Now        func() time.Time
 }
 
 // New constructs a Service. StartedAt should be the App start time so
@@ -82,14 +84,20 @@ func New(p Params) *Service {
 		p.Now = func() time.Time { return time.Now().UTC() }
 	}
 	return &Service{
-		version:   p.Version,
-		startedAt: p.StartedAt,
-		jobs:      p.Jobs,
-		pools:     p.Pools,
-		servers:   p.Servers,
-		now:       p.Now,
+		version:    p.Version,
+		startedAt:  p.StartedAt,
+		jobs:       p.Jobs,
+		pools:      p.Pools,
+		servers:    p.Servers,
+		throughput: p.Throughput,
+		now:        p.Now,
 	}
 }
+
+// Throughput exposes the rolling-window byte-rate tracker for the
+// /api/v1/system/throughput endpoint. Returns nil if no tracker was
+// supplied (system status still works, just no graph).
+func (s *Service) Throughput() *Throughput { return s.throughput }
 
 // Status samples a fresh snapshot. Repository errors propagate; pool
 // snapshots can't fail (they read in-memory counters).

@@ -1060,6 +1060,61 @@ a:hover {
   color: var(--text);
 }
 
+/* sparkline + log viewer (System page) */
+
+.sparkline {
+  vertical-align: middle;
+}
+.log-viewer {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.78rem;
+  max-height: 24rem;
+  overflow: auto;
+  background: var(--bg);
+}
+.log-line {
+  display: flex;
+  gap: 0.55rem;
+  align-items: baseline;
+  padding: 0.18rem 0.75rem;
+  white-space: nowrap;
+}
+.log-line:hover {
+  background: var(--bg-elev-2);
+}
+.log-time {
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+.log-level {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+  min-width: 3rem;
+  flex-shrink: 0;
+}
+.log-line.log-warn .log-level {
+  color: var(--warn);
+}
+.log-line.log-error .log-level {
+  color: var(--err);
+}
+.log-line.log-debug .log-level {
+  color: var(--text-faint);
+}
+.log-msg {
+  color: var(--text);
+  flex-shrink: 0;
+}
+.log-attr {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+.log-attr-value {
+  color: var(--text);
+}
+
 /* per-job event timeline (JobDetail) */
 
 .timeline {

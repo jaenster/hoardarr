@@ -11,10 +11,12 @@ import type {
   EventEnvelope,
   General,
   Job,
+  LogEntry,
   Paths,
   Server,
   Subscription,
   SystemStatus,
+  Throughput,
   User,
 } from "./types";
 
@@ -156,6 +158,12 @@ export const api = {
   general(): Promise<General> {
     return req("GET", "/api/v1/config/general");
   },
+  throughput(): Promise<Throughput> {
+    return req("GET", "/api/v1/system/throughput");
+  },
+  logSnapshot(): Promise<{ entries: LogEntry[] }> {
+    return req("GET", "/api/v1/system/logs");
+  },
 
   // --- subscriptions / webhooks ----------------------------------
   listSubscriptions(): Promise<{ subscriptions: Subscription[] }> {
@@ -207,4 +215,9 @@ export type AddServerBody = {
 // is sent automatically; no apikey query param needed.
 export function streamURL(): string {
   return "/api/v1/queue/stream";
+}
+
+// logStreamURL is the SSE endpoint that pushes new log entries.
+export function logStreamURL(): string {
+  return "/api/v1/system/logs/stream";
 }

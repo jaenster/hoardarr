@@ -40,6 +40,7 @@ import (
 	adapterrar "github.com/jaenster/hoardarr/internal/adapter/rar"
 
 	"github.com/jaenster/hoardarr/internal/domain/extract"
+	"github.com/jaenster/hoardarr/internal/loghub"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
@@ -97,6 +98,7 @@ type App struct {
 	Extract      *appextract.Service
 	Notify       *appnotify.Service
 	ByteFlusher  *appdownload.ByteFlusher
+	LogHub       *loghub.Hub
 
 	LiveHub *sse.Hub
 
@@ -116,6 +118,7 @@ type BuildOption func(*buildOptions)
 type buildOptions struct {
 	nntpDialer nntp.Dialer
 	extractor  extract.Extractor
+	logHub     *loghub.Hub
 }
 
 // WithNNTPDialer overrides the default network dialer used by all
@@ -129,6 +132,13 @@ func WithNNTPDialer(d nntp.Dialer) BuildOption {
 // exercising the deliver/extract orchestration flow.
 func WithExtractor(e extract.Extractor) BuildOption {
 	return func(o *buildOptions) { o.extractor = e }
+}
+
+// WithLogHub plumbs the process-global log hub (created in main) into
+// the App so the REST API can expose the recent-logs snapshot and
+// live tail.
+func WithLogHub(h *loghub.Hub) BuildOption {
+	return func(o *buildOptions) { o.logHub = h }
 }
 
 // Build wires the runtime: ensures data directories exist, opens the
@@ -190,7 +200,10 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		return nil, fmt.Errorf("build pools: %w", err)
 	}
 
-	byteAccounter := appdownload.NewByteAccounter()
+	throughput := appsystem.NewThroughput()
+	byteAccounter := appdownload.NewByteAccounter().WithObserver(func(n int64) {
+		throughput.Add(n)
+	})
 	byteFlusher := appdownload.NewByteFlusher(byteAccounter, serverRepo, 10*time.Second, logger)
 
 	orch := appdownload.NewOrchestratorService(appdownload.OrchestratorServiceParams{
@@ -281,11 +294,12 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 
 	startedAt := time.Now().UTC()
 	systemSvc := appsystem.New(appsystem.Params{
-		Version:   buildVersion,
-		StartedAt: startedAt,
-		Jobs:      jobRepo,
-		Pools:     pools,
-		Servers:   serverRepo,
+		Version:    buildVersion,
+		StartedAt:  startedAt,
+		Jobs:       jobRepo,
+		Pools:      pools,
+		Servers:    serverRepo,
+		Throughput: throughput,
 	})
 
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
@@ -318,6 +332,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			LogLevel: cfg.Server.LogLevel,
 			SABBase:  buildSABBase(cfg.Server.Listen),
 		},
+		LogHub: bo.logHub,
 		Logger: logger,
 	})
 	srv.MountSAB(&sab.Handler{
@@ -362,6 +377,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Extract:       extractSvc,
 		Notify:        notifySvc,
 		ByteFlusher:   byteFlusher,
+		LogHub:        bo.logHub,
 		AuthService:   authSvc,
 		SystemService: systemSvc,
 		StartedAt:     startedAt,

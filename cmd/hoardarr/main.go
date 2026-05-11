@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+
+	"github.com/jaenster/hoardarr/internal/loghub"
 )
 
 // logLevel is a process-global LevelVar so the daemon can adjust its
@@ -22,8 +24,13 @@ import (
 // the handler or any of its child loggers.
 var logLevel = new(slog.LevelVar) // starts at INFO
 
+// logHub mirrors every record into an in-memory ring buffer so the
+// System page's Logs tab can show recent lines + tail live.
+var logHub = loghub.New(1024)
+
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	base := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})
+	logger := slog.New(loghub.NewHandler(base, logHub))
 	slog.SetDefault(logger)
 
 	args := os.Args[1:]

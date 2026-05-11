@@ -42,7 +42,9 @@ func cmdServe(args []string, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	app, err := bootstrap.Build(ctx, cfg, hoardarr.FrontendFS, logger)
+	app, err := bootstrap.Build(ctx, cfg, hoardarr.FrontendFS, logger,
+		bootstrap.WithLogHub(logHub),
+	)
 	if err != nil {
 		return err
 	}
