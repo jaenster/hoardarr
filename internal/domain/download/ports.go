@@ -35,6 +35,11 @@ type JobRepository interface {
 	ListJobsOnly(ctx context.Context) ([]*Job, error)
 	ActiveJobsOnly(ctx context.Context) ([]*Job, error)
 	HistoryJobsOnly(ctx context.Context, q HistoryQuery) ([]*Job, error)
+	// CountAll / CountActive return scalar counts — for endpoints that
+	// only display queue depth (e.g. /api/v1/system/status). Doesn't
+	// materialise any rows.
+	CountAll(ctx context.Context) (int, error)
+	CountActive(ctx context.Context) (int, error)
 	History(ctx context.Context, q HistoryQuery) ([]*Job, error)
 	Delete(ctx context.Context, id JobID) error
 

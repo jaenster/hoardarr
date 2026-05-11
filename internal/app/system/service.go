@@ -117,11 +117,16 @@ func (s *Service) Throughput() *Throughput { return s.throughput }
 func (s *Service) Status(ctx context.Context) (Status, error) {
 	now := s.now()
 
-	active, err := s.jobs.Active(ctx)
+	// The /system/status response only exposes queue depth as counts —
+	// don't materialise aggregates. Previously this loaded every job
+	// + every file + every segment per call; pprof on the live
+	// container had it eating ~38% of CPU all by itself under the
+	// frontend's 2 s polling.
+	activeCount, err := s.jobs.CountActive(ctx)
 	if err != nil {
 		return Status{}, err
 	}
-	all, err := s.jobs.List(ctx)
+	totalCount, err := s.jobs.CountAll(ctx)
 	if err != nil {
 		return Status{}, err
 	}
@@ -168,8 +173,8 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		Version:     s.version,
 		StartedAt:   s.startedAt,
 		Uptime:      now.Sub(s.startedAt),
-		QueueActive: len(active),
-		QueueTotal:  len(all),
+		QueueActive: activeCount,
+		QueueTotal:  totalCount,
 		Pools:       pools,
 	}, nil
 }

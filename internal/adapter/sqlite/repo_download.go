@@ -217,6 +217,27 @@ func (r *JobRepo) ActiveJobsOnly(ctx context.Context) ([]*download.Job, error) {
 	return r.queryJobsBare(ctx, selectActiveJobs)
 }
 
+// CountAll returns the total number of jobs. Used by /api/v1/system/status
+// which only displays queue depth — no need to materialize aggregates.
+func (r *JobRepo) CountAll(ctx context.Context) (int, error) {
+	var n int
+	if err := r.db.QueryRowCtx(ctx, `SELECT COUNT(*) FROM jobs`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CountActive returns the number of jobs in non-terminal states.
+// Used by /api/v1/system/status.
+func (r *JobRepo) CountActive(ctx context.Context) (int, error) {
+	var n int
+	const q = `SELECT COUNT(*) FROM jobs WHERE state IN ('queued','downloading','paused','download_complete','verifying','repairing','unpacking','waiting_for_server')`
+	if err := r.db.QueryRowCtx(ctx, q).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // History returns terminal-state jobs (completed/failed/aborted) ordered
 // by finished_at DESC, with optional Since / Category / State filters.
 //
