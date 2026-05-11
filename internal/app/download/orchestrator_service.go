@@ -43,7 +43,6 @@ type OrchestratorService struct {
 	repo          download.JobRepository
 	bus           event.Bus
 	txm           tx.TransactionManager
-	pools         map[server.ServerID]*nntp.Pool
 	accounter     *ByteAccounter // optional; per-server byte tally
 	limiter       *Limiter       // optional; bandwidth throttle
 	incompleteDir string
@@ -52,6 +51,10 @@ type OrchestratorService struct {
 	flushInterval time.Duration
 	maxAttempts   int
 	baseBackoff   time.Duration
+	poolFactory   PoolFactory // optional; if set, server.usenet.added events hot-wire new pools
+
+	poolsMu sync.RWMutex
+	pools   map[server.ServerID]*nntp.Pool
 
 	mu      sync.Mutex
 	runners map[download.JobID]*runnerHandle
@@ -61,6 +64,13 @@ type OrchestratorService struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	started bool
+}
+
+// PoolFactory builds an nntp.Pool for the server identified by id.
+// Owned by bootstrap (which knows the dialer + pool options); the
+// orchestrator calls it on server.usenet.added/enabled events.
+type PoolFactory interface {
+	BuildPool(ctx context.Context, id server.ServerID) (*nntp.Pool, error)
 }
 
 // OrchestratorServiceParams gathers dependencies for NewOrchestratorService.
@@ -77,6 +87,10 @@ type OrchestratorServiceParams struct {
 	FlushInterval time.Duration // optional, default 100ms
 	MaxAttempts   int           // optional, default 3
 	BaseBackoff   time.Duration // optional, default 200ms
+	// PoolFactory enables hot-wiring NNTP pools when the operator
+	// adds / enables / disables servers from the UI. Nil → static
+	// pool set (tests + the historical behaviour).
+	PoolFactory PoolFactory
 }
 
 // NewOrchestratorService constructs the service.
@@ -93,11 +107,15 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		p.Now = func() time.Time { return time.Now().UTC() }
 	}
 	rootCtx, cancel := context.WithCancel(context.Background())
+	pools := p.Pools
+	if pools == nil {
+		pools = make(map[server.ServerID]*nntp.Pool)
+	}
 	return &OrchestratorService{
 		repo:          p.Repo,
 		bus:           p.Bus,
 		txm:           p.TxManager,
-		pools:         p.Pools,
+		pools:         pools,
 		accounter:     p.Accounter,
 		limiter:       p.Limiter,
 		incompleteDir: p.IncompleteDir,
@@ -106,9 +124,49 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		flushInterval: p.FlushInterval,
 		maxAttempts:   p.MaxAttempts,
 		baseBackoff:   p.BaseBackoff,
+		poolFactory:   p.PoolFactory,
 		runners:       make(map[download.JobID]*runnerHandle),
 		rootCtx:       rootCtx,
 		cancel:        cancel,
+	}
+}
+
+// PoolsSnapshot returns a shallow copy of the current pool set. Safe
+// to iterate without holding any orchestrator lock. Used by
+// TieredFetcher on every Fetch so live pool changes are picked up
+// immediately.
+func (s *OrchestratorService) PoolsSnapshot() map[server.ServerID]*nntp.Pool {
+	s.poolsMu.RLock()
+	defer s.poolsMu.RUnlock()
+	out := make(map[server.ServerID]*nntp.Pool, len(s.pools))
+	for k, v := range s.pools {
+		out[k] = v
+	}
+	return out
+}
+
+// AddPool registers (or replaces) a pool for the given server. Any
+// existing pool with the same id is closed before being replaced.
+// Idempotent for identical (id, pool) pairs.
+func (s *OrchestratorService) AddPool(id server.ServerID, pool *nntp.Pool) {
+	s.poolsMu.Lock()
+	defer s.poolsMu.Unlock()
+	if existing, ok := s.pools[id]; ok && existing != pool {
+		existing.Close()
+	}
+	s.pools[id] = pool
+	s.logger.Info("pool registered live", "server_id", int64(id), "pools", len(s.pools))
+}
+
+// RemovePool closes and forgets the pool for the given server. No-op
+// if no such pool is registered.
+func (s *OrchestratorService) RemovePool(id server.ServerID) {
+	s.poolsMu.Lock()
+	defer s.poolsMu.Unlock()
+	if pool, ok := s.pools[id]; ok {
+		pool.Close()
+		delete(s.pools, id)
+		s.logger.Info("pool removed live", "server_id", int64(id), "pools", len(s.pools))
 	}
 }
 
@@ -132,28 +190,32 @@ func (s *OrchestratorService) Start(ctx context.Context) error {
 	}
 	s.subs = subs
 
-	if len(s.pools) == 0 {
-		s.logger.Warn("orchestrator service started without any NNTP pools; downloads will not run until a server is added and the daemon restarts")
-	} else {
-		active, err := s.repo.Active(ctx)
-		if err != nil {
-			return fmt.Errorf("list active jobs: %w", err)
+	poolCount := len(s.PoolsSnapshot())
+	if poolCount == 0 {
+		if s.poolFactory != nil {
+			s.logger.Info("orchestrator started with no pools; waiting for server.usenet.added events to wire them live")
+		} else {
+			s.logger.Warn("orchestrator started without any NNTP pools; downloads will not run until a server is added (and the daemon picks them up)")
 		}
-		for _, j := range active {
-			if j.State() == download.JobStatePaused {
-				continue
-			}
-			if j.State().IsTerminal() {
-				continue
-			}
-			s.startRunner(j.ID())
+	}
+	active, err := s.repo.Active(ctx)
+	if err != nil {
+		return fmt.Errorf("list active jobs: %w", err)
+	}
+	for _, j := range active {
+		if j.State() == download.JobStatePaused {
+			continue
 		}
+		if j.State().IsTerminal() {
+			continue
+		}
+		s.startRunner(j.ID())
 	}
 
 	s.started = true
 	s.logger.Info("orchestrator service started",
 		"active_jobs", len(s.runners),
-		"pools", len(s.pools))
+		"pools", poolCount)
 	return nil
 }
 
@@ -177,7 +239,7 @@ func (s *OrchestratorService) Stop() error {
 	// reusing conns that were idle when their previous holder
 	// cancelled. The pools themselves remain alive and ready for
 	// new acquires.
-	for _, p := range s.pools {
+	for _, p := range s.PoolsSnapshot() {
 		p.CloseIdle()
 	}
 
@@ -215,6 +277,15 @@ func (s *OrchestratorService) subscribe() ([]event.Subscription, error) {
 		{"orchestrator-job-paused", "download.job.paused", s.onJobPaused},
 		{"orchestrator-job-resumed", "download.job.resumed", s.onJobResumed},
 		{"orchestrator-job-removed", "download.job.removed", s.onJobRemoved},
+	}
+	if s.poolFactory != nil {
+		pairs = append(pairs,
+			spec{"orchestrator-server-added", "server.usenet.added", s.onServerAddedOrEnabled},
+			spec{"orchestrator-server-enabled", "server.usenet.enabled", s.onServerAddedOrEnabled},
+			spec{"orchestrator-server-updated", "server.usenet.updated", s.onServerAddedOrEnabled},
+			spec{"orchestrator-server-disabled", "server.usenet.disabled", s.onServerDisabledOrRemoved},
+			spec{"orchestrator-server-removed", "server.usenet.removed", s.onServerDisabledOrRemoved},
+		)
 	}
 	for _, p := range pairs {
 		sub, err := s.bus.Subscribe(p.name, p.topic, p.handler)
@@ -265,6 +336,69 @@ func (s *OrchestratorService) onJobRemoved(_ context.Context, env event.Envelope
 	return nil
 }
 
+// onServerAddedOrEnabled handles server.usenet.{added,enabled,updated}
+// by building a pool for the now-eligible server (if the factory is
+// wired) and kicking any active jobs that were sitting idle for lack
+// of pools. Idempotent — AddPool replaces an existing pool with the
+// same id, so duplicate events don't leak conns.
+func (s *OrchestratorService) onServerAddedOrEnabled(ctx context.Context, env event.Envelope) error {
+	if s.poolFactory == nil {
+		return nil
+	}
+	var idVal struct {
+		ID server.ServerID `json:"id"`
+	}
+	if err := json.Unmarshal(env.Payload, &idVal); err != nil {
+		return fmt.Errorf("decode server event: %w", err)
+	}
+	pool, err := s.poolFactory.BuildPool(ctx, idVal.ID)
+	if err != nil {
+		s.logger.Warn("hot-wire pool failed", "server_id", int64(idVal.ID), "err", err)
+		return nil
+	}
+	if pool == nil {
+		// Server disabled or otherwise ineligible — drop any existing pool.
+		s.RemovePool(idVal.ID)
+		return nil
+	}
+	s.AddPool(idVal.ID, pool)
+	s.kickIdleJobs()
+	return nil
+}
+
+// onServerDisabledOrRemoved tears down the pool for a server that's
+// no longer eligible to serve fetches.
+func (s *OrchestratorService) onServerDisabledOrRemoved(_ context.Context, env event.Envelope) error {
+	var idVal struct {
+		ID server.ServerID `json:"id"`
+	}
+	if err := json.Unmarshal(env.Payload, &idVal); err != nil {
+		return fmt.Errorf("decode server event: %w", err)
+	}
+	s.RemovePool(idVal.ID)
+	return nil
+}
+
+// kickIdleJobs starts runners for any queued/downloading jobs that
+// don't currently have one. Called after AddPool so jobs that were
+// queued before a pool existed pick up automatically.
+func (s *OrchestratorService) kickIdleJobs() {
+	active, err := s.repo.Active(s.rootCtx)
+	if err != nil {
+		s.logger.Warn("kick-idle: list active failed", "err", err)
+		return
+	}
+	for _, j := range active {
+		if j.State() == download.JobStatePaused {
+			continue
+		}
+		if j.State().IsTerminal() {
+			continue
+		}
+		s.startRunner(j.ID())
+	}
+}
+
 // startRunner spawns a goroutine that drives jobID to completion. If
 // a runner for this id is already active, this is a no-op.
 func (s *OrchestratorService) startRunner(id download.JobID) {
@@ -312,7 +446,7 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 	// Tiered fetcher handles priority/backup/metered selection per
 	// fetch call. The hint server id we pass to NewOrchestrator below
 	// is purely for logs / metrics — TieredFetcher ignores it.
-	fetcher := NewTieredFetcher(s.pools, s.accounter, s.limiter, s.logger)
+	fetcher := NewTieredFetcher(s.PoolsSnapshot, s.accounter, s.limiter, s.logger)
 	hintID, hintMax := s.dispatchHint()
 
 	orch := NewOrchestrator(
@@ -339,7 +473,7 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 // haveAnyUsablePool reports whether at least one enabled, non-quota-
 // exhausted pool exists. Used as a fast-fail at runner-start time.
 func (s *OrchestratorService) haveAnyUsablePool() bool {
-	for _, p := range s.pools {
+	for _, p := range s.PoolsSnapshot() {
 		srv := p.Server()
 		if srv.Enabled() && !srv.QuotaExhausted() {
 			return true
@@ -355,8 +489,9 @@ func (s *OrchestratorService) haveAnyUsablePool() bool {
 // baseline (alternative: sum across the whole tier, but that risks
 // hammering backup providers when primaries are healthy).
 func (s *OrchestratorService) dispatchHint() (server.ServerID, int) {
+	snap := s.PoolsSnapshot()
 	var best *nntp.Pool
-	for _, p := range s.pools {
+	for _, p := range snap {
 		srv := p.Server()
 		if !srv.Enabled() || srv.QuotaExhausted() || srv.Backup() {
 			continue
@@ -367,7 +502,7 @@ func (s *OrchestratorService) dispatchHint() (server.ServerID, int) {
 	}
 	if best == nil {
 		// Only backups available — use whichever first.
-		for _, p := range s.pools {
+		for _, p := range snap {
 			if p.Server().Enabled() && !p.Server().QuotaExhausted() {
 				best = p
 				break

@@ -360,7 +360,11 @@ func (j *Job) MarkSegmentDispatched(segID SegmentID, now time.Time) error {
 	s.state = SegmentStateInflight
 	s.attempts++
 	j.events = append(j.events, SegmentDispatched{
-		JobID: j.id, SegmentID: s.id, Attempt: s.attempts, At: now,
+		JobID:     j.id,
+		SegmentID: s.id,
+		MessageID: s.messageID,
+		Attempt:   s.attempts,
+		At:        now,
 	})
 	return nil
 }

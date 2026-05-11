@@ -19,8 +19,19 @@ import type { EventEnvelope, Job } from "../api/types";
 // In-place patching is essential for "smooth tick" UX — a refresh per
 // segment would be ~hundreds of /queue/list calls per second on a fast
 // job.
+// JobActivity holds short-lived per-job hints surfaced to the UI:
+// what message-id is currently being fetched, last dispatch time, etc.
+// Lives only in memory — recomputed from the SSE stream on every page
+// load.
+export type JobActivity = {
+  currentMessageID?: string;
+  attempt?: number;
+  at?: string; // ISO timestamp of the dispatch
+};
+
 export function useQueue() {
   const [jobs, setJobs] = useState<Job[] | null>(null);
+  const [activity, setActivity] = useState<Record<number, JobActivity>>({});
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const debounceTimer = useRef<number | null>(null);
@@ -109,6 +120,24 @@ export function useQueue() {
         patchJobBytes(payload.job_id, payload.bytes, 0);
       }
     });
+
+    // Segment-dispatched → "currently fetching X" UI hint. Payload
+    // carries {job_id, segment_id, message_id, attempt, at}.
+    es.addEventListener("download.segment.dispatched", (ev) => {
+      const env = parseEnvelope(ev);
+      const payload = env?.Payload as
+        | { job_id?: number; message_id?: string; attempt?: number; at?: string }
+        | undefined;
+      if (!payload?.job_id || !payload.message_id) return;
+      setActivity((current) => ({
+        ...current,
+        [payload.job_id!]: {
+          currentMessageID: payload.message_id,
+          attempt: payload.attempt,
+          at: payload.at,
+        },
+      }));
+    });
     // Segment-missing / failed → tick failed_bytes (best-effort; the
     // event payload doesn't carry a byte count for missing, so we
     // leave failed_bytes alone and rely on the next refresh for the
@@ -159,7 +188,7 @@ export function useQueue() {
     };
   }, [refresh, scheduleRefresh, patchJobBytes]);
 
-  return { jobs, error, loading, refresh, applyReorder };
+  return { jobs, activity, error, loading, refresh, applyReorder };
 }
 
 // parseEnvelope decodes the SSE data payload. The server emits the

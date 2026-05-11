@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"time"
 
 	"github.com/jaenster/hoardarr/internal/adapter/nntp"
 	"github.com/jaenster/hoardarr/internal/domain/download"
@@ -34,24 +35,28 @@ import (
 
 // TieredFetcher is the multi-pool ArticleFetcher.
 type TieredFetcher struct {
-	pools     map[server.ServerID]*nntp.Pool
-	accounter *ByteAccounter
-	limiter   *Limiter // optional; nil disables bandwidth throttling
-	logger    *slog.Logger
+	// poolSource returns a fresh snapshot of the current pool set on
+	// every Fetch. Lets the orchestrator add/remove pools live (when
+	// the operator wires up a new server in the UI) without making
+	// the fetcher race on map reads.
+	poolSource func() map[server.ServerID]*nntp.Pool
+	accounter  *ByteAccounter
+	limiter    *Limiter // optional; nil disables bandwidth throttling
+	logger     *slog.Logger
 }
 
 // Compile-time check.
 var _ download.ArticleFetcher = (*TieredFetcher)(nil)
 
-// NewTieredFetcher wraps the registered pools. The accounter may be
+// NewTieredFetcher wraps a live pool source. The accounter may be
 // nil; supplied, it receives per-server byte deltas as fetched bodies
 // are drained by the caller. The limiter may also be nil; supplied,
 // it throttles per-read.
-func NewTieredFetcher(pools map[server.ServerID]*nntp.Pool, accounter *ByteAccounter, limiter *Limiter, logger *slog.Logger) *TieredFetcher {
+func NewTieredFetcher(poolSource func() map[server.ServerID]*nntp.Pool, accounter *ByteAccounter, limiter *Limiter, logger *slog.Logger) *TieredFetcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &TieredFetcher{pools: pools, accounter: accounter, limiter: limiter, logger: logger}
+	return &TieredFetcher{poolSource: poolSource, accounter: accounter, limiter: limiter, logger: logger}
 }
 
 // Fetch iterates the tiered pool order and returns the first successful
@@ -68,16 +73,34 @@ func (f *TieredFetcher) Fetch(ctx context.Context, _ server.ServerID, messageID 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		started := time.Now()
 		body, err := tryOnePool(ctx, p, messageID)
 		if err == nil {
+			f.logger.Debug("fetched article",
+				"msg_id", messageID,
+				"server", p.Server().Name(),
+				"server_id", int64(p.Server().ID()),
+				"acquire_ms", time.Since(started).Milliseconds(),
+			)
 			// Wrap so used_bytes accounting fires when the caller drains
 			// and bandwidth limiter throttles per-Read.
 			return f.wrapForAccounting(ctx, body, p.Server().ID()), nil
 		}
 		if errors.Is(err, nntp.ErrArticleMissing) {
+			f.logger.Debug("article missing on server",
+				"msg_id", messageID,
+				"server", p.Server().Name(),
+				"server_id", int64(p.Server().ID()),
+			)
 			sawMissing = true
 			continue
 		}
+		f.logger.Warn("article fetch failed",
+			"msg_id", messageID,
+			"server", p.Server().Name(),
+			"server_id", int64(p.Server().ID()),
+			"err", err,
+		)
 		// Transient error: surface up. The segment-retry budget in the
 		// orchestrator will re-call Fetch later and we'll try again from
 		// the top of the tier list. If transient errors are concentrated
@@ -102,7 +125,7 @@ func (f *TieredFetcher) tieredOrder() []*nntp.Pool {
 		id         server.ServerID
 	}
 	var list []entry
-	for id, p := range f.pools {
+	for id, p := range f.poolSource() {
 		srv := p.Server()
 		if !srv.Enabled() {
 			continue

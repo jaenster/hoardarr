@@ -2,6 +2,7 @@ import { useState } from "react";
 import { GripVertical, Pause, Play, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import type { Job, JobState } from "../api/types";
+import type { JobActivity } from "../hooks/useQueue";
 import StatusBadge from "./StatusBadge";
 
 type Tone = "ok" | "warn" | "err" | "info" | "neutral";
@@ -37,13 +38,14 @@ export type QueueReorder = (orderedIds: number[]) => void | Promise<void>;
 
 type Props = {
   jobs: Job[];
+  activity?: Record<number, JobActivity>;
   onPause: QueueAction;
   onResume: QueueAction;
   onRemove: QueueAction;
   onReorder?: QueueReorder;
 };
 
-export default function QueueList({ jobs, onPause, onResume, onRemove, onReorder }: Props) {
+export default function QueueList({ jobs, activity, onPause, onResume, onRemove, onReorder }: Props) {
   // Live drag state — index of the row being dragged and the drop
   // target. Used to render a "drop here" placeholder line.
   const [dragIdx, setDragIdx] = useState<number | null>(null);
@@ -73,6 +75,7 @@ export default function QueueList({ jobs, onPause, onResume, onRemove, onReorder
         <QueueRow
           key={j.id}
           job={j}
+          activity={activity?.[j.id]}
           index={i}
           isDragging={dragIdx === i}
           isDropTarget={overIdx === i && dragIdx !== null && dragIdx !== i}
@@ -95,6 +98,7 @@ export default function QueueList({ jobs, onPause, onResume, onRemove, onReorder
 
 function QueueRow({
   job,
+  activity,
   index,
   isDragging,
   isDropTarget,
@@ -108,6 +112,7 @@ function QueueRow({
   onRemove,
 }: {
   job: Job;
+  activity?: JobActivity;
   index: number;
   isDragging: boolean;
   isDropTarget: boolean;
@@ -209,6 +214,14 @@ function QueueRow({
           ({pct.toFixed(1)}%)
         </span>
       </div>
+      {activity?.currentMessageID && job.state === "downloading" && (
+        <p className="muted queue-row-activity" title={activity.currentMessageID}>
+          Fetching <code className="inline-code">&lt;{truncateMsgID(activity.currentMessageID)}&gt;</code>
+          {activity.attempt && activity.attempt > 1 && (
+            <span className="muted"> · attempt {activity.attempt}</span>
+          )}
+        </p>
+      )}
       {job.failed_bytes > 0 && (
         <p className="muted queue-row-warn">
           {formatBytes(job.failed_bytes)} marked missing or failed
@@ -216,6 +229,11 @@ function QueueRow({
       )}
     </li>
   );
+}
+
+function truncateMsgID(s: string): string {
+  if (s.length <= 56) return s;
+  return s.slice(0, 30) + "…" + s.slice(-22);
 }
 
 function formatBytes(n: number): string {

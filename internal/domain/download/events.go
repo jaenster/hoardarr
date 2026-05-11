@@ -66,9 +66,13 @@ func (e JobRemoved) AggregateID() string   { return jobAggregateID(e.ID) }
 func (e JobRemoved) OccurredAt() time.Time { return e.At }
 
 // SegmentDispatched — a worker accepted this segment for fetch.
+// MessageID is included so the UI can show "fetching <msg-id>" on
+// the active job without a follow-up lookup. Empty for legacy
+// events emitted before the field was added.
 type SegmentDispatched struct {
 	JobID     JobID     `json:"job_id"`
 	SegmentID SegmentID `json:"segment_id"`
+	MessageID string    `json:"message_id,omitempty"`
 	Attempt   int       `json:"attempt"`
 	At        time.Time `json:"at"`
 }

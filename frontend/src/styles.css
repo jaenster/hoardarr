@@ -933,6 +933,15 @@ a:hover {
   align-items: center;
   margin-right: 0.2rem;
 }
+.queue-row-activity {
+  font-size: 0.78rem;
+  margin: 0;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.queue-row-activity code {
+  font-size: 0.74rem;
+}
 .queue-row:last-child {
   border-bottom: none;
 }

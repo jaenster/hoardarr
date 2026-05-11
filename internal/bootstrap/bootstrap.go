@@ -235,6 +235,11 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Limiter:       bandwidthLimiter,
 		IncompleteDir: cfg.Paths.IncompleteDir,
 		Logger:        logger,
+		PoolFactory: &poolFactory{
+			repo:   serverRepo,
+			logger: logger,
+			dialer: bo.nntpDialer,
+		},
 	})
 
 	verifyRepo := sqlite.NewVerifyRepo(db)
@@ -577,4 +582,30 @@ func buildPools(ctx context.Context, repo *sqlite.ServerRepo, logger *slog.Logge
 		})
 	}
 	return out, nil
+}
+
+// poolFactory implements appdownload.PoolFactory by loading the server
+// aggregate from the repo and constructing a pool with the orchestrator-
+// owned dialer + logger.
+//
+// Returns (nil, nil) when the server exists but is disabled — the
+// caller treats that as "drop the existing pool for this id".
+type poolFactory struct {
+	repo   *sqlite.ServerRepo
+	logger *slog.Logger
+	dialer nntp.Dialer
+}
+
+func (f *poolFactory) BuildPool(ctx context.Context, id domainserver.ServerID) (*nntp.Pool, error) {
+	srv, err := f.repo.ByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !srv.Enabled() {
+		return nil, nil
+	}
+	return nntp.NewPool(srv, nntp.PoolOptions{
+		Logger: f.logger,
+		Dialer: f.dialer,
+	}), nil
 }
