@@ -11,6 +11,7 @@ package notify
 
 import (
 	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strings"
@@ -29,7 +30,20 @@ type Kind string
 
 const (
 	KindWebhook Kind = "webhook"
+	KindDiscord Kind = "discord"
+	KindSlack   Kind = "slack"
 )
+
+// ValidKind reports whether k is one of the supported delivery
+// adapters. Used by the domain constructor and by REST validation.
+func ValidKind(k Kind) bool {
+	switch k {
+	case KindWebhook, KindDiscord, KindSlack:
+		return true
+	default:
+		return false
+	}
+}
 
 // Subscription is the aggregate root.
 type Subscription struct {
@@ -78,8 +92,8 @@ func New(p NewParams, now time.Time) (*Subscription, error) {
 	if kind == "" {
 		kind = KindWebhook
 	}
-	if kind != KindWebhook {
-		return nil, errors.New("notify: only webhook subscriptions supported in v0.1")
+	if !ValidKind(kind) {
+		return nil, fmt.Errorf("notify: unknown subscription kind %q", kind)
 	}
 	if err := validateURL(p.URL); err != nil {
 		return nil, err

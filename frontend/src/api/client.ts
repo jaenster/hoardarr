@@ -201,6 +201,7 @@ export type AddSubscriptionBody = {
   url: string;
   topics: string[];
   secret?: string;
+  kind?: "webhook" | "discord" | "slack";
 };
 
 export type HistoryOpts = {

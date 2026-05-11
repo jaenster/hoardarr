@@ -36,10 +36,14 @@ import (
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
 	adapterfs "github.com/jaenster/hoardarr/internal/adapter/fs"
+	adapterdiscord "github.com/jaenster/hoardarr/internal/adapter/notify/discord"
+	adapterrouter "github.com/jaenster/hoardarr/internal/adapter/notify/router"
+	adapterslack "github.com/jaenster/hoardarr/internal/adapter/notify/slack"
 	adapternotify "github.com/jaenster/hoardarr/internal/adapter/notify/webhook"
 	adapterrar "github.com/jaenster/hoardarr/internal/adapter/rar"
 
 	"github.com/jaenster/hoardarr/internal/domain/extract"
+	"github.com/jaenster/hoardarr/internal/domain/notify"
 	"github.com/jaenster/hoardarr/internal/loghub"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
@@ -292,9 +296,14 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 
 	subscriptionRepo := sqlite.NewSubscriptionRepo(db)
 	notifyAdmin := appnotify.NewAdmin(subscriptionRepo, bus, txm, nil)
+	notifyRouter := adapterrouter.New(map[notify.Kind]notify.Sender{
+		notify.KindWebhook: adapternotify.New(),
+		notify.KindDiscord: adapterdiscord.New(),
+		notify.KindSlack:   adapterslack.New(),
+	})
 	notifySvc := appnotify.New(appnotify.ServiceParams{
 		Repo:      subscriptionRepo,
-		Sender:    adapternotify.New(),
+		Sender:    notifyRouter,
 		Bus:       bus,
 		TxManager: txm,
 		Logger:    logger,

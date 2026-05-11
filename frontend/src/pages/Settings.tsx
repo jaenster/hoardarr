@@ -906,6 +906,7 @@ function WebhooksSection() {
           <thead>
             <tr>
               <th>Name</th>
+              <th>Type</th>
               <th>URL</th>
               <th>Topics</th>
               <th>Signed</th>
@@ -917,6 +918,9 @@ function WebhooksSection() {
             {subs.map((s) => (
               <tr key={s.id}>
                 <td>{s.name}</td>
+                <td>
+                  <StatusBadge tone="neutral">{s.kind}</StatusBadge>
+                </td>
                 <td className="muted kv-key-value">{s.url}</td>
                 <td className="muted">{s.topics.length} topics</td>
                 <td>
@@ -971,6 +975,7 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [secret, setSecret] = useState("");
+  const [kind, setKind] = useState<"webhook" | "discord" | "slack">("webhook");
   const [picked, setPicked] = useState<string[]>(["deliver.complete"]);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -991,10 +996,12 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
         url: url.trim(),
         topics: picked,
         secret: secret || undefined,
+        kind,
       });
       setName("");
       setUrl("");
       setSecret("");
+      setKind("webhook");
       setPicked(["deliver.complete"]);
       onAdded();
     } catch (e) {
@@ -1015,6 +1022,19 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
     <form className="settings-form" onSubmit={submit}>
       <h3>Add webhook</h3>
       <div className="settings-row">
+        <label className="settings-field settings-field-narrow">
+          <span>Type</span>
+          <select
+            value={kind}
+            onChange={(e) =>
+              setKind(e.target.value as "webhook" | "discord" | "slack")
+            }
+          >
+            <option value="webhook">Generic webhook</option>
+            <option value="discord">Discord</option>
+            <option value="slack">Slack</option>
+          </select>
+        </label>
         <label className="settings-field">
           <span>Name</span>
           <input value={name} onChange={(e) => setName(e.target.value)} />
@@ -1024,18 +1044,26 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://example.com/hook"
+            placeholder={
+              kind === "discord"
+                ? "https://discord.com/api/webhooks/…"
+                : kind === "slack"
+                  ? "https://hooks.slack.com/services/…"
+                  : "https://example.com/hook"
+            }
           />
         </label>
-        <label className="settings-field">
-          <span>Secret (optional)</span>
-          <input
-            type="password"
-            value={secret}
-            onChange={(e) => setSecret(e.target.value)}
-            autoComplete="off"
-          />
-        </label>
+        {kind === "webhook" && (
+          <label className="settings-field">
+            <span>Secret (optional)</span>
+            <input
+              type="password"
+              value={secret}
+              onChange={(e) => setSecret(e.target.value)}
+              autoComplete="off"
+            />
+          </label>
+        )}
       </div>
       <div className="settings-row settings-topics">
         {KNOWN_TOPICS.map((t) => (

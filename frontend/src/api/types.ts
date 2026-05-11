@@ -147,10 +147,12 @@ export type Throughput = {
   current_bytes_per_sec: number;
 };
 
+export type SubscriptionKind = "webhook" | "discord" | "slack";
+
 export type Subscription = {
   id: number;
   name: string;
-  kind: "webhook";
+  kind: SubscriptionKind;
   url: string;
   topics: string[];
   has_secret: boolean;
