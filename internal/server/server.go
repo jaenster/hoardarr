@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/jaenster/hoardarr/internal/api/rest"
+	"github.com/jaenster/hoardarr/internal/api/sab"
 	"github.com/jaenster/hoardarr/internal/api/sse"
 	"github.com/jaenster/hoardarr/internal/config"
 )
@@ -70,6 +71,17 @@ func (s *Server) SetSessionAuthenticator(sa SessionAuthenticator) {
 // (/auth/setup, /auth/login, /auth/whoami) bypass the middleware.
 func (s *Server) MountREST(h *rest.Handlers) {
 	h.Mount(s.mux, authMiddleware(s.cfg.Auth.APIKey, s.session))
+}
+
+// MountSAB registers /sabnzbd/api with its own auth scheme: the SAB
+// surface authenticates by ?apikey= (form or query), not by cookie or
+// X-Api-Key header — that's what the *arr suite expects. The handler
+// performs its own apikey check inside, so we don't wrap with the REST
+// middleware here.
+func (s *Server) MountSAB(h *sab.Handler) {
+	s.mux.Handle("/sabnzbd/api", h)
+	// Some clients path-prefix without /api; SAB itself accepts both.
+	s.mux.Handle("/sabnzbd/", h)
 }
 
 // MountSSE registers /api/v1/queue/stream backed by the live event hub.

@@ -24,6 +24,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/adapter/nntp"
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	"github.com/jaenster/hoardarr/internal/api/rest"
+	"github.com/jaenster/hoardarr/internal/api/sab"
 	"github.com/jaenster/hoardarr/internal/api/sse"
 	appauth "github.com/jaenster/hoardarr/internal/app/auth"
 	appdeliver "github.com/jaenster/hoardarr/internal/app/deliver"
@@ -262,6 +263,14 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			CompleteDir:   cfg.Paths.CompleteDir,
 		},
 		Logger: logger,
+	})
+	srv.MountSAB(&sab.Handler{
+		APIKey:      cfg.Auth.APIKey,
+		Queue:       queueService,
+		AddJob:      addJobService,
+		Categories:  categoryRepo,
+		Logger:      logger,
+		CompleteDir: cfg.Paths.CompleteDir,
 	})
 	srv.MountSSE(liveHub)
 	httpSrv := &http.Server{
