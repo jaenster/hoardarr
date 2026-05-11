@@ -37,6 +37,7 @@ const settingsSubNav: SubNavItem[] = [
   { label: "General", href: "#general" },
   { label: "Authentication", href: "#authentication" },
   { label: "SABnzbd Compatibility", href: "#sab-compat" },
+  { label: "Connect (Webhooks)", href: "#connect" },
 ];
 
 const navItems: NavItem[] = [

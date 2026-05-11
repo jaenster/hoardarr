@@ -60,6 +60,10 @@ var DefaultTopics = []string{
 	"server.usenet.enabled",
 	"server.usenet.disabled",
 	"server.usenet.removed",
+	"notify.subscription.added",
+	"notify.subscription.enabled",
+	"notify.subscription.disabled",
+	"notify.subscription.removed",
 }
 
 // Hub broadcasts event envelopes to subscribed SSE clients.

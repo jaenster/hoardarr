@@ -1173,6 +1173,16 @@ a:hover {
   accent-color: var(--accent);
 }
 
+/* webhook topic picker — wrap, smaller text */
+.settings-topics {
+  flex-wrap: wrap;
+  gap: 0.4rem 0.75rem;
+  font-size: 0.78rem;
+}
+.settings-topics .settings-checkbox {
+  padding: 0.2rem 0;
+}
+
 /* filter picker — small dropdown wrapped with an icon */
 
 .filter-picker {

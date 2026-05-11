@@ -11,13 +11,22 @@ import {
   Copy,
   Eye,
   EyeOff,
+  Webhook,
+  Send,
 } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
 import { api, ApiError } from "../api/client";
-import type { Category, General, Paths, Server, User } from "../api/types";
+import type {
+  Category,
+  General,
+  Paths,
+  Server,
+  Subscription,
+  User,
+} from "../api/types";
 
 export default function Settings() {
   return (
@@ -31,6 +40,7 @@ export default function Settings() {
       <section id="general"><GeneralSection /></section>
       <section id="authentication"><AuthSection /></section>
       <section id="sab-compat"><SABSection /></section>
+      <section id="connect"><WebhooksSection /></section>
     </Page>
   );
 }
@@ -712,5 +722,241 @@ function SABSection() {
         </dl>
       ) : null}
     </Panel>
+  );
+}
+
+// --- Connect (webhooks) ---------------------------------------------
+
+const KNOWN_TOPICS = [
+  "download.job.created",
+  "download.job.download_complete",
+  "download.job.download_failed",
+  "download.job.completed",
+  "download.job.failed",
+  "verify.ok",
+  "verify.repair_needed",
+  "verify.failed",
+  "repair.ok",
+  "repair.failed",
+  "deliver.complete",
+  "deliver.failed",
+  "extract.complete",
+  "extract.failed",
+];
+
+function WebhooksSection() {
+  const [subs, setSubs] = useState<Subscription[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const r = await api.listSubscriptions();
+      setSubs(r.subscriptions ?? []);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const remove = async (id: number) => {
+    if (!confirm("Remove this webhook?")) return;
+    try {
+      await api.removeSubscription(id);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const test = async (id: number) => {
+    try {
+      await api.testSubscription(id);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  return (
+    <Panel
+      title="Connect (Webhooks)"
+      meta={
+        <StatusBadge tone="neutral">
+          <Webhook size={12} />
+          {subs.length} configured
+        </StatusBadge>
+      }
+    >
+      <p className="muted">
+        POST job events to any URL — wire hoardarr into Discord / Slack /
+        Notifiarr / your own automation. The body is the bus envelope as JSON.
+        If you set a secret the body is HMAC-SHA256 signed in the{" "}
+        <code className="inline-code">X-Hoardarr-Signature</code> header.
+      </p>
+
+      {error && <p className="text-err">{error}</p>}
+
+      {subs.length > 0 ? (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>URL</th>
+              <th>Topics</th>
+              <th>Signed</th>
+              <th>Last delivery</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {subs.map((s) => (
+              <tr key={s.id}>
+                <td>{s.name}</td>
+                <td className="muted kv-key-value">{s.url}</td>
+                <td className="muted">{s.topics.length} topics</td>
+                <td>
+                  <StatusBadge tone={s.has_secret ? "ok" : "neutral"} dot>
+                    {s.has_secret ? "HMAC" : "none"}
+                  </StatusBadge>
+                </td>
+                <td className="muted">
+                  {s.last_error ? (
+                    <span className="text-err" title={s.last_error}>
+                      failed
+                    </span>
+                  ) : s.last_success_at ? (
+                    <>ok @ {new Date(s.last_success_at).toLocaleTimeString()}</>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+                <td className="queue-row-actions">
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    aria-label="Send test event"
+                    title="Send test event"
+                    onClick={() => void test(s.id)}
+                  >
+                    <Send size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn icon-btn-danger"
+                    aria-label="Remove webhook"
+                    onClick={() => void remove(s.id)}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <p className="muted">No webhooks configured yet.</p>
+      )}
+
+      <AddWebhookForm onAdded={() => void refresh()} />
+    </Panel>
+  );
+}
+
+function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [secret, setSecret] = useState("");
+  const [picked, setPicked] = useState<string[]>(["deliver.complete"]);
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const toggle = (t: string) => {
+    setPicked((cur) =>
+      cur.includes(t) ? cur.filter((x) => x !== t) : [...cur, t],
+    );
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setErr(null);
+    try {
+      await api.addSubscription({
+        name: name.trim(),
+        url: url.trim(),
+        topics: picked,
+        secret: secret || undefined,
+      });
+      setName("");
+      setUrl("");
+      setSecret("");
+      setPicked(["deliver.complete"]);
+      onAdded();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setErr(body?.error ?? e.message);
+      } else {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const valid = name.trim() && url.trim() && picked.length > 0;
+
+  return (
+    <form className="settings-form" onSubmit={submit}>
+      <h3>Add webhook</h3>
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Name</span>
+          <input value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label className="settings-field">
+          <span>URL</span>
+          <input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com/hook"
+          />
+        </label>
+        <label className="settings-field">
+          <span>Secret (optional)</span>
+          <input
+            type="password"
+            value={secret}
+            onChange={(e) => setSecret(e.target.value)}
+            autoComplete="off"
+          />
+        </label>
+      </div>
+      <div className="settings-row settings-topics">
+        {KNOWN_TOPICS.map((t) => (
+          <label key={t} className="settings-checkbox">
+            <input
+              type="checkbox"
+              checked={picked.includes(t)}
+              onChange={() => toggle(t)}
+            />
+            <span>{t}</span>
+          </label>
+        ))}
+      </div>
+      {err && <p className="text-err">{err}</p>}
+      <Button
+        variant="primary"
+        type="submit"
+        icon={<Plus size={14} />}
+        disabled={!valid || submitting}
+      >
+        {submitting ? "Adding…" : "Add webhook"}
+      </Button>
+    </form>
   );
 }

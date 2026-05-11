@@ -13,23 +13,35 @@ import (
 
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
+	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	"github.com/jaenster/hoardarr/internal/domain/download"
+	"github.com/jaenster/hoardarr/internal/domain/notify"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 )
 
 // Handlers groups dependencies for the REST API surface.
 type Handlers struct {
-	Queue      *appdownload.QueueService
-	AddJob     *appdownload.AddJobService
-	Servers    *appserver.Service
-	Categories *sqlite.CategoryRepo
-	Auth       Auther         // optional; nil disables /api/v1/auth/*
-	System     SystemStatuser // optional; nil disables /api/v1/system/status
-	Paths      *PathsView     // optional; nil disables /api/v1/config/paths
-	General    *GeneralView   // optional; nil disables /api/v1/config/general
-	Logger     *slog.Logger
+	Queue         *appdownload.QueueService
+	AddJob        *appdownload.AddJobService
+	Servers       *appserver.Service
+	Categories    *sqlite.CategoryRepo
+	Auth          Auther         // optional; nil disables /api/v1/auth/*
+	System        SystemStatuser // optional; nil disables /api/v1/system/status
+	Paths         *PathsView     // optional; nil disables /api/v1/config/paths
+	General       *GeneralView   // optional; nil disables /api/v1/config/general
+	Subscriptions Subscriptions  // optional; nil disables /api/v1/subscriptions
+	Logger        *slog.Logger
+}
+
+// Subscriptions is the slice of app/notify the REST handler needs.
+type Subscriptions interface {
+	List(ctx context.Context) ([]*notify.Subscription, error)
+	Add(ctx context.Context, cmd appnotify.AddCmd) (notify.SubscriptionID, error)
+	Remove(ctx context.Context, id notify.SubscriptionID) error
+	SetEnabled(ctx context.Context, id notify.SubscriptionID, enabled bool) error
+	Test(ctx context.Context, id notify.SubscriptionID) error
 }
 
 // PathsView exposes the resolved data and category dirs for read-only
@@ -111,6 +123,16 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	// mutation lives at config.toml + restart, same as paths.
 	if h.General != nil {
 		register("GET", "/api/v1/config/general", h.getGeneral)
+	}
+
+	// Subscriptions (webhooks).
+	if h.Subscriptions != nil {
+		register("GET", "/api/v1/subscriptions", h.listSubscriptions)
+		register("POST", "/api/v1/subscriptions", h.addSubscription)
+		register("DELETE", "/api/v1/subscriptions/{id}", h.removeSubscription)
+		register("POST", "/api/v1/subscriptions/{id}/test", h.testSubscription)
+		register("POST", "/api/v1/subscriptions/{id}/enable", h.enableSubscription)
+		register("POST", "/api/v1/subscriptions/{id}/disable", h.disableSubscription)
 	}
 }
 
@@ -382,6 +404,113 @@ func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
 		"log_level": h.General.LogLevel,
 		"sab_base":  h.General.SABBase,
 	})
+}
+
+// --- subscriptions / webhooks ---------------------------------------
+
+func (h *Handlers) listSubscriptions(w http.ResponseWriter, r *http.Request) {
+	subs, err := h.Subscriptions.List(r.Context())
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]SubscriptionDTO, 0, len(subs))
+	for _, s := range subs {
+		out = append(out, subscriptionToDTO(s))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": out})
+}
+
+type addSubscriptionReq struct {
+	Name   string   `json:"name"`
+	Kind   string   `json:"kind,omitempty"` // empty -> "webhook"
+	URL    string   `json:"url"`
+	Topics []string `json:"topics"`
+	Secret string   `json:"secret,omitempty"`
+}
+
+func (h *Handlers) addSubscription(w http.ResponseWriter, r *http.Request) {
+	var req addSubscriptionReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	kind := notify.Kind(req.Kind)
+	if kind == "" {
+		kind = notify.KindWebhook
+	}
+	id, err := h.Subscriptions.Add(r.Context(), appnotify.AddCmd{
+		Name:   req.Name,
+		Kind:   kind,
+		URL:    req.URL,
+		Topics: req.Topics,
+		Secret: req.Secret,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, appnotify.ErrNameTaken):
+			h.writeError(w, http.StatusConflict, err)
+		default:
+			h.writeError(w, http.StatusBadRequest, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": int64(id)})
+}
+
+func (h *Handlers) removeSubscription(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Subscriptions.Remove(r.Context(), notify.SubscriptionID(id)); err != nil {
+		if errors.Is(err, notify.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, err)
+			return
+		}
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) testSubscription(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Subscriptions.Test(r.Context(), notify.SubscriptionID(id)); err != nil {
+		h.writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) enableSubscription(w http.ResponseWriter, r *http.Request) {
+	h.setSubscriptionEnabled(w, r, true)
+}
+
+func (h *Handlers) disableSubscription(w http.ResponseWriter, r *http.Request) {
+	h.setSubscriptionEnabled(w, r, false)
+}
+
+func (h *Handlers) setSubscriptionEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Subscriptions.SetEnabled(r.Context(), notify.SubscriptionID(id), enabled); err != nil {
+		if errors.Is(err, notify.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, err)
+			return
+		}
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- paths (read-only) ----------------------------------------------

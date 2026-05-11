@@ -11,6 +11,7 @@ import (
 
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	"github.com/jaenster/hoardarr/internal/domain/download"
+	"github.com/jaenster/hoardarr/internal/domain/notify"
 	"github.com/jaenster/hoardarr/internal/domain/server"
 )
 
@@ -68,6 +69,47 @@ type CategoryDTO struct {
 	Name     string `json:"name"`
 	Dir      string `json:"dir"`
 	Priority int    `json:"priority"`
+}
+
+// SubscriptionDTO is the JSON shape for /api/v1/subscriptions.
+// Secret is intentionally omitted from list responses; if a future
+// "show secret" UI flow is needed it can use a separate endpoint that
+// returns it once.
+type SubscriptionDTO struct {
+	ID            int64      `json:"id"`
+	Name          string     `json:"name"`
+	Kind          string     `json:"kind"`
+	URL           string     `json:"url"`
+	Topics        []string   `json:"topics"`
+	HasSecret     bool       `json:"has_secret"`
+	Enabled       bool       `json:"enabled"`
+	LastSuccessAt *time.Time `json:"last_success_at,omitempty"`
+	LastErrorAt   *time.Time `json:"last_error_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+func subscriptionToDTO(s *notify.Subscription) SubscriptionDTO {
+	dto := SubscriptionDTO{
+		ID:        int64(s.ID()),
+		Name:      s.Name(),
+		Kind:      string(s.Kind()),
+		URL:       s.URL(),
+		Topics:    s.Topics(),
+		HasSecret: s.Secret() != "",
+		Enabled:   s.Enabled(),
+		LastError: s.LastError(),
+		CreatedAt: s.CreatedAt(),
+		UpdatedAt: s.UpdatedAt(),
+	}
+	if t := s.LastSuccessAt(); !t.IsZero() {
+		dto.LastSuccessAt = &t
+	}
+	if t := s.LastErrorAt(); !t.IsZero() {
+		dto.LastErrorAt = &t
+	}
+	return dto
 }
 
 // jobToDTO converts a Job aggregate to its wire shape.

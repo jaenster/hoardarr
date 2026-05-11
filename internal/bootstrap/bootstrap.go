@@ -30,11 +30,13 @@ import (
 	appdeliver "github.com/jaenster/hoardarr/internal/app/deliver"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appextract "github.com/jaenster/hoardarr/internal/app/extract"
+	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
 	apprepair "github.com/jaenster/hoardarr/internal/app/repair"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
 	adapterfs "github.com/jaenster/hoardarr/internal/adapter/fs"
+	adapternotify "github.com/jaenster/hoardarr/internal/adapter/notify/webhook"
 	adapterrar "github.com/jaenster/hoardarr/internal/adapter/rar"
 
 	"github.com/jaenster/hoardarr/internal/domain/extract"
@@ -93,6 +95,7 @@ type App struct {
 	Repair       *apprepair.Service
 	Deliver      *appdeliver.Service
 	Extract      *appextract.Service
+	Notify       *appnotify.Service
 	ByteFlusher  *appdownload.ByteFlusher
 
 	LiveHub *sse.Hub
@@ -265,6 +268,17 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 
 	categoryRepo := sqlite.NewCategoryRepo(db)
 
+	subscriptionRepo := sqlite.NewSubscriptionRepo(db)
+	notifyAdmin := appnotify.NewAdmin(subscriptionRepo, bus, txm, nil)
+	notifySvc := appnotify.New(appnotify.ServiceParams{
+		Repo:      subscriptionRepo,
+		Sender:    adapternotify.New(),
+		Bus:       bus,
+		TxManager: txm,
+		Logger:    logger,
+	})
+	notifyFacade := &notifyFacade{admin: notifyAdmin, svc: notifySvc}
+
 	startedAt := time.Now().UTC()
 	systemSvc := appsystem.New(appsystem.Params{
 		Version:   buildVersion,
@@ -291,6 +305,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Categories: categoryRepo,
 		Auth:       authSvc,
 		System:     systemSvc,
+		Subscriptions: notifyFacade,
 		Paths: &rest.PathsView{
 			DataDir:       cfg.Server.DataDir,
 			IncompleteDir: cfg.Paths.IncompleteDir,
@@ -344,6 +359,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Repair:        repairSvc,
 		Deliver:       deliverSvc,
 		Extract:       extractSvc,
+		Notify:        notifySvc,
 		ByteFlusher:   byteFlusher,
 		AuthService:   authSvc,
 		SystemService: systemSvc,
@@ -390,6 +406,9 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Extract.Start(ctx); err != nil {
 		return fmt.Errorf("start extract: %w", err)
 	}
+	if err := a.Notify.Start(ctx); err != nil {
+		return fmt.Errorf("start notify: %w", err)
+	}
 	a.ByteFlusher.Start(ctx)
 
 	errCh := make(chan error, 1)
@@ -429,6 +448,9 @@ func (a *App) Shutdown() error {
 			}
 		}
 		a.ByteFlusher.Stop()
+		if err := a.Notify.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("notify stop: %w", err)
+		}
 		if err := a.Extract.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("extract stop: %w", err)
 		}

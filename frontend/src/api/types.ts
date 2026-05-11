@@ -127,3 +127,18 @@ export type General = {
   log_level: string;
   sab_base: string;
 };
+
+export type Subscription = {
+  id: number;
+  name: string;
+  kind: "webhook";
+  url: string;
+  topics: string[];
+  has_secret: boolean;
+  enabled: boolean;
+  last_success_at?: string;
+  last_error_at?: string;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+};

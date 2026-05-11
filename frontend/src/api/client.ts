@@ -6,7 +6,7 @@
 // in the server middleware for *arr clients but the web UI no longer
 // uses it.
 
-import type { Category, General, Job, Paths, Server, SystemStatus, User } from "./types";
+import type { Category, General, Job, Paths, Server, Subscription, SystemStatus, User } from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown, msg: string) {
@@ -141,6 +141,30 @@ export const api = {
   general(): Promise<General> {
     return req("GET", "/api/v1/config/general");
   },
+
+  // --- subscriptions / webhooks ----------------------------------
+  listSubscriptions(): Promise<{ subscriptions: Subscription[] }> {
+    return req("GET", "/api/v1/subscriptions");
+  },
+  addSubscription(body: AddSubscriptionBody): Promise<{ id: number }> {
+    return jsonReq("POST", "/api/v1/subscriptions", body);
+  },
+  removeSubscription(id: number): Promise<void> {
+    return req("DELETE", `/api/v1/subscriptions/${id}`);
+  },
+  testSubscription(id: number): Promise<void> {
+    return req("POST", `/api/v1/subscriptions/${id}/test`);
+  },
+  enableSubscription(id: number, enabled: boolean): Promise<void> {
+    return req("POST", `/api/v1/subscriptions/${id}/${enabled ? "enable" : "disable"}`);
+  },
+};
+
+export type AddSubscriptionBody = {
+  name: string;
+  url: string;
+  topics: string[];
+  secret?: string;
 };
 
 export type HistoryOpts = {
