@@ -1,0 +1,26 @@
+# Build artefacts and local state — never copied into the image.
+hoardarr
+hoardarr.new
+*.log
+.git
+.gitignore
+.claude
+.idea
+.vscode
+
+# Pre-built frontend dist gets overwritten by the builder stage, so
+# leaving it in is harmless but slows the COPY step on each build.
+frontend/dist
+frontend/node_modules
+
+# Local data and the makefile target's output don't belong in the
+# image either.
+data
+incomplete
+complete
+
+# Docs / planning that don't change the binary.
+*.md
+
+# OS-noise.
+.DS_Store

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -254,6 +255,20 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v, ok := os.LookupEnv("HOARDARR_SQLITE_PATH"); ok && v != "" {
 		cfg.Storage.SQLite.Path = v
+	}
+	if v, ok := os.LookupEnv("HOARDARR_INCOMPLETE_DIR"); ok && v != "" {
+		cfg.Paths.IncompleteDir = v
+	}
+	if v, ok := os.LookupEnv("HOARDARR_COMPLETE_DIR"); ok && v != "" {
+		cfg.Paths.CompleteDir = v
+	}
+	if v, ok := os.LookupEnv("HOARDARR_LOG_LEVEL"); ok && v != "" {
+		cfg.Server.LogLevel = strings.ToLower(v)
+	}
+	if v, ok := os.LookupEnv("HOARDARR_BANDWIDTH_GLOBAL"); ok && v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			cfg.Bandwidth.GlobalBytesPerSec = n
+		}
 	}
 }
 
