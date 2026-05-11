@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jaenster/hoardarr/internal/domain/download"
 	"github.com/jaenster/hoardarr/internal/domain/event"
 	"github.com/jaenster/hoardarr/internal/domain/notify"
 	"github.com/jaenster/hoardarr/internal/domain/tx"
@@ -52,6 +53,7 @@ var SubscribableTopics = []string{
 // Service drives webhook (and future) deliveries.
 type Service struct {
 	repo   notify.Repository
+	jobs   download.JobRepository // optional; enables payload enrichment
 	sender notify.Sender
 	bus    event.Bus
 	txm    tx.TransactionManager
@@ -79,6 +81,10 @@ type ServiceParams struct {
 	TxManager tx.TransactionManager
 	Logger    *slog.Logger
 	Now       func() time.Time
+	// Jobs enables payload enrichment: when an event carries a
+	// job_id, the dispatched envelope is augmented with a job
+	// snapshot. Optional — nil disables enrichment.
+	Jobs download.JobRepository
 }
 
 // New constructs a Service.
@@ -92,6 +98,7 @@ func New(p ServiceParams) *Service {
 	rootCtx, cancel := context.WithCancel(context.Background())
 	return &Service{
 		repo:    p.Repo,
+		jobs:    p.Jobs,
 		sender:  p.Sender,
 		bus:     p.Bus,
 		txm:     p.TxManager,
@@ -207,16 +214,93 @@ func (s *Service) activeSubs() []*notify.Subscription {
 // onEvent fans the envelope out to every matching active subscription.
 // Per-subscription dispatch is a goroutine so a slow subscriber
 // doesn't block siblings.
+//
+// Payload enrichment: if the event carries a job_id, the envelope's
+// payload is rewritten to include a job snapshot (name, category,
+// state, total/done bytes, file count, source). Subscribers thus
+// don't need a follow-up GET to react sensibly — "deliver.complete"
+// arrives with everything a Discord embed or shell webhook needs.
 func (s *Service) onEvent(ctx context.Context, env event.Envelope) error {
+	enriched := s.enrichEnvelope(ctx, env)
 	for _, sub := range s.activeSubs() {
-		if !sub.MatchesTopic(env.Topic) {
+		if !sub.MatchesTopic(enriched.Topic) {
 			continue
 		}
 		s.wg.Add(1)
-		go s.dispatch(s.rootCtx, sub, env)
+		go s.dispatch(s.rootCtx, sub, enriched)
 	}
 	_ = ctx
 	return nil
+}
+
+// enrichEnvelope returns env with Payload rewritten to include a
+// snapshot of the relevant Job aggregate when the original payload
+// carried a job_id. Falls back to the unmodified envelope when:
+//   - the payload doesn't decode as JSON
+//   - no job_id field is present
+//   - the job repo lookup fails
+//
+// The original event fields are preserved under "event"; the job
+// snapshot goes under "job"; the topic + envelope id stay at top
+// level so HMAC consumers don't have to relearn the shape.
+func (s *Service) enrichEnvelope(ctx context.Context, env event.Envelope) event.Envelope {
+	if s.jobs == nil {
+		return env
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(env.Payload, &raw); err != nil {
+		return env
+	}
+	rawID, ok := raw["job_id"]
+	if !ok {
+		return env
+	}
+	id, ok := asJobID(rawID)
+	if !ok || id == 0 {
+		return env
+	}
+	j, err := s.jobs.ByID(ctx, id)
+	if err != nil {
+		return env
+	}
+	merged := map[string]any{
+		"event": raw,
+		"job": map[string]any{
+			"id":           int64(j.ID()),
+			"name":         j.Name(),
+			"category":     j.Category(),
+			"state":        string(j.State()),
+			"source":       j.Source(),
+			"total_bytes":  j.TotalBytes(),
+			"done_bytes":   j.DoneBytes(),
+			"failed_bytes": j.FailedBytes(),
+			"file_count":   len(j.Files()),
+			"added_at":     j.AddedAt().Format("2006-01-02T15:04:05Z07:00"),
+		},
+	}
+	body, err := json.Marshal(merged)
+	if err != nil {
+		return env
+	}
+	out := env
+	out.Payload = body
+	return out
+}
+
+// asJobID extracts a domain JobID from a JSON-decoded number. JSON
+// unmarshal yields float64 for numbers in interface{}, so a direct
+// type assertion won't work.
+func asJobID(v any) (download.JobID, bool) {
+	switch n := v.(type) {
+	case float64:
+		return download.JobID(int64(n)), true
+	case int64:
+		return download.JobID(n), true
+	case int:
+		return download.JobID(n), true
+	default:
+		return 0, false
+	}
 }
 
 // dispatch invokes the Sender for one (sub, event) pair and updates

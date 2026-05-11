@@ -324,6 +324,10 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Bus:       bus,
 		TxManager: txm,
 		Logger:    logger,
+		// Enable payload enrichment: webhook events carrying a job_id
+		// get a "job" snapshot stapled on (name, source, bytes, etc.)
+		// so consumers don't need a follow-up GET.
+		Jobs: jobRepo,
 	})
 	notifyFacade := &notifyFacade{admin: notifyAdmin, svc: notifySvc}
 

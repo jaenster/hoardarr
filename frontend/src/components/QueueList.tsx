@@ -189,6 +189,11 @@ function QueueRow({
           {job.category && (
             <span className="queue-row-cat muted">{job.category}</span>
           )}
+          {job.source && (
+            <span className="queue-row-source muted" title={job.source}>
+              from {shortSource(job.source)}
+            </span>
+          )}
         </div>
         <div className="queue-row-actions">
           <StatusBadge tone={stateTone[job.state]}>{stateLabel[job.state]}</StatusBadge>
@@ -261,6 +266,21 @@ function QueueRow({
 function truncateMsgID(s: string): string {
   if (s.length <= 56) return s;
   return s.slice(0, 30) + "…" + s.slice(-22);
+}
+
+// shortSource collapses a full HTTP User-Agent down to the headline
+// product name + version. "Sonarr/4.0.5.1710 (linux 6.1)" → "Sonarr/4.0".
+// "Mozilla/5.0 … Chrome/120" → "browser".
+function shortSource(ua: string): string {
+  const t = ua.trim();
+  // Common *arr UA patterns: "Sonarr/4.0.5.1710" etc.
+  const arrMatch = t.match(/^(Sonarr|Radarr|Lidarr|Readarr|Prowlarr|Bazarr)\/(\d+(?:\.\d+)?)/i);
+  if (arrMatch) return `${arrMatch[1]}/${arrMatch[2]}`;
+  // Generic <Product>/<version> tokens take the first one.
+  const first = t.split(/\s+/)[0];
+  if (first.includes("/") && first.length < 40) return first;
+  if (/Mozilla|Chrome|Safari|Firefox/i.test(t)) return "browser";
+  return first.length > 24 ? first.slice(0, 24) + "…" : first;
 }
 
 function formatETA(seconds: number): string {

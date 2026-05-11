@@ -29,6 +29,11 @@ type Job struct {
 	priority   int
 	queueOrder int64
 	state      JobState
+	// source is the requesting client (e.g. "Sonarr/4.0.5"). Captured
+	// from the HTTP User-Agent on the upload endpoint; empty for
+	// manual uploads. Lets the UI and webhook subscribers attribute
+	// jobs to their *arr origin.
+	source string
 
 	totalBytes  int64
 	doneBytes   int64
@@ -53,6 +58,7 @@ type NewJobParams struct {
 	Category   string
 	Priority   int
 	QueueOrder int64
+	Source     string // requesting client UA (e.g. "Sonarr/4.x"); empty for manual
 	NZBBlob    []byte
 	Files      []NewFileParams
 }
@@ -78,6 +84,7 @@ func NewJob(p NewJobParams, now time.Time) (*Job, error) {
 		category:   p.Category,
 		priority:   p.Priority,
 		queueOrder: p.QueueOrder,
+		source:     p.Source,
 		state:      JobStateQueued,
 		addedAt:    now,
 		nzbBlob:    append([]byte(nil), p.NZBBlob...),
@@ -107,6 +114,7 @@ type HydrateJobParams struct {
 	Category    string
 	Priority    int
 	QueueOrder  int64
+	Source      string
 	State       JobState
 	TotalBytes  int64
 	DoneBytes   int64
@@ -129,6 +137,7 @@ func HydrateJob(p HydrateJobParams) *Job {
 		category:    p.Category,
 		priority:    p.Priority,
 		queueOrder:  p.QueueOrder,
+		source:      p.Source,
 		state:       p.State,
 		totalBytes:  p.TotalBytes,
 		doneBytes:   p.DoneBytes,
@@ -149,6 +158,7 @@ func (j *Job) Name() string      { return j.name }
 func (j *Job) Category() string  { return j.category }
 func (j *Job) Priority() int     { return j.priority }
 func (j *Job) QueueOrder() int64 { return j.queueOrder }
+func (j *Job) Source() string    { return j.source }
 func (j *Job) State() JobState   { return j.state }
 func (j *Job) TotalBytes() int64 { return j.totalBytes }
 func (j *Job) DoneBytes() int64  { return j.doneBytes }

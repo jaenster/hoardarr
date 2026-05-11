@@ -76,7 +76,7 @@ export default function JobDetail() {
       title={job ? job.name : `Job #${id}`}
       subtitle={
         job
-          ? `${job.category || "*"} • ${job.state}`
+          ? `${job.category || "*"} • ${job.state}${job.source ? " • from " + job.source : ""}`
           : loading
             ? "Loading…"
             : "Not in queue or history"

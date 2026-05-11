@@ -277,6 +277,7 @@ func (h *Handlers) addNZB(w http.ResponseWriter, r *http.Request) {
 		NZB:      file,
 		Name:     displayName,
 		Category: r.FormValue("category"),
+		Source:   r.UserAgent(),
 	})
 	if err != nil {
 		switch {

@@ -172,6 +172,7 @@ func (h *Handler) modeAddFile(w http.ResponseWriter, r *http.Request) {
 		NZB:      file,
 		Name:     displayName,
 		Category: cat,
+		Source:   r.UserAgent(),
 	})
 	if err != nil && !errors.Is(err, appdownload.ErrDuplicateNZB) {
 		h.writeError(w, http.StatusBadRequest, err)

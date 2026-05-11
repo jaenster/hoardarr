@@ -43,12 +43,12 @@ func (r *JobRepo) Save(ctx context.Context, j *download.Job) error {
 func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
 	res, err := r.db.ExecCtx(ctx, `
 		INSERT INTO jobs(
-			nzb_hash, name, category, priority, queue_order, state,
+			nzb_hash, name, category, priority, queue_order, source, state,
 			total_bytes, done_bytes, failed_bytes,
 			added_at, started_at, finished_at, error_msg, nzb_blob
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		j.NZBHash(), j.Name(), j.Category(), j.Priority(), j.QueueOrder(), string(j.State()),
+		j.NZBHash(), j.Name(), j.Category(), j.Priority(), j.QueueOrder(), j.Source(), string(j.State()),
 		j.TotalBytes(), j.DoneBytes(), j.FailedBytes(),
 		j.AddedAt().UnixMilli(),
 		nullableMillis(j.StartedAt()), nullableMillis(j.FinishedAt()),
@@ -471,6 +471,7 @@ func rehydrateJob(j *download.Job, files []*download.File) *download.Job {
 		Category:    j.Category(),
 		Priority:    j.Priority(),
 		QueueOrder:  j.QueueOrder(),
+		Source:      j.Source(),
 		State:       j.State(),
 		TotalBytes:  j.TotalBytes(),
 		DoneBytes:   j.DoneBytes(),
@@ -521,7 +522,7 @@ func (r *JobRepo) loadSegments(ctx context.Context, fileID download.FileID) ([]*
 	return out, rows.Err()
 }
 
-const jobColumns = `id, nzb_hash, name, category, priority, queue_order, state,
+const jobColumns = `id, nzb_hash, name, category, priority, queue_order, source, state,
 		total_bytes, done_bytes, failed_bytes,
 		added_at, started_at, finished_at, error_msg, nzb_blob`
 
@@ -560,6 +561,7 @@ func scanJobFromScanner(s serverScanner) (*download.Job, error) {
 		category    string
 		priority    int
 		queueOrder  int64
+		source      string
 		state       string
 		totalBytes  int64
 		doneBytes   int64
@@ -570,7 +572,7 @@ func scanJobFromScanner(s serverScanner) (*download.Job, error) {
 		errorMsg    sql.NullString
 		nzbBlob     []byte
 	)
-	if err := s.Scan(&id, &nzbHash, &name, &category, &priority, &queueOrder, &state,
+	if err := s.Scan(&id, &nzbHash, &name, &category, &priority, &queueOrder, &source, &state,
 		&totalBytes, &doneBytes, &failedBytes,
 		&addedAt, &startedAt, &finishedAt, &errorMsg, &nzbBlob); err != nil {
 		return nil, err
@@ -582,6 +584,7 @@ func scanJobFromScanner(s serverScanner) (*download.Job, error) {
 		Category:    category,
 		Priority:    priority,
 		QueueOrder:  queueOrder,
+		Source:      source,
 		State:       download.JobState(state),
 		TotalBytes:  totalBytes,
 		DoneBytes:   doneBytes,

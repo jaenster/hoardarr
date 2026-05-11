@@ -56,6 +56,11 @@ type AddJobCmd struct {
 
 	// Priority (lower = higher; 0 default).
 	Priority int
+
+	// Source identifies the client that uploaded the NZB — typically
+	// the HTTP User-Agent ("Sonarr/4.0.5.1710"). Empty for manual
+	// uploads via curl or the browser drop zone.
+	Source string
 }
 
 // AddJob validates the NZB, dedupes against existing jobs, and creates
@@ -102,6 +107,7 @@ func (s *AddJobService) AddJob(ctx context.Context, cmd AddJobCmd) (download.Job
 			Category:   cmd.Category,
 			Priority:   cmd.Priority,
 			QueueOrder: now.UnixNano(),
+			Source:     cmd.Source,
 			NZBBlob:    body,
 			Files:      files,
 		}, now)

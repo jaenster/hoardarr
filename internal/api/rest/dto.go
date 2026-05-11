@@ -23,6 +23,7 @@ type JobDTO struct {
 	Category    string    `json:"category"`
 	Priority    int       `json:"priority"`
 	State       string    `json:"state"`
+	Source      string    `json:"source,omitempty"`
 	TotalBytes  int64     `json:"total_bytes"`
 	DoneBytes   int64     `json:"done_bytes"`
 	FailedBytes int64     `json:"failed_bytes"`
@@ -122,6 +123,7 @@ func jobToDTO(j *download.Job) JobDTO {
 		Category:    j.Category(),
 		Priority:    j.Priority(),
 		State:       string(j.State()),
+		Source:      j.Source(),
 		TotalBytes:  j.TotalBytes(),
 		DoneBytes:   j.DoneBytes(),
 		FailedBytes: j.FailedBytes(),

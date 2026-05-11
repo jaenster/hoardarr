@@ -24,6 +24,7 @@ export type Job = {
   category: string;
   priority: number;
   state: JobState;
+  source?: string;
   total_bytes: number;
   done_bytes: number;
   failed_bytes: number;
