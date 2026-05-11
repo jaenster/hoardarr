@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"sync"
 
@@ -172,6 +173,17 @@ func (s *Server) routes() {
 	// Protected. Mounted per-route so the public health endpoint is not
 	// accidentally guarded.
 	s.mux.Handle("GET /api/v1/whoami", protect(http.HandlerFunc(s.handleWhoami)))
+
+	// pprof — gated behind API-key, mounted under /debug/pprof/ at the
+	// same path net/http/pprof expects. Available in all builds because
+	// "minimal CPU/RAM target" is a project goal and we need the live
+	// profiler when something gets fat.
+	s.mux.Handle("GET /debug/pprof/", protect(http.HandlerFunc(pprof.Index)))
+	s.mux.Handle("GET /debug/pprof/cmdline", protect(http.HandlerFunc(pprof.Cmdline)))
+	s.mux.Handle("GET /debug/pprof/profile", protect(http.HandlerFunc(pprof.Profile)))
+	s.mux.Handle("GET /debug/pprof/symbol", protect(http.HandlerFunc(pprof.Symbol)))
+	s.mux.Handle("GET /debug/pprof/trace", protect(http.HandlerFunc(pprof.Trace)))
+	s.mux.Handle("GET /debug/pprof/{name}", protect(http.HandlerFunc(pprof.Index)))
 
 	// Frontend (SPA fallback).
 	s.mux.Handle("/", s.handleFrontend())
