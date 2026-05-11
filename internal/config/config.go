@@ -48,6 +48,16 @@ type Server struct {
 	// LogLevel selects the slog level: "debug" | "info" | "warn" | "error".
 	// Empty resolves to "info" during validation.
 	LogLevel string `toml:"log_level"`
+
+	// URLBase is the path prefix this hoardarr instance is mounted at
+	// behind a reverse proxy. Must start with "/" or be empty; must
+	// not end with "/". Examples: "", "/hoardarr", "/apps/hoardarr".
+	//
+	// When set, the backend strips this prefix from incoming requests
+	// before routing, and the frontend bootstrap injects a <base href>
+	// + window.HOARDARR_BASE so client-side routes and assets resolve
+	// correctly. One binary, picks up its mount path from env/config.
+	URLBase string `toml:"url_base"`
 }
 
 // Auth holds authentication configuration. Currently API-key only;
@@ -194,6 +204,14 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("server.log_level %q is not supported (valid: debug, info, warn, error)", c.Server.LogLevel)
 	}
+	if c.Server.URLBase != "" {
+		if !strings.HasPrefix(c.Server.URLBase, "/") {
+			return fmt.Errorf("server.url_base %q must start with /", c.Server.URLBase)
+		}
+		if strings.HasSuffix(c.Server.URLBase, "/") {
+			return fmt.Errorf("server.url_base %q must not end with /", c.Server.URLBase)
+		}
+	}
 	if c.Bandwidth.GlobalBytesPerSec < 0 {
 		return fmt.Errorf("bandwidth.global_bytes_per_sec %d must be >= 0", c.Bandwidth.GlobalBytesPerSec)
 	}
@@ -264,6 +282,11 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v, ok := os.LookupEnv("HOARDARR_LOG_LEVEL"); ok && v != "" {
 		cfg.Server.LogLevel = strings.ToLower(v)
+	}
+	if v, ok := os.LookupEnv("HOARDARR_URL_BASE"); ok {
+		// Allow setting to empty via env to override a config-file
+		// value, hence the unconditional assignment.
+		cfg.Server.URLBase = strings.TrimRight(v, "/")
 	}
 	if v, ok := os.LookupEnv("HOARDARR_BANDWIDTH_GLOBAL"); ok && v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {

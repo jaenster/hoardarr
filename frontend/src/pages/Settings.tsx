@@ -958,11 +958,19 @@ function GeneralSection() {
             <dd>
               <code className="inline-code">{gen.log_level}</code>
             </dd>
+            <dt>URL base</dt>
+            <dd>
+              <code className="inline-code">{gen.url_base || "(root)"}</code>
+              <span className="muted" style={{ marginLeft: "0.6rem" }}>
+                set via <code className="inline-code">HOARDARR_URL_BASE</code>
+              </span>
+            </dd>
           </dl>
           <p className="muted">
             Edit <code className="inline-code">config.toml</code> and restart to
             change these. The API key is shared with *arr clients via the SAB
-            endpoint below.
+            endpoint below. URL base is read at startup so the embedded frontend
+            knows its mount prefix; changing it requires a restart.
           </p>
         </>
       ) : null}

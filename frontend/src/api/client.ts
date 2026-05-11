@@ -5,6 +5,11 @@
 // browser via `credentials: "include"`). The X-Api-Key path remains
 // in the server middleware for *arr clients but the web UI no longer
 // uses it.
+//
+// URL base: Vite bakes a sentinel into `import.meta.env.BASE_URL`,
+// which the Go server replaces with the runtime URLBase before
+// serving any JS file. Every request goes through `withBase` so the
+// SPA works whether mounted at "/" or "/hoardarr".
 
 import type {
   BandwidthConfig,
@@ -27,6 +32,18 @@ export class ApiError extends Error {
   }
 }
 
+// urlBase is the resolved runtime prefix (no trailing slash). Empty
+// when hoardarr is mounted at root.
+export const urlBase = (import.meta.env.BASE_URL ?? "/").replace(/\/+$/, "");
+
+// withBase prefixes an absolute "/api/..." or "/auth/..." path with
+// the runtime URL base. Idempotent for already-prefixed paths.
+export function withBase(path: string): string {
+  if (!urlBase) return path;
+  if (path.startsWith(urlBase + "/") || path === urlBase) return path;
+  return urlBase + path;
+}
+
 async function req<T>(
   method: string,
   path: string,
@@ -36,7 +53,7 @@ async function req<T>(
   const headers: Record<string, string> = { ...extraHeaders };
   // JSON encoding for plain object bodies happens at call sites that
   // need it; FormData / file bodies pass through unmodified.
-  const res = await fetch(path, {
+  const res = await fetch(withBase(path), {
     method,
     headers,
     body,
@@ -269,10 +286,10 @@ export type TestServerResult = {
 // streamURL returns the URL for the SSE endpoint. The session cookie
 // is sent automatically; no apikey query param needed.
 export function streamURL(): string {
-  return "/api/v1/queue/stream";
+  return withBase("/api/v1/queue/stream");
 }
 
 // logStreamURL is the SSE endpoint that pushes new log entries.
 export function logStreamURL(): string {
-  return "/api/v1/system/logs/stream";
+  return withBase("/api/v1/system/logs/stream");
 }

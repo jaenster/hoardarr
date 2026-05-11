@@ -49,9 +49,38 @@ func New(cfg config.Config, logger *slog.Logger, web fs.FS) *Server {
 	return s
 }
 
-// ServeHTTP makes Server an http.Handler.
+// ServeHTTP makes Server an http.Handler. When URLBase is set, the
+// prefix is stripped from incoming requests before routing — every
+// internal route (REST, SSE, SAB, frontend) is registered without the
+// prefix so the code is portable across deployments.
+//
+// Root convenience: if someone hits "/" with URLBase set, we redirect
+// to "<base>/" so a bookmark of the host root lands on the SPA
+// instead of 404. Same for "<base>" (no trailing slash) so the
+// document base resolves correctly.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mux.ServeHTTP(w, r)
+	base := s.cfg.Server.URLBase
+	if base == "" {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	if r.URL.Path == "/" || r.URL.Path == base {
+		http.Redirect(w, r, base+"/", http.StatusMovedPermanently)
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, base+"/") {
+		http.NotFound(w, r)
+		return
+	}
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = strings.TrimPrefix(r.URL.Path, base)
+	if r2.URL.Path == "" {
+		r2.URL.Path = "/"
+	}
+	if r.URL.RawPath != "" {
+		r2.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, base)
+	}
+	s.mux.ServeHTTP(w, r2)
 }
 
 // SetSessionAuthenticator installs the session validator used by the
@@ -139,9 +168,21 @@ func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// handleFrontend serves the SPA: static files from web FS, with a fallback
-// to index.html for client-side routes. If web is nil (no build present),
-// serves a dev placeholder.
+// sentinelBase is what Vite bakes into every asset URL,
+// import.meta.env.BASE_URL reference, and CSS url(). The frontend
+// handler swaps it for the runtime base (URLBase + "/") on serve.
+const sentinelBase = "/__HOARDARR_BASE__/"
+
+// handleFrontend serves the SPA: static files from web FS, with a
+// fallback to index.html for client-side routes.
+//
+// All emitted asset URLs and code references to BASE_URL contain a
+// fixed sentinel string. We walk the embed FS once, replace the
+// sentinel with the configured runtime base in every text file, and
+// serve from the resulting in-memory map. Binary assets (fonts,
+// images) are passed through untouched.
+//
+// If web is nil (no build present), serves a dev placeholder.
 func (s *Server) handleFrontend() http.Handler {
 	if s.web == nil {
 		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -150,21 +191,131 @@ func (s *Server) handleFrontend() http.Handler {
 		})
 	}
 
-	fileServer := http.FileServerFS(s.web)
+	mapped, indexHTML, err := s.buildFrontendFS()
+	if err != nil {
+		s.logger.Error("frontend: failed to load assets", "err", err)
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "frontend assets missing", http.StatusInternalServerError)
+		})
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clean := strings.TrimPrefix(r.URL.Path, "/")
-		if clean == "" {
-			fileServer.ServeHTTP(w, r)
+		if clean == "" || clean == "index.html" {
+			serveIndexHTML(w, indexHTML)
 			return
 		}
-		if _, err := fs.Stat(s.web, clean); err != nil {
-			r2 := r.Clone(r.Context())
-			r2.URL.Path = "/"
-			fileServer.ServeHTTP(w, r2)
+		// Look up our pre-processed copy first; fall through to the
+		// raw FS only for entries we deliberately didn't rewrite
+		// (binary assets).
+		if body, ok := mapped[clean]; ok {
+			serveAsset(w, clean, body)
 			return
 		}
-		fileServer.ServeHTTP(w, r)
+		if _, statErr := fs.Stat(s.web, clean); statErr != nil {
+			// SPA fallback for client-side routes.
+			serveIndexHTML(w, indexHTML)
+			return
+		}
+		http.FileServerFS(s.web).ServeHTTP(w, r)
 	})
+}
+
+// buildFrontendFS walks the embed FS once and returns a map of
+// path -> rewritten bytes for every text file, plus the rewritten
+// index.html separately for convenient SPA fallback. Binary files
+// are absent from the map (the request handler falls through to the
+// raw FS for those).
+//
+// "Text" here is a static allow-list of extensions Vite emits with
+// the base path baked in. Adding to the list is cheap and safer than
+// trying to sniff content type.
+func (s *Server) buildFrontendFS() (map[string][]byte, []byte, error) {
+	runtimeBase := s.cfg.Server.URLBase + "/"
+	if s.cfg.Server.URLBase == "" {
+		runtimeBase = "/"
+	}
+	rewrite := func(b []byte) []byte {
+		return []byte(strings.ReplaceAll(string(b), sentinelBase, runtimeBase))
+	}
+
+	out := make(map[string][]byte)
+	var indexHTML []byte
+	err := fs.WalkDir(s.web, ".", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isRewriteable(p) {
+			return nil
+		}
+		body, readErr := fs.ReadFile(s.web, p)
+		if readErr != nil {
+			return readErr
+		}
+		body = rewrite(body)
+		out[p] = body
+		if p == "index.html" {
+			indexHTML = body
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if indexHTML == nil {
+		// Fall back to reading directly; an unusual layout that
+		// doesn't put index.html at the root would still surface as
+		// "asset missing".
+		raw, readErr := fs.ReadFile(s.web, "index.html")
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		indexHTML = rewrite(raw)
+	}
+	return out, indexHTML, nil
+}
+
+// isRewriteable lists the file extensions whose bytes can mention
+// the sentinel. Everything else (woff, png, ico, …) is left alone
+// and served via FileServerFS unmodified.
+func isRewriteable(p string) bool {
+	switch {
+	case strings.HasSuffix(p, ".html"),
+		strings.HasSuffix(p, ".js"),
+		strings.HasSuffix(p, ".mjs"),
+		strings.HasSuffix(p, ".css"),
+		strings.HasSuffix(p, ".map"),
+		strings.HasSuffix(p, ".svg"):
+		return true
+	}
+	return false
+}
+
+func serveIndexHTML(w http.ResponseWriter, body []byte) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// index.html depends on runtime base, so don't allow stale caches
+	// after a URLBase change. Hashed asset filenames protect the rest.
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(body)
+}
+
+func serveAsset(w http.ResponseWriter, p string, body []byte) {
+	switch {
+	case strings.HasSuffix(p, ".js"), strings.HasSuffix(p, ".mjs"):
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	case strings.HasSuffix(p, ".css"):
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	case strings.HasSuffix(p, ".map"):
+		w.Header().Set("Content-Type", "application/json")
+	case strings.HasSuffix(p, ".svg"):
+		w.Header().Set("Content-Type", "image/svg+xml")
+	case strings.HasSuffix(p, ".html"):
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	}
+	_, _ = w.Write(body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

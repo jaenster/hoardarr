@@ -39,6 +39,21 @@ type Handlers struct {
 	Outbox        EventReader    // optional; nil disables /api/v1/queue/{id}/events
 	LogHub        *loghub.Hub    // optional; nil disables /api/v1/system/logs*
 	Logger        *slog.Logger
+	// URLBase is the reverse-proxy mount prefix (e.g. "/hoardarr").
+	// Empty when hoardarr is at root. Used as the session cookie's
+	// Path so the browser only sends it back on hoardarr URLs and we
+	// don't leak credentials to other apps on the same origin.
+	URLBase string
+}
+
+// sessionCookiePath returns the Path attribute for the session
+// cookie. Always trailing-slash terminated so the browser includes
+// every URL under the prefix.
+func (h *Handlers) sessionCookiePath() string {
+	if h.URLBase == "" {
+		return "/"
+	}
+	return h.URLBase + "/"
 }
 
 // EventReader is the slice of the outbox bus that the per-job
@@ -77,10 +92,11 @@ type PathsView struct {
 // API key is included so admins can copy it into *arr clients; we
 // only return it to authenticated requests.
 type GeneralView struct {
-	Listen    string
-	APIKey    string
-	LogLevel  string
-	SABBase   string // e.g. "http://hoardarr:8085/sabnzbd/api"
+	Listen   string
+	APIKey   string
+	LogLevel string
+	SABBase  string // e.g. "http://hoardarr:8085/sabnzbd/api"
+	URLBase  string // reverse-proxy mount prefix; empty when at root
 }
 
 // SystemStatuser is the slice of app/system.Service that the REST
@@ -748,6 +764,7 @@ func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
 		"api_key":   h.General.APIKey,
 		"log_level": h.General.LogLevel,
 		"sab_base":  h.General.SABBase,
+		"url_base":  h.General.URLBase,
 	})
 }
 

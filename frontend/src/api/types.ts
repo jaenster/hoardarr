@@ -127,6 +127,7 @@ export type General = {
   api_key: string;
   log_level: string;
   sab_base: string;
+  url_base: string;
 };
 
 export type BandwidthConfig = {

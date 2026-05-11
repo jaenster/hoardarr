@@ -349,10 +349,12 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			APIKey:   cfg.Auth.APIKey,
 			LogLevel: cfg.Server.LogLevel,
 			SABBase:  buildSABBase(cfg.Server.Listen),
+			URLBase:  cfg.Server.URLBase,
 		},
 		Bandwidth: bandwidthLimiter,
 		LogHub:    bo.logHub,
-		Logger: logger,
+		Logger:    logger,
+		URLBase:   cfg.Server.URLBase,
 	})
 	srv.MountSAB(&sab.Handler{
 		APIKey:      cfg.Auth.APIKey,

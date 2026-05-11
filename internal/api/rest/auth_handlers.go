@@ -122,7 +122,7 @@ func (h *Handlers) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, map[string]any{"id": int64(id)})
 		return
 	}
-	setSessionCookie(w, sess)
+	h.setSessionCookie(w, sess)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": int64(id)})
 }
 
@@ -150,7 +150,7 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	setSessionCookie(w, sess)
+	h.setSessionCookie(w, sess)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -206,7 +206,7 @@ func (h *Handlers) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(SessionCookieName); err == nil && cookie.Value != "" {
 		_ = h.Auth.Logout(r.Context(), cookie.Value)
 	}
-	clearSessionCookie(w)
+	h.clearSessionCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -215,7 +215,7 @@ func (h *Handlers) handleLogout(w http.ResponseWriter, r *http.Request) {
 // self-hosted setups deploy behind a reverse-proxy that terminates
 // TLS upstream — cookies set with Secure=true wouldn't make it
 // across the proxy hop.
-func setSessionCookie(w http.ResponseWriter, sess auth.Session) {
+func (h *Handlers) setSessionCookie(w http.ResponseWriter, sess auth.Session) {
 	maxAge := int(time.Until(sess.ExpiresAt).Seconds())
 	if maxAge < 0 {
 		maxAge = 0
@@ -223,18 +223,18 @@ func setSessionCookie(w http.ResponseWriter, sess auth.Session) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    sess.Token,
-		Path:     "/",
+		Path:     h.sessionCookiePath(),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAge,
 	})
 }
 
-func clearSessionCookie(w http.ResponseWriter) {
+func (h *Handlers) clearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     SessionCookieName,
 		Value:    "",
-		Path:     "/",
+		Path:     h.sessionCookiePath(),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
