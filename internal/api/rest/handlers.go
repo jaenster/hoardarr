@@ -224,10 +224,13 @@ func (h *Handlers) listQueue(w http.ResponseWriter, r *http.Request) {
 	includeAll := r.URL.Query().Get("include") == "all"
 	var jobs []*download.Job
 	var err error
+	// Shallow loads — file metadata only, no per-segment hydration.
+	// The DTO drops segments anyway and skipping the N+M repo queries
+	// turns a multi-second response on big releases into milliseconds.
 	if includeAll {
-		jobs, err = h.Queue.List(ctx)
+		jobs, err = h.Queue.ListShallow(ctx)
 	} else {
-		jobs, err = h.Queue.Active(ctx)
+		jobs, err = h.Queue.ActiveShallow(ctx)
 	}
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)

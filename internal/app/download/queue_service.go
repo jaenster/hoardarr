@@ -190,9 +190,20 @@ func (s *QueueService) List(ctx context.Context) ([]*download.Job, error) {
 	return s.repo.List(ctx)
 }
 
+// ListShallow is List without per-file segment hydration. Use for
+// UI listings; orders of magnitude faster on large releases.
+func (s *QueueService) ListShallow(ctx context.Context) ([]*download.Job, error) {
+	return s.repo.ListShallow(ctx)
+}
+
 // Active returns jobs in non-terminal states.
 func (s *QueueService) Active(ctx context.Context) ([]*download.Job, error) {
 	return s.repo.Active(ctx)
+}
+
+// ActiveShallow is Active without per-file segment hydration.
+func (s *QueueService) ActiveShallow(ctx context.Context) ([]*download.Job, error) {
+	return s.repo.ActiveShallow(ctx)
 }
 
 // History returns terminal-state jobs ordered by finished_at DESC,
