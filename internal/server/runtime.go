@@ -19,9 +19,14 @@ import (
 // config file on disk in a single critical section. Callers either
 // see the old value or the new one — never a half-applied state.
 type Runtime struct {
-	mu         sync.RWMutex
-	configPath string // empty disables persistence (used in tests)
-	urlBase    string
+	mu                sync.RWMutex
+	configPath        string // empty disables persistence (used in tests)
+	urlBase           string
+	maxConcurrentJobs int
+	// listeners are notified on max-concurrent changes so the
+	// orchestrator can drain its pending-jobs backlog when the cap
+	// goes up.
+	listeners []func(maxConcurrent int)
 }
 
 // NewRuntime constructs a Runtime seeded from the given config and
@@ -29,8 +34,9 @@ type Runtime struct {
 // disable persistence (writes become in-memory only).
 func NewRuntime(cfg config.Config, configPath string) *Runtime {
 	return &Runtime{
-		configPath: configPath,
-		urlBase:    cfg.Server.URLBase,
+		configPath:        configPath,
+		urlBase:           cfg.Server.URLBase,
+		maxConcurrentJobs: cfg.Server.MaxConcurrentJobs,
 	}
 }
 
@@ -40,6 +46,58 @@ func (rt *Runtime) URLBase() string {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	return rt.urlBase
+}
+
+// MaxConcurrentJobs returns the current cap. 0 = unlimited.
+func (rt *Runtime) MaxConcurrentJobs() int {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.maxConcurrentJobs
+}
+
+// SetMaxConcurrentJobs validates v, persists it, and notifies listeners
+// (the orchestrator) so a higher cap immediately drains the pending
+// backlog. Negative values are clamped to 0 (unlimited).
+func (rt *Runtime) SetMaxConcurrentJobs(v int) (int, error) {
+	if v < 0 {
+		v = 0
+	}
+	if v > 1024 {
+		return 0, fmt.Errorf("max_concurrent_jobs %d unreasonably high", v)
+	}
+
+	rt.mu.Lock()
+	if rt.configPath != "" {
+		cfg, err := config.LoadOrCreate(rt.configPath)
+		if err != nil {
+			rt.mu.Unlock()
+			return 0, fmt.Errorf("load config: %w", err)
+		}
+		cfg.Server.MaxConcurrentJobs = v
+		if err := config.Save(rt.configPath, cfg); err != nil {
+			rt.mu.Unlock()
+			return 0, fmt.Errorf("save config: %w", err)
+		}
+	}
+	rt.maxConcurrentJobs = v
+	listeners := append([]func(int){}, rt.listeners...)
+	rt.mu.Unlock()
+
+	// Notify outside the lock to avoid deadlocks if a listener calls
+	// back into Runtime.
+	for _, l := range listeners {
+		l(v)
+	}
+	return v, nil
+}
+
+// OnMaxConcurrentJobsChange registers fn for invocation whenever the
+// cap changes. Used by the orchestrator to drain the pending backlog
+// when the operator raises the limit.
+func (rt *Runtime) OnMaxConcurrentJobsChange(fn func(maxConcurrent int)) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.listeners = append(rt.listeners, fn)
 }
 
 // SetURLBase validates v, persists it to the config file, and

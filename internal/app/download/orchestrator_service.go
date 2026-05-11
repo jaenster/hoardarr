@@ -52,13 +52,18 @@ type OrchestratorService struct {
 	maxAttempts   int
 	baseBackoff   time.Duration
 	poolFactory   PoolFactory // optional; if set, server.usenet.added events hot-wire new pools
+	// concurrencyCap returns the current max concurrent runners.
+	// 0 means unlimited; nil means unlimited (no cap configured).
+	concurrencyCap func() int
 
 	poolsMu sync.RWMutex
 	pools   map[server.ServerID]*nntp.Pool
 
-	mu      sync.Mutex
-	runners map[download.JobID]*runnerHandle
-	subs    []event.Subscription
+	mu       sync.Mutex
+	runners  map[download.JobID]*runnerHandle
+	pending  []download.JobID // jobs waiting for a runner slot
+	pendingSet map[download.JobID]struct{}
+	subs     []event.Subscription
 
 	rootCtx context.Context
 	cancel  context.CancelFunc
@@ -91,6 +96,11 @@ type OrchestratorServiceParams struct {
 	// adds / enables / disables servers from the UI. Nil → static
 	// pool set (tests + the historical behaviour).
 	PoolFactory PoolFactory
+	// ConcurrencyCap returns the current max number of jobs allowed
+	// to run in parallel. 0 means unlimited. Nil means unlimited.
+	// The orchestrator consults this on every dispatch; live edits
+	// from Settings take effect on the next job that lands.
+	ConcurrencyCap func() int
 }
 
 // NewOrchestratorService constructs the service.
@@ -112,22 +122,53 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		pools = make(map[server.ServerID]*nntp.Pool)
 	}
 	return &OrchestratorService{
-		repo:          p.Repo,
-		bus:           p.Bus,
-		txm:           p.TxManager,
-		pools:         pools,
-		accounter:     p.Accounter,
-		limiter:       p.Limiter,
-		incompleteDir: p.IncompleteDir,
-		logger:        p.Logger,
-		now:           p.Now,
-		flushInterval: p.FlushInterval,
-		maxAttempts:   p.MaxAttempts,
-		baseBackoff:   p.BaseBackoff,
-		poolFactory:   p.PoolFactory,
-		runners:       make(map[download.JobID]*runnerHandle),
-		rootCtx:       rootCtx,
-		cancel:        cancel,
+		repo:           p.Repo,
+		bus:            p.Bus,
+		txm:            p.TxManager,
+		pools:          pools,
+		accounter:      p.Accounter,
+		limiter:        p.Limiter,
+		incompleteDir:  p.IncompleteDir,
+		logger:         p.Logger,
+		now:            p.Now,
+		flushInterval:  p.FlushInterval,
+		maxAttempts:    p.MaxAttempts,
+		baseBackoff:    p.BaseBackoff,
+		poolFactory:    p.PoolFactory,
+		concurrencyCap: p.ConcurrencyCap,
+		runners:        make(map[download.JobID]*runnerHandle),
+		pendingSet:     make(map[download.JobID]struct{}),
+		rootCtx:        rootCtx,
+		cancel:         cancel,
+	}
+}
+
+// NudgePending drains the backlog up to the current concurrency cap.
+// Called by the runtime config listener after the cap is raised — a
+// no-op when the cap is unlimited or the backlog is empty.
+func (s *OrchestratorService) NudgePending() {
+	for {
+		s.mu.Lock()
+		if !s.started {
+			s.mu.Unlock()
+			return
+		}
+		if s.concurrencyCap != nil {
+			cap := s.concurrencyCap()
+			if cap > 0 && len(s.runners) >= cap {
+				s.mu.Unlock()
+				return
+			}
+		}
+		if len(s.pending) == 0 {
+			s.mu.Unlock()
+			return
+		}
+		next := s.pending[0]
+		s.pending = s.pending[1:]
+		delete(s.pendingSet, next)
+		s.mu.Unlock()
+		s.startRunner(next)
 	}
 }
 
@@ -399,13 +440,32 @@ func (s *OrchestratorService) kickIdleJobs() {
 	}
 }
 
-// startRunner spawns a goroutine that drives jobID to completion. If
-// a runner for this id is already active, this is a no-op.
+// startRunner spawns a goroutine that drives jobID to completion if a
+// slot is available under the concurrency cap. If the cap is reached,
+// the job is appended to the pending backlog and started when a
+// running job finishes. Idempotent for ids that are already running
+// or already pending.
 func (s *OrchestratorService) startRunner(id download.JobID) {
 	s.mu.Lock()
 	if _, exists := s.runners[id]; exists {
 		s.mu.Unlock()
 		return
+	}
+	if _, queued := s.pendingSet[id]; queued {
+		s.mu.Unlock()
+		return
+	}
+	if s.concurrencyCap != nil {
+		cap := s.concurrencyCap()
+		if cap > 0 && len(s.runners) >= cap {
+			s.pending = append(s.pending, id)
+			s.pendingSet[id] = struct{}{}
+			s.logger.Info("orchestrator: cap reached, queuing job",
+				"job_id", int64(id), "cap", cap, "active", len(s.runners),
+				"pending", len(s.pending))
+			s.mu.Unlock()
+			return
+		}
 	}
 	runCtx, runCancel := context.WithCancel(s.rootCtx)
 	handle := &runnerHandle{cancel: runCancel, done: make(chan struct{})}
@@ -416,10 +476,22 @@ func (s *OrchestratorService) startRunner(id download.JobID) {
 	go s.runJob(runCtx, id, handle)
 }
 
-// stopRunner cancels the runner for id and waits for it to exit.
-// No-op if no runner exists.
+// stopRunner cancels the runner for id and waits for it to exit. Also
+// removes the id from the pending backlog so a paused-while-queued
+// job doesn't get auto-started later. No-op if no runner exists.
 func (s *OrchestratorService) stopRunner(id download.JobID) {
 	s.mu.Lock()
+	// Drop from pending if it was waiting for a slot.
+	if _, queued := s.pendingSet[id]; queued {
+		delete(s.pendingSet, id)
+		filtered := s.pending[:0]
+		for _, p := range s.pending {
+			if p != id {
+				filtered = append(filtered, p)
+			}
+		}
+		s.pending = filtered
+	}
 	handle, exists := s.runners[id]
 	s.mu.Unlock()
 	if !exists {
@@ -436,6 +508,8 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 		s.mu.Lock()
 		delete(s.runners, id)
 		s.mu.Unlock()
+		// A slot freed; drain the backlog if any jobs were queued.
+		s.NudgePending()
 	}()
 
 	if !s.haveAnyUsablePool() {

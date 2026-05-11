@@ -911,11 +911,18 @@ function GeneralSection() {
   const [urlBaseSavedAt, setUrlBaseSavedAt] = useState<number | null>(null);
   const [urlBaseErr, setUrlBaseErr] = useState<string | null>(null);
 
+  // Max concurrent jobs — live-editable cap on parallel downloads.
+  const [maxConcurrentDraft, setMaxConcurrentDraft] = useState(0);
+  const [maxConcurrentSaving, setMaxConcurrentSaving] = useState(false);
+  const [maxConcurrentSavedAt, setMaxConcurrentSavedAt] = useState<number | null>(null);
+  const [maxConcurrentErr, setMaxConcurrentErr] = useState<string | null>(null);
+
   const refresh = async () => {
     try {
       const g = await api.general();
       setGen(g);
       setUrlBaseDraft(g.url_base);
+      setMaxConcurrentDraft(g.max_concurrent_jobs);
       setErr(null);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -953,6 +960,29 @@ function GeneralSection() {
   };
 
   const dirty = gen != null && urlBaseDraft !== gen.url_base;
+  const maxConcurrentDirty =
+    gen != null && maxConcurrentDraft !== gen.max_concurrent_jobs;
+
+  const saveMaxConcurrent = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setMaxConcurrentSaving(true);
+    setMaxConcurrentErr(null);
+    try {
+      const v = Math.max(0, Math.floor(maxConcurrentDraft || 0));
+      await api.setGeneral({ max_concurrent_jobs: v });
+      setMaxConcurrentSavedAt(Date.now());
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setMaxConcurrentErr(body?.error ?? e.message);
+      } else {
+        setMaxConcurrentErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setMaxConcurrentSaving(false);
+    }
+  };
 
   return (
     <Panel
@@ -1027,6 +1057,42 @@ function GeneralSection() {
               disabled={!dirty || urlBaseSaving}
             >
               {urlBaseSaving ? "Saving…" : "Save URL base"}
+            </Button>
+          </form>
+
+          <form className="settings-form" onSubmit={saveMaxConcurrent}>
+            <h3>Max concurrent downloads</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              Cap how many jobs run in parallel. <strong>0</strong> means
+              unlimited (every queued NZB starts immediately). Set to{" "}
+              <strong>1</strong> for SAB-style strict serial behaviour, or
+              <strong> 2-3</strong> to balance throughput against per-job
+              speed. Excess jobs queue and start automatically as runners
+              finish.
+            </p>
+            <div className="settings-row">
+              <label className="settings-field settings-field-narrow">
+                <span>Limit</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={maxConcurrentDraft}
+                  onChange={(e) =>
+                    setMaxConcurrentDraft(Math.max(0, parseInt(e.target.value, 10) || 0))
+                  }
+                />
+              </label>
+            </div>
+            {maxConcurrentErr && <p className="text-err">{maxConcurrentErr}</p>}
+            {maxConcurrentSavedAt && !maxConcurrentDirty && !maxConcurrentErr && (
+              <p className="muted">Saved. Takes effect on the next job.</p>
+            )}
+            <Button
+              variant="primary"
+              type="submit"
+              disabled={!maxConcurrentDirty || maxConcurrentSaving}
+            >
+              {maxConcurrentSaving ? "Saving…" : "Save"}
             </Button>
           </form>
 

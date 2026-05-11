@@ -76,6 +76,16 @@ func (s *Server) Runtime() *Runtime { return s.runtime }
 // instead of 404. Same for "<base>" (no trailing slash) so the
 // document base resolves correctly.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Wrap once with the access logger so every dispatched route gets
+	// logged at debug level (no-op for higher log levels). Kept close
+	// to ServeHTTP so we measure the full URLBase-strip + mux dispatch.
+	accessLog(s.logger, http.HandlerFunc(s.serveInner)).ServeHTTP(w, r)
+}
+
+// serveInner is the original ServeHTTP body. Split out so the access
+// log middleware sits at the boundary and sees the original request
+// (with URLBase prefix intact) instead of the stripped form.
+func (s *Server) serveInner(w http.ResponseWriter, r *http.Request) {
 	base := s.runtime.URLBase()
 	if base == "" {
 		s.mux.ServeHTTP(w, r)

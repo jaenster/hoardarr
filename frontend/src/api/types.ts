@@ -128,6 +128,7 @@ export type General = {
   log_level: string;
   sab_base: string;
   url_base: string;
+  max_concurrent_jobs: number;
 };
 
 export type BandwidthConfig = {

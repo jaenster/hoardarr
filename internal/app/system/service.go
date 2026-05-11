@@ -60,21 +60,28 @@ type Service struct {
 	version    string
 	startedAt  time.Time
 	jobs       download.JobRepository
-	pools      map[domainserver.ServerID]*nntp.Pool
-	servers    ServerStatRepo
-	throughput *Throughput
-	now        func() time.Time
+	// poolsSource returns a fresh pool snapshot on every call.
+	// Reads from the orchestrator's live map so servers added at
+	// runtime show up immediately on /api/v1/system/status — the
+	// old behaviour (static snapshot at construction time) didn't.
+	poolsSource func() map[domainserver.ServerID]*nntp.Pool
+	servers     ServerStatRepo
+	throughput  *Throughput
+	now         func() time.Time
 }
 
 // Params gathers Service dependencies.
 type Params struct {
-	Version    string
-	StartedAt  time.Time
-	Jobs       download.JobRepository
-	Pools      map[domainserver.ServerID]*nntp.Pool
-	Servers    ServerStatRepo
-	Throughput *Throughput
-	Now        func() time.Time
+	Version   string
+	StartedAt time.Time
+	Jobs      download.JobRepository
+	// PoolsSource is a callback that returns the live pool map. Wire
+	// it to OrchestratorService.PoolsSnapshot so hot-wired servers
+	// surface on the System page.
+	PoolsSource func() map[domainserver.ServerID]*nntp.Pool
+	Servers     ServerStatRepo
+	Throughput  *Throughput
+	Now         func() time.Time
 }
 
 // New constructs a Service. StartedAt should be the App start time so
@@ -83,14 +90,20 @@ func New(p Params) *Service {
 	if p.Now == nil {
 		p.Now = func() time.Time { return time.Now().UTC() }
 	}
+	if p.PoolsSource == nil {
+		// Stable empty-snapshot fallback for tests that don't care
+		// about pool stats.
+		empty := map[domainserver.ServerID]*nntp.Pool{}
+		p.PoolsSource = func() map[domainserver.ServerID]*nntp.Pool { return empty }
+	}
 	return &Service{
-		version:    p.Version,
-		startedAt:  p.StartedAt,
-		jobs:       p.Jobs,
-		pools:      p.Pools,
-		servers:    p.Servers,
-		throughput: p.Throughput,
-		now:        p.Now,
+		version:     p.Version,
+		startedAt:   p.StartedAt,
+		jobs:        p.Jobs,
+		poolsSource: p.PoolsSource,
+		servers:     p.Servers,
+		throughput:  p.Throughput,
+		now:         p.Now,
 	}
 }
 
@@ -126,8 +139,9 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		}
 	}
 
-	pools := make([]PoolStatus, 0, len(s.pools))
-	for id, p := range s.pools {
+	live := s.poolsSource()
+	pools := make([]PoolStatus, 0, len(live))
+	for id, p := range live {
 		st := p.Stats()
 		srv := p.Server()
 		if fresh, ok := freshByID[id]; ok {

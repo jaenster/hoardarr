@@ -226,6 +226,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		bandwidthLimiter.SetServerCap(id, p.Server().BandwidthBytesPerSec())
 	}
 
+	runtime := server.NewRuntime(cfg, bo.configPath)
 	orch := appdownload.NewOrchestratorService(appdownload.OrchestratorServiceParams{
 		Repo:          jobRepo,
 		Bus:           bus,
@@ -240,7 +241,10 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			logger: logger,
 			dialer: bo.nntpDialer,
 		},
+		ConcurrencyCap: runtime.MaxConcurrentJobs,
 	})
+	// Drain pending when the operator raises the cap from Settings.
+	runtime.OnMaxConcurrentJobsChange(func(_ int) { orch.NudgePending() })
 
 	verifyRepo := sqlite.NewVerifyRepo(db)
 	verifySvc := appverify.New(appverify.ServiceParams{
@@ -325,12 +329,15 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 
 	startedAt := time.Now().UTC()
 	systemSvc := appsystem.New(appsystem.Params{
-		Version:    buildVersion,
-		StartedAt:  startedAt,
-		Jobs:       jobRepo,
-		Pools:      pools,
-		Servers:    serverRepo,
-		Throughput: throughput,
+		Version:   buildVersion,
+		StartedAt: startedAt,
+		Jobs:      jobRepo,
+		// Read the live pool map every time — captures hot-wired
+		// servers added at runtime so /api/v1/system/status reflects
+		// reality instead of just startup state.
+		PoolsSource: orch.PoolsSnapshot,
+		Servers:     serverRepo,
+		Throughput:  throughput,
 	})
 
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
@@ -341,7 +348,6 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		return nil, fmt.Errorf("live hub: %w", err)
 	}
 
-	runtime := server.NewRuntime(cfg, bo.configPath)
 	srv := server.New(cfg, runtime, logger, frontendFS)
 	srv.SetSessionAuthenticator(authSvc)
 	srv.MountREST(&rest.Handlers{

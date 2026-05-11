@@ -52,6 +52,7 @@ type Handlers struct {
 // internal/server (which would be a cycle).
 type URLBaseReader interface {
 	URLBase() string
+	MaxConcurrentJobs() int
 }
 
 // URLBaseWriter is implemented by *server.Runtime and exposes the
@@ -62,6 +63,7 @@ type URLBaseReader interface {
 type URLBaseWriter interface {
 	URLBaseReader
 	SetURLBase(v string) (string, error)
+	SetMaxConcurrentJobs(v int) (int, error)
 }
 
 // sessionCookiePath returns the Path attribute for the session
@@ -800,24 +802,28 @@ func (h *Handlers) setBandwidth(w http.ResponseWriter, r *http.Request) {
 // --- general config (read-only) -------------------------------------
 
 func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
-	// URLBase is runtime-mutable; prefer the Runtime view over the
-	// frozen snapshot in GeneralView so the response reflects any
-	// edits applied since startup.
+	// URLBase + MaxConcurrentJobs are runtime-mutable; prefer the
+	// Runtime view over the frozen snapshot in GeneralView so the
+	// response reflects any edits applied since startup.
 	urlBase := h.General.URLBase
+	maxConcurrent := 0
 	if h.Runtime != nil {
 		urlBase = h.Runtime.URLBase()
+		maxConcurrent = h.Runtime.MaxConcurrentJobs()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"listen":    h.General.Listen,
-		"api_key":   h.General.APIKey,
-		"log_level": h.General.LogLevel,
-		"sab_base":  h.General.SABBase,
-		"url_base":  urlBase,
+		"listen":              h.General.Listen,
+		"api_key":             h.General.APIKey,
+		"log_level":           h.General.LogLevel,
+		"sab_base":            h.General.SABBase,
+		"url_base":            urlBase,
+		"max_concurrent_jobs": maxConcurrent,
 	})
 }
 
 type putGeneralReq struct {
-	URLBase *string `json:"url_base,omitempty"`
+	URLBase           *string `json:"url_base,omitempty"`
+	MaxConcurrentJobs *int    `json:"max_concurrent_jobs,omitempty"`
 }
 
 // putGeneral applies runtime-mutable General settings. Currently only
@@ -840,6 +846,12 @@ func (h *Handlers) putGeneral(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.URLBase != nil {
 		if _, err := writer.SetURLBase(*req.URLBase); err != nil {
+			h.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.MaxConcurrentJobs != nil {
+		if _, err := writer.SetMaxConcurrentJobs(*req.MaxConcurrentJobs); err != nil {
 			h.writeError(w, http.StatusBadRequest, err)
 			return
 		}
