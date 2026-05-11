@@ -271,6 +271,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		StartedAt: startedAt,
 		Jobs:      jobRepo,
 		Pools:     pools,
+		Servers:   serverRepo,
 	})
 
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)

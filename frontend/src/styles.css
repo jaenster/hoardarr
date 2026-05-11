@@ -1060,6 +1060,38 @@ a:hover {
   color: var(--text);
 }
 
+/* tiny per-server quota usage bar (System page) */
+
+.usage-bar {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 8rem;
+}
+.usage-bar-text {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.usage-bar-track {
+  background: var(--bg-elev-2);
+  border-radius: 2px;
+  height: 4px;
+  width: 100%;
+  overflow: hidden;
+}
+.usage-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 200ms ease-out;
+}
+.usage-bar-fill.is-warn {
+  background: var(--warn);
+}
+.usage-bar-fill.is-err {
+  background: var(--err);
+}
+
 /* key-row used inside <dd> for reveal/copy buttons next to a value */
 
 .kv-key-row {
@@ -1111,7 +1143,8 @@ a:hover {
 .settings-field-narrow {
   flex: 0 0 6rem;
 }
-.settings-field input {
+.settings-field input,
+.settings-field select {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -1122,7 +1155,8 @@ a:hover {
   text-transform: none;
   letter-spacing: 0;
 }
-.settings-field input:focus {
+.settings-field input:focus,
+.settings-field select:focus {
   outline: none;
   border-color: var(--accent-line);
   box-shadow: 0 0 0 3px var(--accent-soft);

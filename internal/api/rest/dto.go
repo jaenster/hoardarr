@@ -46,17 +46,21 @@ type FileDTO struct {
 // ServerDTO is the JSON shape returned by /api/v1/servers. Passwords
 // are intentionally omitted from responses.
 type ServerDTO struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Host      string    `json:"host"`
-	Port      int       `json:"port"`
-	TLS       bool      `json:"tls"`
-	Username  string    `json:"username,omitempty"`
-	MaxConns  int       `json:"max_conns"`
-	Priority  int       `json:"priority"`
-	Enabled   bool      `json:"enabled"`
-	AddedAt   time.Time `json:"added_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	Host        string    `json:"host"`
+	Port        int       `json:"port"`
+	TLS         bool      `json:"tls"`
+	Username    string    `json:"username,omitempty"`
+	MaxConns    int       `json:"max_conns"`
+	Priority    int       `json:"priority"`
+	Enabled     bool      `json:"enabled"`
+	Backup      bool      `json:"backup"`
+	BillingMode string    `json:"billing_mode"`
+	QuotaBytes  int64     `json:"quota_bytes"`
+	UsedBytes   int64     `json:"used_bytes"`
+	AddedAt     time.Time `json:"added_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // CategoryDTO is the JSON shape for /api/v1/categories.
@@ -105,17 +109,21 @@ func jobToDTO(j *download.Job) JobDTO {
 
 func serverToDTO(s *server.UsenetServer) ServerDTO {
 	return ServerDTO{
-		ID:        int64(s.ID()),
-		Name:      s.Name(),
-		Host:      s.Host(),
-		Port:      s.Port(),
-		TLS:       s.TLS(),
-		Username:  s.Username(),
-		MaxConns:  s.MaxConns(),
-		Priority:  s.Priority(),
-		Enabled:   s.Enabled(),
-		AddedAt:   s.AddedAt(),
-		UpdatedAt: s.UpdatedAt(),
+		ID:          int64(s.ID()),
+		Name:        s.Name(),
+		Host:        s.Host(),
+		Port:        s.Port(),
+		TLS:         s.TLS(),
+		Username:    s.Username(),
+		MaxConns:    s.MaxConns(),
+		Priority:    s.Priority(),
+		Enabled:     s.Enabled(),
+		Backup:      s.Backup(),
+		BillingMode: string(s.BillingMode()),
+		QuotaBytes:  s.QuotaBytes(),
+		UsedBytes:   s.UsedBytes(),
+		AddedAt:     s.AddedAt(),
+		UpdatedAt:   s.UpdatedAt(),
 	}
 }
 

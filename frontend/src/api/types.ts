@@ -44,6 +44,8 @@ export type JobFile = {
   is_par2: boolean;
 };
 
+export type BillingMode = "flat" | "metered";
+
 export type Server = {
   id: number;
   name: string;
@@ -54,6 +56,10 @@ export type Server = {
   max_conns: number;
   priority: number;
   enabled: boolean;
+  backup: boolean;
+  billing_mode: BillingMode;
+  quota_bytes: number;
+  used_bytes: number;
   added_at: string;
   updated_at: string;
 };
@@ -101,6 +107,10 @@ export type PoolStatus = {
   in_use: number;
   idle: number;
   enabled: boolean;
+  backup: boolean;
+  billing_mode: BillingMode;
+  quota_bytes: number;
+  used_bytes: number;
 };
 
 export type Paths = {

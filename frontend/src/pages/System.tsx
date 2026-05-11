@@ -94,18 +94,38 @@ export default function System() {
                 <th>Server</th>
                 <th>Endpoint</th>
                 <th>Conns</th>
+                <th>Type</th>
+                <th>Used</th>
                 <th>State</th>
               </tr>
             </thead>
             <tbody>
               {status.pools.map((p) => (
                 <tr key={p.server_id}>
-                  <td>{p.server_name}</td>
+                  <td>
+                    {p.server_name}
+                    {p.backup ? <span className="muted"> (backup)</span> : null}
+                  </td>
                   <td className="muted">
                     {p.host}:{p.port}
                   </td>
                   <td className="muted">
                     {p.in_use}/{p.max_conns} in use, {p.idle} idle
+                  </td>
+                  <td>
+                    <StatusBadge
+                      tone={p.billing_mode === "metered" ? "warn" : "ok"}
+                      dot
+                    >
+                      {p.billing_mode === "metered" ? "metered" : "flat"}
+                    </StatusBadge>
+                  </td>
+                  <td className="muted">
+                    {p.billing_mode === "metered" ? (
+                      <UsageBar used={p.used_bytes} quota={p.quota_bytes} />
+                    ) : (
+                      formatBytes(p.used_bytes)
+                    )}
                   </td>
                   <td>
                     <StatusBadge tone={p.enabled ? "ok" : "neutral"} dot>
@@ -125,6 +145,40 @@ export default function System() {
       </Panel>
     </Page>
   );
+}
+
+function UsageBar({ used, quota }: { used: number; quota: number }) {
+  if (!quota) {
+    // No quota set → show just the used count.
+    return <>{formatBytes(used)}</>;
+  }
+  const pct = Math.min(100, Math.round((used * 100) / quota));
+  const tone = pct >= 90 ? "is-err" : pct >= 75 ? "is-warn" : "";
+  return (
+    <span className="usage-bar">
+      <span className="usage-bar-text">
+        {formatBytes(used)} / {formatBytes(quota)} ({pct}%)
+      </span>
+      <span className={`usage-bar-track`}>
+        <span
+          className={`usage-bar-fill ${tone}`}
+          style={{ width: `${pct}%` }}
+        />
+      </span>
+    </span>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
 function formatTime(s: string): string {

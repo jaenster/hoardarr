@@ -33,14 +33,26 @@ type Status struct {
 
 // PoolStatus is one Usenet server's pool snapshot.
 type PoolStatus struct {
-	ServerID   domainserver.ServerID
-	ServerName string
-	Host       string
-	Port       int
-	MaxConns   int
-	InUse      int
-	Idle       int
-	Enabled    bool
+	ServerID    domainserver.ServerID
+	ServerName  string
+	Host        string
+	Port        int
+	MaxConns    int
+	InUse       int
+	Idle        int
+	Enabled     bool
+	Backup      bool
+	BillingMode string
+	QuotaBytes  int64
+	UsedBytes   int64
+}
+
+// ServerStatRepo is the slice of the server repo system.Service needs
+// to surface fresh per-server byte counters (the pool keeps a snapshot
+// from startup; persistent used_bytes lives in the DB and is updated
+// by the byte flusher).
+type ServerStatRepo interface {
+	List(ctx context.Context) ([]*domainserver.UsenetServer, error)
 }
 
 // Service composes Status snapshots from authoritative sources.
@@ -49,6 +61,7 @@ type Service struct {
 	startedAt time.Time
 	jobs      download.JobRepository
 	pools     map[domainserver.ServerID]*nntp.Pool
+	servers   ServerStatRepo
 	now       func() time.Time
 }
 
@@ -58,6 +71,7 @@ type Params struct {
 	StartedAt time.Time
 	Jobs      download.JobRepository
 	Pools     map[domainserver.ServerID]*nntp.Pool
+	Servers   ServerStatRepo
 	Now       func() time.Time
 }
 
@@ -72,6 +86,7 @@ func New(p Params) *Service {
 		startedAt: p.StartedAt,
 		jobs:      p.Jobs,
 		pools:     p.Pools,
+		servers:   p.Servers,
 		now:       p.Now,
 	}
 }
@@ -90,19 +105,39 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		return Status{}, err
 	}
 
+	// Refresh used_bytes / quota from DB. The pool's cached server
+	// aggregate is frozen at construction time; the authoritative
+	// runtime counter lives in the DB (flushed periodically by the
+	// byte flusher). Falls back to the cached snapshot on repo error.
+	freshByID := map[domainserver.ServerID]*domainserver.UsenetServer{}
+	if s.servers != nil {
+		if list, err := s.servers.List(ctx); err == nil {
+			for _, sv := range list {
+				freshByID[sv.ID()] = sv
+			}
+		}
+	}
+
 	pools := make([]PoolStatus, 0, len(s.pools))
 	for id, p := range s.pools {
 		st := p.Stats()
 		srv := p.Server()
+		if fresh, ok := freshByID[id]; ok {
+			srv = fresh
+		}
 		pools = append(pools, PoolStatus{
-			ServerID:   id,
-			ServerName: srv.Name(),
-			Host:       srv.Host(),
-			Port:       srv.Port(),
-			MaxConns:   st.MaxConns,
-			InUse:      st.InUse,
-			Idle:       st.Idle,
-			Enabled:    srv.Enabled(),
+			ServerID:    id,
+			ServerName:  srv.Name(),
+			Host:        srv.Host(),
+			Port:        srv.Port(),
+			MaxConns:    st.MaxConns,
+			InUse:       st.InUse,
+			Idle:        st.Idle,
+			Enabled:     srv.Enabled(),
+			Backup:      srv.Backup(),
+			BillingMode: string(srv.BillingMode()),
+			QuotaBytes:  srv.QuotaBytes(),
+			UsedBytes:   srv.UsedBytes(),
 		})
 	}
 

@@ -92,6 +92,8 @@ function ServersSection() {
               <th>TLS</th>
               <th>Conns</th>
               <th>Priority</th>
+              <th>Type</th>
+              <th>Used</th>
               <th></th>
             </tr>
           </thead>
@@ -108,7 +110,22 @@ function ServersSection() {
                   </StatusBadge>
                 </td>
                 <td className="muted">{s.max_conns}</td>
-                <td className="muted">{s.priority}</td>
+                <td className="muted">
+                  {s.priority}
+                  {s.backup ? " (backup)" : ""}
+                </td>
+                <td>
+                  <StatusBadge tone={s.billing_mode === "metered" ? "warn" : "ok"} dot>
+                    {s.billing_mode === "metered" ? "metered" : "flat"}
+                  </StatusBadge>
+                </td>
+                <td className="muted">
+                  {s.billing_mode === "metered"
+                    ? `${formatBytesShort(s.used_bytes)} / ${
+                        s.quota_bytes ? formatBytesShort(s.quota_bytes) : "∞"
+                      }`
+                    : formatBytesShort(s.used_bytes)}
+                </td>
                 <td className="queue-row-actions">
                   <button
                     type="button"
@@ -139,6 +156,9 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
   const [password, setPassword] = useState("");
   const [maxConns, setMaxConns] = useState(8);
   const [priority, setPriority] = useState(0);
+  const [backup, setBackup] = useState(false);
+  const [billingMode, setBillingMode] = useState<"flat" | "metered">("flat");
+  const [quotaGB, setQuotaGB] = useState(0); // operator-friendly: GB; converted to bytes on submit
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -156,11 +176,20 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
         password: password || undefined,
         max_conns: maxConns,
         priority,
+        backup,
+        billing_mode: billingMode,
+        quota_bytes:
+          billingMode === "metered" && quotaGB > 0
+            ? Math.round(quotaGB * 1024 * 1024 * 1024)
+            : 0,
       });
       setName("");
       setHost("");
       setUsername("");
       setPassword("");
+      setBackup(false);
+      setBillingMode("flat");
+      setQuotaGB(0);
       onAdded();
     } catch (e) {
       if (e instanceof ApiError) {
@@ -244,6 +273,39 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
             onChange={(e) => setPriority(Number(e.target.value))}
           />
         </label>
+        <label className="settings-checkbox">
+          <input
+            type="checkbox"
+            checked={backup}
+            onChange={(e) => setBackup(e.target.checked)}
+          />
+          <span>Backup</span>
+        </label>
+      </div>
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Billing</span>
+          <select
+            value={billingMode}
+            onChange={(e) => setBillingMode(e.target.value as "flat" | "metered")}
+          >
+            <option value="flat">Flat (unlimited)</option>
+            <option value="metered">Metered (block / pay-per-byte)</option>
+          </select>
+        </label>
+        {billingMode === "metered" && (
+          <label className="settings-field settings-field-narrow">
+            <span>Quota (GB)</span>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={quotaGB}
+              onChange={(e) => setQuotaGB(Number(e.target.value))}
+              placeholder="0 = unlimited"
+            />
+          </label>
+        )}
       </div>
       {err && <p className="text-err">{err}</p>}
       <Button
@@ -256,6 +318,20 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
       </Button>
     </form>
   );
+}
+
+// --- shared helpers --------------------------------------------------
+
+function formatBytesShort(n: number): string {
+  if (n <= 0) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
 // --- Categories -----------------------------------------------------

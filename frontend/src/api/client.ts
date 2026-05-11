@@ -159,6 +159,9 @@ export type AddServerBody = {
   password?: string;
   max_conns?: number;
   priority?: number;
+  backup?: boolean;
+  billing_mode?: "flat" | "metered";
+  quota_bytes?: number;
 };
 
 // streamURL returns the URL for the SSE endpoint. The session cookie

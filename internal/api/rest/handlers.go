@@ -274,14 +274,17 @@ func (h *Handlers) listServers(w http.ResponseWriter, r *http.Request) {
 }
 
 type addServerReq struct {
-	Name     string `json:"name"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	TLS      *bool  `json:"tls,omitempty"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	MaxConns int    `json:"max_conns,omitempty"`
-	Priority int    `json:"priority,omitempty"`
+	Name        string `json:"name"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	TLS         *bool  `json:"tls,omitempty"`
+	Username    string `json:"username,omitempty"`
+	Password    string `json:"password,omitempty"`
+	MaxConns    int    `json:"max_conns,omitempty"`
+	Priority    int    `json:"priority,omitempty"`
+	Backup      bool   `json:"backup,omitempty"`
+	BillingMode string `json:"billing_mode,omitempty"` // "flat" | "metered"; empty => flat
+	QuotaBytes  int64  `json:"quota_bytes,omitempty"`
 }
 
 func (h *Handlers) addServer(w http.ResponseWriter, r *http.Request) {
@@ -295,14 +298,17 @@ func (h *Handlers) addServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, err := h.Servers.Add(r.Context(), appserver.AddCmd{
-		Name:     req.Name,
-		Host:     req.Host,
-		Port:     req.Port,
-		TLS:      req.TLS,
-		Username: req.Username,
-		Password: req.Password,
-		MaxConns: req.MaxConns,
-		Priority: req.Priority,
+		Name:        req.Name,
+		Host:        req.Host,
+		Port:        req.Port,
+		TLS:         req.TLS,
+		Username:    req.Username,
+		Password:    req.Password,
+		MaxConns:    req.MaxConns,
+		Priority:    req.Priority,
+		Backup:      req.Backup,
+		BillingMode: domainserver.BillingMode(req.BillingMode),
+		QuotaBytes:  req.QuotaBytes,
 	})
 	if err != nil {
 		switch {
@@ -340,14 +346,18 @@ func (h *Handlers) systemStatus(w http.ResponseWriter, r *http.Request) {
 	pools := make([]map[string]any, 0, len(st.Pools))
 	for _, p := range st.Pools {
 		pools = append(pools, map[string]any{
-			"server_id":   int64(p.ServerID),
-			"server_name": p.ServerName,
-			"host":        p.Host,
-			"port":        p.Port,
-			"max_conns":   p.MaxConns,
-			"in_use":      p.InUse,
-			"idle":        p.Idle,
-			"enabled":     p.Enabled,
+			"server_id":    int64(p.ServerID),
+			"server_name":  p.ServerName,
+			"host":         p.Host,
+			"port":         p.Port,
+			"max_conns":    p.MaxConns,
+			"in_use":       p.InUse,
+			"idle":         p.Idle,
+			"enabled":      p.Enabled,
+			"backup":       p.Backup,
+			"billing_mode": p.BillingMode,
+			"quota_bytes":  p.QuotaBytes,
+			"used_bytes":   p.UsedBytes,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
