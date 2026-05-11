@@ -9,7 +9,7 @@ import { api, ApiError } from "../api/client";
 import { useQueue } from "../hooks/useQueue";
 
 export default function Activity() {
-  const { jobs, error, loading, refresh } = useQueue();
+  const { jobs, error, loading, refresh, applyReorder } = useQueue();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -33,6 +33,15 @@ export default function Activity() {
       await api.removeJob(id);
     } catch (e) {
       setUploadError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const onReorder = async (orderedIds: number[]) => {
+    applyReorder(orderedIds); // optimistic local reorder
+    try {
+      await api.reorderQueue(orderedIds);
+    } catch (e) {
+      setUploadError(e instanceof Error ? e.message : String(e));
+      await refresh(); // rollback to server truth on failure
     }
   };
 
@@ -131,6 +140,7 @@ export default function Activity() {
             onPause={onPause}
             onResume={onResume}
             onRemove={onRemove}
+            onReorder={onReorder}
           />
         )}
       </Panel>

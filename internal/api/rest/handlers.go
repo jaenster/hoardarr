@@ -113,6 +113,7 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	register("POST", "/api/v1/queue/nzb", h.addNZB)
 	register("POST", "/api/v1/queue/{id}/pause", h.pauseJob)
 	register("POST", "/api/v1/queue/{id}/resume", h.resumeJob)
+	register("POST", "/api/v1/queue/reorder", h.reorderQueue)
 	register("DELETE", "/api/v1/queue/{id}", h.removeJob)
 	if h.Outbox != nil {
 		register("GET", "/api/v1/queue/{id}/events", h.jobEvents)
@@ -320,6 +321,31 @@ func (h *Handlers) resumeJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.Queue.ResumeJob(r.Context(), download.JobID(id)); err != nil {
+		h.writeError(w, statusFor(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type reorderQueueReq struct {
+	IDs []int64 `json:"ids"`
+}
+
+func (h *Handlers) reorderQueue(w http.ResponseWriter, r *http.Request) {
+	var req reorderQueueReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	if len(req.IDs) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	ids := make([]download.JobID, len(req.IDs))
+	for i, id := range req.IDs {
+		ids[i] = download.JobID(id)
+	}
+	if err := h.Queue.Reorder(r.Context(), ids); err != nil {
 		h.writeError(w, statusFor(err), err)
 		return
 	}

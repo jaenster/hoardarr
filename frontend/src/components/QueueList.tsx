@@ -1,4 +1,5 @@
-import { Pause, Play, Trash2 } from "lucide-react";
+import { useState } from "react";
+import { GripVertical, Pause, Play, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import type { Job, JobState } from "../api/types";
 import StatusBadge from "./StatusBadge";
@@ -32,21 +33,57 @@ const stateLabel: Record<JobState, string> = {
 };
 
 export type QueueAction = (jobID: number) => void | Promise<void>;
+export type QueueReorder = (orderedIds: number[]) => void | Promise<void>;
 
 type Props = {
   jobs: Job[];
   onPause: QueueAction;
   onResume: QueueAction;
   onRemove: QueueAction;
+  onReorder?: QueueReorder;
 };
 
-export default function QueueList({ jobs, onPause, onResume, onRemove }: Props) {
+export default function QueueList({ jobs, onPause, onResume, onRemove, onReorder }: Props) {
+  // Live drag state — index of the row being dragged and the drop
+  // target. Used to render a "drop here" placeholder line.
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [overIdx, setOverIdx] = useState<number | null>(null);
+
+  const isReorderable = !!onReorder;
+
+  const handleDrop = async () => {
+    if (dragIdx == null || overIdx == null || dragIdx === overIdx) {
+      setDragIdx(null);
+      setOverIdx(null);
+      return;
+    }
+    const next = jobs.slice();
+    const [moved] = next.splice(dragIdx, 1);
+    next.splice(overIdx, 0, moved);
+    setDragIdx(null);
+    setOverIdx(null);
+    if (onReorder) {
+      await onReorder(next.map((j) => j.id));
+    }
+  };
+
   return (
     <ul className="queue-list" role="list">
-      {jobs.map((j) => (
+      {jobs.map((j, i) => (
         <QueueRow
           key={j.id}
           job={j}
+          index={i}
+          isDragging={dragIdx === i}
+          isDropTarget={overIdx === i && dragIdx !== null && dragIdx !== i}
+          reorderable={isReorderable}
+          onDragStart={() => setDragIdx(i)}
+          onDragOver={() => setOverIdx(i)}
+          onDragEnd={() => {
+            setDragIdx(null);
+            setOverIdx(null);
+          }}
+          onDrop={() => void handleDrop()}
           onPause={onPause}
           onResume={onResume}
           onRemove={onRemove}
@@ -58,11 +95,27 @@ export default function QueueList({ jobs, onPause, onResume, onRemove }: Props) 
 
 function QueueRow({
   job,
+  index,
+  isDragging,
+  isDropTarget,
+  reorderable,
+  onDragStart,
+  onDragOver,
+  onDragEnd,
+  onDrop,
   onPause,
   onResume,
   onRemove,
 }: {
   job: Job;
+  index: number;
+  isDragging: boolean;
+  isDropTarget: boolean;
+  reorderable: boolean;
+  onDragStart: () => void;
+  onDragOver: () => void;
+  onDragEnd: () => void;
+  onDrop: () => void;
   onPause: QueueAction;
   onResume: QueueAction;
   onRemove: QueueAction;
@@ -71,11 +124,44 @@ function QueueRow({
   const isPaused = job.state === "paused";
   const isTerminal =
     job.state === "completed" || job.state === "failed" || job.state === "aborted";
+  // Terminal jobs aren't draggable — reordering them is meaningless.
+  const draggable = reorderable && !isTerminal;
 
   return (
-    <li className="queue-row">
+    <li
+      className={
+        "queue-row" +
+        (isDragging ? " is-dragging" : "") +
+        (isDropTarget ? " is-drop-target" : "")
+      }
+      draggable={draggable}
+      onDragStart={(e) => {
+        if (!draggable) return;
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", String(job.id));
+        onDragStart();
+      }}
+      onDragOver={(e) => {
+        if (!reorderable) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        onDragOver();
+      }}
+      onDragEnd={onDragEnd}
+      onDrop={(e) => {
+        if (!reorderable) return;
+        e.preventDefault();
+        onDrop();
+      }}
+      data-index={index}
+    >
       <div className="queue-row-head">
         <div className="queue-row-title">
+          {draggable && (
+            <span className="queue-row-grip" aria-hidden="true" title="Drag to reorder">
+              <GripVertical size={14} />
+            </span>
+          )}
           <Link to={`/jobs/${job.id}`} className="queue-row-name queue-row-name-link">{job.name}</Link>
           {job.category && (
             <span className="queue-row-cat muted">{job.category}</span>

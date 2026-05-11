@@ -118,6 +118,9 @@ export const api = {
   removeJob(id: number): Promise<void> {
     return req("DELETE", `/api/v1/queue/${id}`);
   },
+  reorderQueue(ids: number[]): Promise<void> {
+    return jsonReq("POST", "/api/v1/queue/reorder", { ids });
+  },
 
   // --- per-job event timeline -----------------------------------
   jobEvents(id: number): Promise<{ events: EventEnvelope[] }> {

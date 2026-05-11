@@ -131,6 +131,55 @@ func (s *QueueService) RemoveJob(ctx context.Context, id download.JobID) error {
 	return nil
 }
 
+// Reorder rewrites queue_order on the supplied jobs so they appear in
+// the given order at the top of the active queue.
+//
+// Approach: persist queue_order = i for the i-th id passed in. Any
+// active job not present in ids retains its existing queue_order. We
+// allocate orders starting from the current minimum minus len(ids),
+// so reordered jobs land *before* untouched jobs in ascending order.
+// This means "drag a job to the top" actually puts it at the top
+// without needing to renumber every other row.
+//
+// Terminal-state jobs in the input are silently skipped — they have
+// no live queue position to set. Missing IDs surface as ErrNotFound
+// because that's typically a stale-client bug worth seeing.
+func (s *QueueService) Reorder(ctx context.Context, ids []download.JobID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return s.txm.InTx(ctx, func(ctx context.Context) error {
+		// Compute a base order safely below all existing queue_order
+		// values so the reordered set lands at the top. We pick base =
+		// min(existing) - len(ids); subsequent saves use base+i.
+		active, err := s.repo.Active(ctx)
+		if err != nil {
+			return fmt.Errorf("active: %w", err)
+		}
+		var minOrder int64
+		for _, j := range active {
+			if j.QueueOrder() < minOrder {
+				minOrder = j.QueueOrder()
+			}
+		}
+		base := minOrder - int64(len(ids))
+		for i, id := range ids {
+			j, err := s.repo.ByID(ctx, id)
+			if err != nil {
+				return fmt.Errorf("reorder: %d: %w", id, err)
+			}
+			if j.State().IsTerminal() {
+				continue
+			}
+			j.SetQueueOrder(base + int64(i))
+			if err := s.repo.Save(ctx, j); err != nil {
+				return fmt.Errorf("save: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
 // Get returns the full job tree (files, segments) by id.
 func (s *QueueService) Get(ctx context.Context, id download.JobID) (*download.Job, error) {
 	return s.repo.ByID(ctx, id)

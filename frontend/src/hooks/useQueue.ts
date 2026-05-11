@@ -46,6 +46,30 @@ export function useQueue() {
     }, 250);
   }, [refresh]);
 
+  // applyReorder mutates local state to match the given id order.
+  // Called by the Activity page to give immediate visual feedback on
+  // drag-drop without waiting for the POST + SSE refresh round trip.
+  // The server will overwrite this on the next refresh anyway, so a
+  // stale order from a missed update self-corrects.
+  const applyReorder = useCallback((orderedIds: number[]) => {
+    setJobs((current) => {
+      if (!current) return current;
+      const byId = new Map(current.map((j) => [j.id, j]));
+      const reordered: Job[] = [];
+      for (const id of orderedIds) {
+        const j = byId.get(id);
+        if (j) {
+          reordered.push(j);
+          byId.delete(id);
+        }
+      }
+      // Anything the client didn't reorder (terminal jobs, races)
+      // keeps its old relative order at the end.
+      reordered.push(...byId.values());
+      return reordered;
+    });
+  }, []);
+
   const patchJobBytes = useCallback(
     (jobId: number, deltaDone: number, deltaFailed: number) => {
       setJobs((current) => {
@@ -135,7 +159,7 @@ export function useQueue() {
     };
   }, [refresh, scheduleRefresh, patchJobBytes]);
 
-  return { jobs, error, loading, refresh };
+  return { jobs, error, loading, refresh, applyReorder };
 }
 
 // parseEnvelope decodes the SSE data payload. The server emits the

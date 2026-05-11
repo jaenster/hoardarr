@@ -180,6 +180,16 @@ func (j *Job) SetID(id JobID) {
 	}
 }
 
+// SetQueueOrder rewrites the queue-order position. No event is
+// emitted — reorder is a UI-driven concern, the orchestrator picks up
+// the new ordering on its next dispatch tick via the repository.
+//
+// Terminal jobs aren't filtered here; QueueService.Reorder is
+// responsible for not feeding terminal IDs into the operation.
+func (j *Job) SetQueueOrder(order int64) {
+	j.queueOrder = order
+}
+
 // PullEvents returns and clears the pending event list.
 func (j *Job) PullEvents() []event.Event {
 	out := j.events
