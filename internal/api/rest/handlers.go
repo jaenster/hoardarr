@@ -28,6 +28,7 @@ type Handlers struct {
 	Auth       Auther         // optional; nil disables /api/v1/auth/*
 	System     SystemStatuser // optional; nil disables /api/v1/system/status
 	Paths      *PathsView     // optional; nil disables /api/v1/config/paths
+	General    *GeneralView   // optional; nil disables /api/v1/config/general
 	Logger     *slog.Logger
 }
 
@@ -38,6 +39,17 @@ type PathsView struct {
 	DataDir       string
 	IncompleteDir string
 	CompleteDir   string
+}
+
+// GeneralView surfaces the slice of runtime config the UI needs to
+// render a meaningful General settings panel and the SAB-compat tab.
+// API key is included so admins can copy it into *arr clients; we
+// only return it to authenticated requests.
+type GeneralView struct {
+	Listen    string
+	APIKey    string
+	LogLevel  string
+	SABBase   string // e.g. "http://hoardarr:8085/sabnzbd/api"
 }
 
 // SystemStatuser is the slice of app/system.Service that the REST
@@ -93,6 +105,12 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	// runtime mutation is unsafe while jobs hold open files in incomplete/.
 	if h.Paths != nil {
 		register("GET", "/api/v1/config/paths", h.getPaths)
+	}
+
+	// General config view: listen addr, API key, log level. Read-only;
+	// mutation lives at config.toml + restart, same as paths.
+	if h.General != nil {
+		register("GET", "/api/v1/config/general", h.getGeneral)
 	}
 }
 
@@ -342,6 +360,17 @@ func (h *Handlers) systemStatus(w http.ResponseWriter, r *http.Request) {
 			"total":  st.QueueTotal,
 		},
 		"pools": pools,
+	})
+}
+
+// --- general config (read-only) -------------------------------------
+
+func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"listen":    h.General.Listen,
+		"api_key":   h.General.APIKey,
+		"log_level": h.General.LogLevel,
+		"sab_base":  h.General.SABBase,
 	})
 }
 

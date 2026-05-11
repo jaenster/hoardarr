@@ -43,6 +43,22 @@ import (
 	"github.com/jaenster/hoardarr/internal/server"
 )
 
+// buildSABBase derives the SAB-compat URL the operator pastes into
+// Sonarr/Radarr. cfg.Server.Listen may be ":8085" (any-interface) or
+// "127.0.0.1:8085" (explicit); the second form is the better hint to
+// the operator. We leave both as-is and prepend http:// — TLS belongs
+// to a reverse proxy in front of hoardarr today.
+func buildSABBase(listen string) string {
+	if listen == "" {
+		return ""
+	}
+	host := listen
+	if len(host) > 0 && host[0] == ':' {
+		host = "localhost" + host
+	}
+	return "http://" + host + "/sabnzbd/api"
+}
+
 // buildVersion identifies the running binary in /api/v1/system/status
 // and (eventually) in the SAB-compat version mode. Bumped per release;
 // dev builds use the -dev suffix so consumers can detect "not a tagged
@@ -77,6 +93,7 @@ type App struct {
 	Repair       *apprepair.Service
 	Deliver      *appdeliver.Service
 	Extract      *appextract.Service
+	ByteFlusher  *appdownload.ByteFlusher
 
 	LiveHub *sse.Hub
 
@@ -170,11 +187,15 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		return nil, fmt.Errorf("build pools: %w", err)
 	}
 
+	byteAccounter := appdownload.NewByteAccounter()
+	byteFlusher := appdownload.NewByteFlusher(byteAccounter, serverRepo, 10*time.Second, logger)
+
 	orch := appdownload.NewOrchestratorService(appdownload.OrchestratorServiceParams{
 		Repo:          jobRepo,
 		Bus:           bus,
 		TxManager:     txm,
 		Pools:         pools,
+		Accounter:     byteAccounter,
 		IncompleteDir: cfg.Paths.IncompleteDir,
 		Logger:        logger,
 	})
@@ -274,6 +295,12 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			IncompleteDir: cfg.Paths.IncompleteDir,
 			CompleteDir:   cfg.Paths.CompleteDir,
 		},
+		General: &rest.GeneralView{
+			Listen:   cfg.Server.Listen,
+			APIKey:   cfg.Auth.APIKey,
+			LogLevel: cfg.Server.LogLevel,
+			SABBase:  buildSABBase(cfg.Server.Listen),
+		},
 		Logger: logger,
 	})
 	srv.MountSAB(&sab.Handler{
@@ -316,6 +343,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Repair:        repairSvc,
 		Deliver:       deliverSvc,
 		Extract:       extractSvc,
+		ByteFlusher:   byteFlusher,
 		AuthService:   authSvc,
 		SystemService: systemSvc,
 		StartedAt:     startedAt,
@@ -361,6 +389,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Extract.Start(ctx); err != nil {
 		return fmt.Errorf("start extract: %w", err)
 	}
+	a.ByteFlusher.Start(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -398,6 +427,7 @@ func (a *App) Shutdown() error {
 				a.shutdownErr = fmt.Errorf("live hub close: %w", err)
 			}
 		}
+		a.ByteFlusher.Stop()
 		if err := a.Extract.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("extract stop: %w", err)
 		}

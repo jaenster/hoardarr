@@ -17,8 +17,13 @@ import (
 	"os"
 )
 
+// logLevel is a process-global LevelVar so the daemon can adjust its
+// effective slog level once config has loaded — without rebuilding
+// the handler or any of its child loggers.
+var logLevel = new(slog.LevelVar) // starts at INFO
+
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	slog.SetDefault(logger)
 
 	args := os.Args[1:]

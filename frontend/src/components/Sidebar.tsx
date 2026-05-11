@@ -27,17 +27,16 @@ type NavItem = {
   subNav?: SubNavItem[];
 };
 
+// Sub-nav reflects the panels actually rendered on the Settings page.
+// Aspirational sections (Post-Processing, Bandwidth, Connect, UI) come
+// back when their backing features land.
 const settingsSubNav: SubNavItem[] = [
   { label: "Usenet Servers", href: "#servers" },
   { label: "Categories", href: "#categories" },
   { label: "Paths", href: "#paths" },
-  { label: "Post-Processing", href: "#post-processing" },
-  { label: "Bandwidth", href: "#bandwidth" },
-  { label: "Connect", href: "#connect" },
   { label: "General", href: "#general" },
   { label: "Authentication", href: "#authentication" },
-  { label: "SABnzbd Compatibility", href: "#compatibility" },
-  { label: "UI", href: "#ui" },
+  { label: "SABnzbd Compatibility", href: "#sab-compat" },
 ];
 
 const navItems: NavItem[] = [

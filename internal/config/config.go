@@ -42,6 +42,10 @@ type Server struct {
 	// incomplete/complete directories, logs. Resolved to an absolute
 	// path during validation.
 	DataDir string `toml:"data_dir"`
+
+	// LogLevel selects the slog level: "debug" | "info" | "warn" | "error".
+	// Empty resolves to "info" during validation.
+	LogLevel string `toml:"log_level"`
 }
 
 // Auth holds authentication configuration. Currently API-key only;
@@ -91,8 +95,9 @@ type Paths struct {
 func Default() Config {
 	return Config{
 		Server: Server{
-			Listen:  ":8085",
-			DataDir: "./data",
+			Listen:   ":8085",
+			DataDir:  "./data",
+			LogLevel: "info",
 		},
 		Auth: Auth{
 			APIKey: "",
@@ -174,6 +179,12 @@ func (c *Config) Validate() error {
 	if c.Paths.CompleteDir == "" {
 		return errors.New("paths.complete_dir must not be empty after normalize")
 	}
+	switch c.Server.LogLevel {
+	case "debug", "info", "warn", "error":
+		// valid
+	default:
+		return fmt.Errorf("server.log_level %q is not supported (valid: debug, info, warn, error)", c.Server.LogLevel)
+	}
 	return nil
 }
 
@@ -205,6 +216,10 @@ func (c *Config) normalize() error {
 		c.Paths.CompleteDir = filepath.Join(dataDir, "complete")
 	} else if !filepath.IsAbs(c.Paths.CompleteDir) {
 		c.Paths.CompleteDir = filepath.Join(dataDir, c.Paths.CompleteDir)
+	}
+
+	if c.Server.LogLevel == "" {
+		c.Server.LogLevel = "info"
 	}
 	return nil
 }

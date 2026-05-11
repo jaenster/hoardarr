@@ -110,3 +110,10 @@ export type Paths = {
   runtime_mutable: boolean;
   requires_restart: boolean;
 };
+
+export type General = {
+  listen: string;
+  api_key: string;
+  log_level: string;
+  sab_base: string;
+};

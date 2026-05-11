@@ -5,23 +5,32 @@ import {
   HardDrive,
   Plus,
   Trash2,
+  Settings2,
+  KeyRound,
+  Plug,
+  Copy,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
 import { api, ApiError } from "../api/client";
-import type { Category, Paths, Server } from "../api/types";
+import type { Category, General, Paths, Server, User } from "../api/types";
 
 export default function Settings() {
   return (
     <Page
       title="Settings"
-      subtitle="Configure servers, categories and paths"
+      subtitle="Servers, categories, paths, and integration endpoints"
     >
-      <ServersSection />
-      <CategoriesSection />
-      <PathsSection />
+      <section id="servers"><ServersSection /></section>
+      <section id="categories"><CategoriesSection /></section>
+      <section id="paths"><PathsSection /></section>
+      <section id="general"><GeneralSection /></section>
+      <section id="authentication"><AuthSection /></section>
+      <section id="sab-compat"><SABSection /></section>
     </Page>
   );
 }
@@ -445,6 +454,186 @@ function PathsSection() {
             while jobs hold open files.
           </p>
         </>
+      ) : null}
+    </Panel>
+  );
+}
+
+// --- General --------------------------------------------------------
+
+function GeneralSection() {
+  const [gen, setGen] = useState<General | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [revealKey, setRevealKey] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .general()
+      .then((g) => {
+        if (!cancelled) setGen(g);
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <Panel
+      title="General"
+      meta={<StatusBadge tone="neutral"><Settings2 size={12} />read-only</StatusBadge>}
+    >
+      {err && <p className="text-err">{err}</p>}
+      {gen ? (
+        <>
+          <dl className="kv">
+            <dt>Listen</dt>
+            <dd>
+              <code className="inline-code">{gen.listen}</code>
+            </dd>
+            <dt>API key</dt>
+            <dd className="kv-key-row">
+              <code className="inline-code kv-key-value">
+                {revealKey ? gen.api_key : "•".repeat(gen.api_key.length || 32)}
+              </code>
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label={revealKey ? "Hide API key" : "Reveal API key"}
+                onClick={() => setRevealKey((v) => !v)}
+              >
+                {revealKey ? <EyeOff size={14} /> : <Eye size={14} />}
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Copy API key"
+                onClick={() => void navigator.clipboard.writeText(gen.api_key)}
+              >
+                <Copy size={14} />
+              </button>
+            </dd>
+            <dt>Log level</dt>
+            <dd>
+              <code className="inline-code">{gen.log_level}</code>
+            </dd>
+          </dl>
+          <p className="muted">
+            Edit <code className="inline-code">config.toml</code> and restart to
+            change these. The API key is shared with *arr clients via the SAB
+            endpoint below.
+          </p>
+        </>
+      ) : null}
+    </Panel>
+  );
+}
+
+// --- Authentication -------------------------------------------------
+
+function AuthSection() {
+  const [user, setUser] = useState<User | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .whoami()
+      .then((w) => {
+        if (cancelled) return;
+        if (w.state === "authenticated") setUser(w.user);
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <Panel
+      title="Authentication"
+      meta={
+        <StatusBadge tone="ok"><KeyRound size={12} />cookie session</StatusBadge>
+      }
+    >
+      {err && <p className="text-err">{err}</p>}
+      {user ? (
+        <>
+          <dl className="kv">
+            <dt>Signed in as</dt>
+            <dd>
+              <code className="inline-code">{user.username}</code>
+            </dd>
+            <dt>Role</dt>
+            <dd>
+              <code className="inline-code">{user.role}</code>
+            </dd>
+          </dl>
+          <p className="muted">
+            Change-password lands in a follow-up; until then, edit
+            users directly in the SQLite DB or re-run setup against a fresh DB.
+          </p>
+        </>
+      ) : null}
+    </Panel>
+  );
+}
+
+// --- SAB compat -----------------------------------------------------
+
+function SABSection() {
+  const [gen, setGen] = useState<General | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.general().then((g) => {
+      if (!cancelled) setGen(g);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <Panel
+      title="SABnzbd Compatibility"
+      meta={
+        <StatusBadge tone="ok"><Plug size={12} />enabled</StatusBadge>
+      }
+    >
+      <p className="muted">
+        Configure any *arr client (Sonarr, Radarr, Lidarr, Readarr, Prowlarr)
+        with these values to use hoardarr as a drop-in SABnzbd download client.
+      </p>
+      {gen ? (
+        <dl className="kv">
+          <dt>Host:Port</dt>
+          <dd className="kv-key-row">
+            <code className="inline-code kv-key-value">{gen.sab_base}</code>
+            <button
+              type="button"
+              className="icon-btn"
+              aria-label="Copy SAB URL"
+              onClick={() => void navigator.clipboard.writeText(gen.sab_base)}
+            >
+              <Copy size={14} />
+            </button>
+          </dd>
+          <dt>API key</dt>
+          <dd>
+            <span className="muted">— see General panel above</span>
+          </dd>
+          <dt>Version reported</dt>
+          <dd>
+            <code className="inline-code">3.7.2</code>{" "}
+            <span className="muted">(lies to *arr so it accepts us)</span>
+          </dd>
+        </dl>
       ) : null}
     </Panel>
   );

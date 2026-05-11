@@ -44,6 +44,7 @@ type OrchestratorService struct {
 	bus           event.Bus
 	txm           tx.TransactionManager
 	pools         map[server.ServerID]*nntp.Pool
+	accounter     *ByteAccounter // optional; per-server byte tally
 	incompleteDir string
 	logger        *slog.Logger
 	now           func() time.Time
@@ -67,6 +68,7 @@ type OrchestratorServiceParams struct {
 	Bus           event.Bus
 	TxManager     tx.TransactionManager
 	Pools         map[server.ServerID]*nntp.Pool
+	Accounter     *ByteAccounter // optional; supply to capture per-server byte tallies
 	IncompleteDir string
 	Logger        *slog.Logger
 	Now           func() time.Time
@@ -94,6 +96,7 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		bus:           p.Bus,
 		txm:           p.TxManager,
 		pools:         p.Pools,
+		accounter:     p.Accounter,
 		incompleteDir: p.IncompleteDir,
 		logger:        p.Logger,
 		now:           p.Now,
@@ -298,17 +301,20 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 		s.mu.Unlock()
 	}()
 
-	pool := s.pickPool()
-	if pool == nil {
-		s.logger.Error("orchestrator: no pool available", "job_id", id)
+	if !s.haveAnyUsablePool() {
+		s.logger.Error("orchestrator: no usable pool", "job_id", id)
 		return
 	}
-	srv := pool.Server()
-	fetcher := NewPoolFetcher(pool)
+
+	// Tiered fetcher handles priority/backup/metered selection per
+	// fetch call. The hint server id we pass to NewOrchestrator below
+	// is purely for logs / metrics — TieredFetcher ignores it.
+	fetcher := NewTieredFetcher(s.pools, s.accounter, s.logger)
+	hintID, hintMax := s.dispatchHint()
 
 	orch := NewOrchestrator(
 		s.repo, fetcher, s.bus, s.txm,
-		srv.ID(), srv.MaxConns(), s.incompleteDir,
+		hintID, hintMax, s.incompleteDir,
 		OrchestratorOptions{
 			Logger:        s.logger,
 			Now:           s.now,
@@ -327,17 +333,46 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 	}
 }
 
-// pickPool returns the highest-priority pool. M2 is single-server in
-// practice; multi-server failover lands later.
-func (s *OrchestratorService) pickPool() *nntp.Pool {
+// haveAnyUsablePool reports whether at least one enabled, non-quota-
+// exhausted pool exists. Used as a fast-fail at runner-start time.
+func (s *OrchestratorService) haveAnyUsablePool() bool {
+	for _, p := range s.pools {
+		srv := p.Server()
+		if srv.Enabled() && !srv.QuotaExhausted() {
+			return true
+		}
+	}
+	return false
+}
+
+// dispatchHint returns (id, maxConns) of the highest-priority usable
+// pool. The id is a label only — actual fetches go through the
+// tiered fetcher. The maxConns value sizes the orchestrator's worker
+// pool; we use the highest-priority server's cap as a reasonable
+// baseline (alternative: sum across the whole tier, but that risks
+// hammering backup providers when primaries are healthy).
+func (s *OrchestratorService) dispatchHint() (server.ServerID, int) {
 	var best *nntp.Pool
 	for _, p := range s.pools {
-		if !p.Server().Enabled() {
+		srv := p.Server()
+		if !srv.Enabled() || srv.QuotaExhausted() || srv.Backup() {
 			continue
 		}
-		if best == nil || p.Server().Priority() < best.Server().Priority() {
+		if best == nil || srv.Priority() < best.Server().Priority() {
 			best = p
 		}
 	}
-	return best
+	if best == nil {
+		// Only backups available — use whichever first.
+		for _, p := range s.pools {
+			if p.Server().Enabled() && !p.Server().QuotaExhausted() {
+				best = p
+				break
+			}
+		}
+	}
+	if best == nil {
+		return 0, 1
+	}
+	return best.Server().ID(), best.Server().MaxConns()
 }

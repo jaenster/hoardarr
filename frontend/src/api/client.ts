@@ -6,7 +6,7 @@
 // in the server middleware for *arr clients but the web UI no longer
 // uses it.
 
-import type { Category, Job, Paths, Server, SystemStatus, User } from "./types";
+import type { Category, General, Job, Paths, Server, SystemStatus, User } from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown, msg: string) {
@@ -137,6 +137,9 @@ export const api = {
   },
   paths(): Promise<Paths> {
     return req("GET", "/api/v1/config/paths");
+  },
+  general(): Promise<General> {
+    return req("GET", "/api/v1/config/general");
   },
 };
 

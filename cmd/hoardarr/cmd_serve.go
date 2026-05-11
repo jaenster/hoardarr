@@ -25,7 +25,19 @@ func cmdServe(args []string, logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	logger.Info("config loaded", "path", *configPath)
+	// Apply the config-requested log level to the process-wide LevelVar.
+	// Config.Validate already restricts the set, so this is a total map.
+	switch cfg.Server.LogLevel {
+	case "debug":
+		logLevel.Set(slog.LevelDebug)
+	case "warn":
+		logLevel.Set(slog.LevelWarn)
+	case "error":
+		logLevel.Set(slog.LevelError)
+	default:
+		logLevel.Set(slog.LevelInfo)
+	}
+	logger.Info("config loaded", "path", *configPath, "log_level", cfg.Server.LogLevel)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

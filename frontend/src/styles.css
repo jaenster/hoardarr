@@ -1060,6 +1060,18 @@ a:hover {
   color: var(--text);
 }
 
+/* key-row used inside <dd> for reveal/copy buttons next to a value */
+
+.kv-key-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.kv-key-value {
+  word-break: break-all;
+}
+
 /* settings forms — used by Servers / Categories panels */
 
 .settings-form {

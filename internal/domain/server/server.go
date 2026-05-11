@@ -38,11 +38,38 @@ type UsenetServer struct {
 	maxConns  int
 	priority  int
 	enabled   bool
+
+	// backup: when true the orchestrator only consults this server after
+	// every non-backup tier has reported the article missing. Independent
+	// of priority — backups are always last regardless of priority value.
+	backup bool
+
+	// billingMode: "flat" (unlimited monthly) or "metered" (block account,
+	// pay-per-byte). The orchestrator prefers flat over metered when
+	// both are available in the same tier; metered providers act as a
+	// reserve for rare / old articles.
+	billingMode BillingMode
+
+	// quotaBytes is the total purchased byte budget for metered servers.
+	// 0 means "unknown / unlimited" (we don't auto-disable). usedBytes
+	// is a monotonic counter incremented by the fetcher after each
+	// successful body download.
+	quotaBytes int64
+	usedBytes  int64
+
 	addedAt   time.Time
 	updatedAt time.Time
 
 	events []event.Event
 }
+
+// BillingMode identifies the provider's pricing structure.
+type BillingMode string
+
+const (
+	BillingFlat    BillingMode = "flat"
+	BillingMetered BillingMode = "metered"
+)
 
 // NewParams gathers required fields for New. Optional fields default
 // to common-case values: TLS on, MaxConns 8, priority 0, enabled true.
@@ -55,6 +82,12 @@ type NewParams struct {
 	Password string
 	MaxConns int
 	Priority int
+
+	// Optional. Backup defaults false. BillingMode defaults BillingFlat.
+	// QuotaBytes defaults 0 (= unknown / unlimited).
+	Backup      bool
+	BillingMode BillingMode
+	QuotaBytes  int64
 }
 
 // New constructs a UsenetServer with validation. The returned aggregate
@@ -93,18 +126,32 @@ func New(p NewParams, now time.Time) (*UsenetServer, error) {
 		return nil, err
 	}
 
+	billing := p.BillingMode
+	if billing == "" {
+		billing = BillingFlat
+	}
+	if billing != BillingFlat && billing != BillingMetered {
+		return nil, fmt.Errorf("server: unknown billing_mode %q", billing)
+	}
+	if p.QuotaBytes < 0 {
+		return nil, fmt.Errorf("server: quota_bytes %d must be >= 0", p.QuotaBytes)
+	}
+
 	s := &UsenetServer{
-		name:      name,
-		host:      host,
-		port:      p.Port,
-		tls:       tls,
-		username:  p.Username,
-		password:  p.Password,
-		maxConns:  maxConns,
-		priority:  p.Priority,
-		enabled:   true,
-		addedAt:   now,
-		updatedAt: now,
+		name:        name,
+		host:        host,
+		port:        p.Port,
+		tls:         tls,
+		username:    p.Username,
+		password:    p.Password,
+		maxConns:    maxConns,
+		priority:    p.Priority,
+		enabled:     true,
+		backup:      p.Backup,
+		billingMode: billing,
+		quotaBytes:  p.QuotaBytes,
+		addedAt:     now,
+		updatedAt:   now,
 	}
 	s.events = append(s.events, ServerAdded{
 		ID:   0, // repo fills in after Save
@@ -117,36 +164,48 @@ func New(p NewParams, now time.Time) (*UsenetServer, error) {
 // HydrateParams is the snapshot the repository hands back when loading
 // a row. Bypasses validation; the database is trusted.
 type HydrateParams struct {
-	ID        ServerID
-	Name      string
-	Host      string
-	Port      int
-	TLS       bool
-	Username  string
-	Password  string
-	MaxConns  int
-	Priority  int
-	Enabled   bool
-	AddedAt   time.Time
-	UpdatedAt time.Time
+	ID          ServerID
+	Name        string
+	Host        string
+	Port        int
+	TLS         bool
+	Username    string
+	Password    string
+	MaxConns    int
+	Priority    int
+	Enabled     bool
+	Backup      bool
+	BillingMode BillingMode
+	QuotaBytes  int64
+	UsedBytes   int64
+	AddedAt     time.Time
+	UpdatedAt   time.Time
 }
 
 // Hydrate reconstructs a UsenetServer from persistence. No events are
 // emitted.
 func Hydrate(p HydrateParams) *UsenetServer {
+	billing := p.BillingMode
+	if billing == "" {
+		billing = BillingFlat
+	}
 	return &UsenetServer{
-		id:        p.ID,
-		name:      p.Name,
-		host:      p.Host,
-		port:      p.Port,
-		tls:       p.TLS,
-		username:  p.Username,
-		password:  p.Password,
-		maxConns:  p.MaxConns,
-		priority:  p.Priority,
-		enabled:   p.Enabled,
-		addedAt:   p.AddedAt,
-		updatedAt: p.UpdatedAt,
+		id:          p.ID,
+		name:        p.Name,
+		host:        p.Host,
+		port:        p.Port,
+		tls:         p.TLS,
+		username:    p.Username,
+		password:    p.Password,
+		maxConns:    p.MaxConns,
+		priority:    p.Priority,
+		enabled:     p.Enabled,
+		backup:      p.Backup,
+		billingMode: billing,
+		quotaBytes:  p.QuotaBytes,
+		usedBytes:   p.UsedBytes,
+		addedAt:     p.AddedAt,
+		updatedAt:   p.UpdatedAt,
 	}
 }
 
@@ -160,9 +219,34 @@ func (s *UsenetServer) Username() string   { return s.username }
 func (s *UsenetServer) Password() string   { return s.password }
 func (s *UsenetServer) MaxConns() int      { return s.maxConns }
 func (s *UsenetServer) Priority() int      { return s.priority }
-func (s *UsenetServer) Enabled() bool      { return s.enabled }
-func (s *UsenetServer) AddedAt() time.Time { return s.addedAt }
+func (s *UsenetServer) Enabled() bool        { return s.enabled }
+func (s *UsenetServer) Backup() bool         { return s.backup }
+func (s *UsenetServer) BillingMode() BillingMode { return s.billingMode }
+func (s *UsenetServer) QuotaBytes() int64    { return s.quotaBytes }
+func (s *UsenetServer) UsedBytes() int64     { return s.usedBytes }
+func (s *UsenetServer) AddedAt() time.Time   { return s.addedAt }
 func (s *UsenetServer) UpdatedAt() time.Time { return s.updatedAt }
+
+// QuotaExhausted reports whether a metered server has hit its quota.
+// Flat-rate servers and metered servers with quota_bytes=0 (unknown)
+// always return false — auto-disable only kicks in when the operator
+// explicitly set a quota.
+func (s *UsenetServer) QuotaExhausted() bool {
+	if s.billingMode != BillingMetered || s.quotaBytes == 0 {
+		return false
+	}
+	return s.usedBytes >= s.quotaBytes
+}
+
+// AddBytesUsed increments the per-server byte counter. Called by the
+// fetcher after a successful BODY download.
+func (s *UsenetServer) AddBytesUsed(n int64, now time.Time) {
+	if n <= 0 {
+		return
+	}
+	s.usedBytes += n
+	s.updatedAt = now
+}
 
 // SetID is called by the repository after a successful Save when a
 // fresh aggregate gets its database-assigned id. After SetID, any

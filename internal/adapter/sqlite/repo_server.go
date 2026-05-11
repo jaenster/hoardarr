@@ -39,11 +39,14 @@ func (r *ServerRepo) insert(ctx context.Context, s *server.UsenetServer) error {
 	res, err := r.db.ExecCtx(ctx, `
 		INSERT INTO servers(
 			name, host, port, tls, username, password,
-			max_conns, priority, enabled, added_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			max_conns, priority, enabled,
+			backup, billing_mode, quota_bytes, used_bytes,
+			added_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		s.Name(), s.Host(), s.Port(), boolToInt(s.TLS()), nullableString(s.Username()), nullableString(s.Password()),
 		s.MaxConns(), s.Priority(), boolToInt(s.Enabled()),
+		boolToInt(s.Backup()), string(s.BillingMode()), s.QuotaBytes(), s.UsedBytes(),
 		s.AddedAt().UnixMilli(), s.UpdatedAt().UnixMilli(),
 	)
 	if err != nil {
@@ -61,11 +64,14 @@ func (r *ServerRepo) update(ctx context.Context, s *server.UsenetServer) error {
 	res, err := r.db.ExecCtx(ctx, `
 		UPDATE servers SET
 			name = ?, host = ?, port = ?, tls = ?, username = ?, password = ?,
-			max_conns = ?, priority = ?, enabled = ?, updated_at = ?
+			max_conns = ?, priority = ?, enabled = ?,
+			backup = ?, billing_mode = ?, quota_bytes = ?, used_bytes = ?,
+			updated_at = ?
 		WHERE id = ?
 	`,
 		s.Name(), s.Host(), s.Port(), boolToInt(s.TLS()), nullableString(s.Username()), nullableString(s.Password()),
 		s.MaxConns(), s.Priority(), boolToInt(s.Enabled()),
+		boolToInt(s.Backup()), string(s.BillingMode()), s.QuotaBytes(), s.UsedBytes(),
 		s.UpdatedAt().UnixMilli(),
 		int64(s.ID()),
 	)
@@ -105,6 +111,32 @@ func (r *ServerRepo) ListEnabled(ctx context.Context) ([]*server.UsenetServer, e
 	return r.queryServers(ctx, selectEnabledServers)
 }
 
+// IncrementUsedBytes bumps used_bytes by n in a single UPDATE statement.
+// Used by the byte-accounting flusher in the download package; avoids
+// the read-modify-write cost of going through Save() for every flush
+// tick (and the lost-update risk if two flushers raced — they don't
+// today but the SQL atomicity is the right shape regardless).
+//
+// Bumping updated_at too keeps "last seen" semantics consistent with
+// every other server-state mutation.
+func (r *ServerRepo) IncrementUsedBytes(ctx context.Context, id server.ServerID, n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	res, err := r.db.ExecCtx(ctx, `
+		UPDATE servers SET used_bytes = used_bytes + ?, updated_at = ?
+		WHERE id = ?
+	`, n, time.Now().UTC().UnixMilli(), int64(id))
+	if err != nil {
+		return fmt.Errorf("increment used_bytes: %w", err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return server.ErrNotFound
+	}
+	return nil
+}
+
 // Delete removes the row by id. Returns ErrNotFound if id does not
 // exist.
 func (r *ServerRepo) Delete(ctx context.Context, id server.ServerID) error {
@@ -139,7 +171,10 @@ func (r *ServerRepo) queryServers(ctx context.Context, query string, args ...any
 	return out, rows.Err()
 }
 
-const serverColumns = `id, name, host, port, tls, username, password, max_conns, priority, enabled, added_at, updated_at`
+const serverColumns = `id, name, host, port, tls, username, password,
+	max_conns, priority, enabled,
+	backup, billing_mode, quota_bytes, used_bytes,
+	added_at, updated_at`
 
 const selectServerByID = `SELECT ` + serverColumns + ` FROM servers WHERE id = ?`
 const selectServerByName = `SELECT ` + serverColumns + ` FROM servers WHERE name = ?`
@@ -160,35 +195,48 @@ func scanServer(row *sql.Row) (*server.UsenetServer, error) {
 
 func scanServerFromRows(s serverScanner) (*server.UsenetServer, error) {
 	var (
-		id        int64
-		name      string
-		host      string
-		port      int
-		tls       int
-		username  sql.NullString
-		password  sql.NullString
-		maxConns  int
-		priority  int
-		enabled   int
-		added     int64
-		updated   int64
+		id          int64
+		name        string
+		host        string
+		port        int
+		tls         int
+		username    sql.NullString
+		password    sql.NullString
+		maxConns    int
+		priority    int
+		enabled     int
+		backup      int
+		billingMode string
+		quotaBytes  int64
+		usedBytes   int64
+		added       int64
+		updated     int64
 	)
-	if err := s.Scan(&id, &name, &host, &port, &tls, &username, &password, &maxConns, &priority, &enabled, &added, &updated); err != nil {
+	if err := s.Scan(
+		&id, &name, &host, &port, &tls, &username, &password,
+		&maxConns, &priority, &enabled,
+		&backup, &billingMode, &quotaBytes, &usedBytes,
+		&added, &updated,
+	); err != nil {
 		return nil, err
 	}
 	return server.Hydrate(server.HydrateParams{
-		ID:        server.ServerID(id),
-		Name:      name,
-		Host:      host,
-		Port:      port,
-		TLS:       tls != 0,
-		Username:  username.String,
-		Password:  password.String,
-		MaxConns:  maxConns,
-		Priority:  priority,
-		Enabled:   enabled != 0,
-		AddedAt:   time.UnixMilli(added).UTC(),
-		UpdatedAt: time.UnixMilli(updated).UTC(),
+		ID:          server.ServerID(id),
+		Name:        name,
+		Host:        host,
+		Port:        port,
+		TLS:         tls != 0,
+		Username:    username.String,
+		Password:    password.String,
+		MaxConns:    maxConns,
+		Priority:    priority,
+		Enabled:     enabled != 0,
+		Backup:      backup != 0,
+		BillingMode: server.BillingMode(billingMode),
+		QuotaBytes:  quotaBytes,
+		UsedBytes:   usedBytes,
+		AddedAt:     time.UnixMilli(added).UTC(),
+		UpdatedAt:   time.UnixMilli(updated).UTC(),
 	}), nil
 }
 
