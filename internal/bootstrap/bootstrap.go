@@ -537,7 +537,13 @@ func (a *App) Shutdown() error {
 		if err := a.Orchestrator.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("orchestrator stop: %w", err)
 		}
-		for id, p := range a.Pools {
+		// Use the orchestrator's live pool snapshot — a.Pools is the
+		// frozen startup set and misses anything hot-wired via UI.
+		// Without this, conns from runtime-added servers linger on
+		// the provider until their idle timeout (60-120s on Eweka),
+		// which trips the max-connections limit during quick restarts.
+		live := a.Orchestrator.PoolsSnapshot()
+		for id, p := range live {
 			if err := p.Close(); err != nil && a.shutdownErr == nil {
 				a.shutdownErr = fmt.Errorf("pool close (server %d): %w", id, err)
 			}

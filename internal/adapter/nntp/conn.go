@@ -145,12 +145,24 @@ func (c *Conn) Server() *server.UsenetServer { return c.server }
 // Used by the pool to prune idle connections.
 func (c *Conn) LastUsed() time.Time { return c.lastUsed }
 
-// Close terminates the connection. Idempotent.
+// Close terminates the connection. Sends NNTP QUIT first (with a
+// 2s deadline) so the server immediately frees the connection slot
+// in its accounting — most providers count slots until they see
+// QUIT or a TCP FIN. Without an explicit QUIT, Eweka and similar
+// providers keep "ghost" slots around for ~60-120s after a hard
+// kill, which trips their max-connections limit. Idempotent.
 func (c *Conn) Close() error {
 	if c.closed {
 		return nil
 	}
 	c.closed = true
+	// Best-effort QUIT. We don't care about the response, only that
+	// the bytes make it on the wire before we tear down the socket.
+	// Skip on already-broken conns (Write would just error).
+	if c.netConn != nil {
+		_ = c.netConn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, _ = c.netConn.Write([]byte("QUIT\r\n"))
+	}
 	return c.tp.Close()
 }
 
