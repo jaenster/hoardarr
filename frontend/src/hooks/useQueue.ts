@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamURL } from "../api/client";
-import type { Job } from "../api/types";
+import type { EventEnvelope, Job } from "../api/types";
 
-// useQueue holds the current queue snapshot and refreshes it via
-// /api/v1/queue + Server-Sent Events.
+// useQueue holds the current queue snapshot and applies live SSE
+// updates.
 //
 // Strategy:
-//  1. On mount: GET /api/v1/queue once.
-//  2. Open an EventSource on /api/v1/queue/stream.
-//  3. On any download.* event, debounce-refresh /api/v1/queue.
+//   1. On mount: GET /api/v1/queue once.
+//   2. Open EventSource on /api/v1/queue/stream.
+//   3. Segment-level events (completed/missing/failed) patch the
+//      affected job in place — done_bytes / failed_bytes tick on the
+//      sub-second cadence the orchestrator produces them at, with no
+//      network roundtrip per tick.
+//   4. Job-level events (created/state transitions/removed) schedule
+//      a debounced refresh, because those require fields we don't
+//      derive from segment payloads (state, started_at, files…).
 //
-// The debounce coalesces rapid-fire SegmentCompleted events into one
-// fetch every ~250ms, giving smooth progress updates without
-// hammering the API. Going to per-event in-place patching is a
-// future optimisation.
+// In-place patching is essential for "smooth tick" UX — a refresh per
+// segment would be ~hundreds of /queue/list calls per second on a fast
+// job.
 export function useQueue() {
   const [jobs, setJobs] = useState<Job[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -41,11 +46,54 @@ export function useQueue() {
     }, 250);
   }, [refresh]);
 
+  const patchJobBytes = useCallback(
+    (jobId: number, deltaDone: number, deltaFailed: number) => {
+      setJobs((current) => {
+        if (!current) return current;
+        let mutated = false;
+        const next = current.map((j) => {
+          if (j.id !== jobId) return j;
+          mutated = true;
+          const nextDone = j.done_bytes + deltaDone;
+          // Clamp to total_bytes so the bar never overshoots while we
+          // wait for the next authoritative refresh.
+          const clampedDone =
+            j.total_bytes > 0 ? Math.min(j.total_bytes, nextDone) : nextDone;
+          return {
+            ...j,
+            done_bytes: clampedDone,
+            failed_bytes: j.failed_bytes + deltaFailed,
+          };
+        });
+        return mutated ? next : current;
+      });
+    },
+    [],
+  );
+
   useEffect(() => {
     void refresh();
 
     const es = new EventSource(streamURL());
-    const onAnyDownload = () => scheduleRefresh();
+
+    // Segment-completed → tick done_bytes immediately. Payload carries
+    // {job_id, segment_id, bytes, at}.
+    es.addEventListener("download.segment.completed", (ev) => {
+      const env = parseEnvelope(ev);
+      const payload = env?.Payload as { job_id?: number; bytes?: number } | undefined;
+      if (payload?.job_id && typeof payload.bytes === "number") {
+        patchJobBytes(payload.job_id, payload.bytes, 0);
+      }
+    });
+    // Segment-missing / failed → tick failed_bytes (best-effort; the
+    // event payload doesn't carry a byte count for missing, so we
+    // leave failed_bytes alone and rely on the next refresh for the
+    // exact figure).
+    es.addEventListener("download.segment.failed", () => scheduleRefresh());
+    es.addEventListener("download.segment.missing", () => scheduleRefresh());
+
+    // Anything that mutates job state (or the job set itself) → full
+    // refresh. These are infrequent, so the cost is fine.
     [
       "download.job.created",
       "download.job.started",
@@ -54,11 +102,24 @@ export function useQueue() {
       "download.job.removed",
       "download.job.download_complete",
       "download.job.download_failed",
-      "download.segment.completed",
-      "download.segment.missing",
-      "download.segment.failed",
+      "download.job.completed",
+      "download.job.failed",
       "download.file.completed",
-    ].forEach((topic) => es.addEventListener(topic, onAnyDownload));
+      "verify.started",
+      "verify.ok",
+      "verify.repair_needed",
+      "verify.failed",
+      "repair.started",
+      "repair.ok",
+      "repair.failed",
+      "extract.started",
+      "extract.complete",
+      "extract.failed",
+      "deliver.started",
+      "deliver.complete",
+      "deliver.skipped",
+      "deliver.failed",
+    ].forEach((topic) => es.addEventListener(topic, () => scheduleRefresh()));
 
     es.onerror = () => {
       // EventSource auto-reconnects; we surface a non-fatal warning.
@@ -72,7 +133,18 @@ export function useQueue() {
       }
       es.close();
     };
-  }, [refresh, scheduleRefresh]);
+  }, [refresh, scheduleRefresh, patchJobBytes]);
 
   return { jobs, error, loading, refresh };
+}
+
+// parseEnvelope decodes the SSE data payload. The server emits the
+// full event.Envelope as JSON; we lift the Payload field out.
+function parseEnvelope(ev: MessageEvent): EventEnvelope | null {
+  if (typeof ev.data !== "string") return null;
+  try {
+    return JSON.parse(ev.data) as EventEnvelope;
+  } catch {
+    return null;
+  }
 }
