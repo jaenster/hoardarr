@@ -22,26 +22,30 @@ func jobToSABSlot(j *download.Job) map[string]any {
 		pct = int((j.DoneBytes() * 100) / j.TotalBytes())
 	}
 	return map[string]any{
-		"index":      0,
-		"nzo_id":     nzoID(j.ID()),
-		"unpackopts": "3",
-		"priority":   priorityToSAB(j.Priority()),
-		"script":     "None",
-		"filename":   j.Name(),
-		"cat":        catOrStar(j.Category()),
-		"mbleft":     leftMB,
-		"mb":         totalMB,
-		"size":       formatBytesHuman(j.TotalBytes()),
-		"sizeleft":   formatBytesHuman(j.TotalBytes() - j.DoneBytes()),
-		"percentage": fmt.Sprintf("%d", pct),
-		"mbmissing":  "0.00",
-		"status":     stateToSABStatus(j.State()),
-		"timeleft":   "0:00:00",
-		"avg_age":    "0d",
-		"eta":        "unknown",
-		"missing":    0,
-		"unpack":     "",
-		"_doneMB":    doneMB,
+		"index":         0,
+		"nzo_id":        nzoID(j.ID()),
+		"unpackopts":    "3",
+		"priority":      priorityToSAB(j.Priority()),
+		"script":        "None",
+		"filename":      j.Name(),
+		"cat":           catOrStar(j.Category()),
+		"mbleft":        leftMB,
+		"mb":            totalMB,
+		"size":          formatBytesHuman(j.TotalBytes()),
+		"sizeleft":      formatBytesHuman(j.TotalBytes() - j.DoneBytes()),
+		"percentage":    fmt.Sprintf("%d", pct),
+		"mbmissing":     "0.00",
+		"status":        stateToSABStatus(j.State()),
+		"timeleft":      "0:00:00",
+		"avg_age":       "0d",
+		"eta":           "unknown",
+		"missing":       0,
+		// SAB v3.7.x parity. *arr ignores these; SAB-mobile reads them:
+		"labels":        []string{},
+		"password":      "",
+		"direct_unpack": nil, // SAB: int progress or null
+		"time_added":    formatTimeISO(j.AddedAt()),
+		"_doneMB":       doneMB,
 	}
 }
 
@@ -57,22 +61,40 @@ func jobToSABHistorySlot(j *download.Job, completeDir string) map[string]any {
 		storage = filepath.Join(completeDir, j.Name())
 	}
 	return map[string]any{
-		"id":         int64(j.ID()),
-		"nzo_id":     nzoID(j.ID()),
-		"name":       j.Name(),
-		"category":   catOrStar(j.Category()),
-		"size":       formatBytesHuman(j.TotalBytes()),
-		"bytes":      j.TotalBytes(),
-		"storage":    storage,
-		"completed":  unixOrZero(j.FinishedAt()),
-		"status":     historyStateToSAB(j.State()),
-		"fail_message": j.ErrorMsg(),
-		"path":       storage,
-		"script":     "None",
+		"id":            int64(j.ID()),
+		"nzo_id":        nzoID(j.ID()),
+		"name":          j.Name(),
+		"nzb_name":      j.Name() + ".nzb",
+		"category":      catOrStar(j.Category()),
+		"pp":            "X", // post-process opts encoded; we always do verify+extract+deliver
+		"size":          formatBytesHuman(j.TotalBytes()),
+		"bytes":         j.TotalBytes(),
+		"storage":       storage,
+		"completed":     unixOrZero(j.FinishedAt()),
+		"status":        historyStateToSAB(j.State()),
+		"fail_message":  j.ErrorMsg(),
+		"path":          storage,
+		"script":        "None",
 		"download_time": 0,
 		"postproc_time": 0,
-		"stage_log":  []any{},
-		"action_line": "",
+		"stage_log":     []any{},
+		"action_line":   "",
+		// SAB v3.7.x parity. Provide defaults so consumers don't NPE.
+		"report":         "",
+		"url":            "",
+		"url_info":       "",
+		"script_line":    "",
+		"downloaded":     j.TotalBytes(),
+		"completeness":   nil,
+		"meta":           nil,
+		"series":         "",
+		"duplicate_key":  "",
+		"md5sum":         "",
+		"password":       "",
+		"loaded":         false,
+		"retry":          false,
+		"archive":        false,
+		"time_added":     formatTimeISO(j.AddedAt()),
 	}
 }
 
@@ -215,4 +237,14 @@ func unixOrZero(t time.Time) int64 {
 		return 0
 	}
 	return t.Unix()
+}
+
+// formatTimeISO emits an RFC3339 string for SAB's `time_added` slot
+// field. Returns an empty string for the zero time so consumers can
+// distinguish "never set".
+func formatTimeISO(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
