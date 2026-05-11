@@ -295,13 +295,17 @@ func (s *UsenetServer) SetEnabled(enabled bool, now time.Time) {
 // applied. Returns the same validation errors as New for the affected
 // fields.
 type UpdateParams struct {
-	Host     *string
-	Port     *int
-	TLS      *bool
-	Username *string
-	Password *string
-	MaxConns *int
-	Priority *int
+	Host                 *string
+	Port                 *int
+	TLS                  *bool
+	Username             *string
+	Password             *string
+	MaxConns             *int
+	Priority             *int
+	Backup               *bool
+	BillingMode          *BillingMode
+	QuotaBytes           *int64
+	BandwidthBytesPerSec *int64
 }
 
 // Update applies a batch of field changes and records a single
@@ -362,6 +366,41 @@ func (s *UsenetServer) Update(p UpdateParams, now time.Time) error {
 	if p.Priority != nil && *p.Priority != s.priority {
 		s.priority = *p.Priority
 		changed = true
+	}
+	if p.Backup != nil && *p.Backup != s.backup {
+		s.backup = *p.Backup
+		changed = true
+	}
+	if p.BillingMode != nil {
+		v := *p.BillingMode
+		if v == "" {
+			v = BillingFlat
+		}
+		if v != BillingFlat && v != BillingMetered {
+			return fmt.Errorf("server: unknown billing_mode %q", v)
+		}
+		if v != s.billingMode {
+			s.billingMode = v
+			changed = true
+		}
+	}
+	if p.QuotaBytes != nil {
+		if *p.QuotaBytes < 0 {
+			return fmt.Errorf("server: quota_bytes %d must be >= 0", *p.QuotaBytes)
+		}
+		if *p.QuotaBytes != s.quotaBytes {
+			s.quotaBytes = *p.QuotaBytes
+			changed = true
+		}
+	}
+	if p.BandwidthBytesPerSec != nil {
+		if *p.BandwidthBytesPerSec < 0 {
+			return fmt.Errorf("server: bandwidth_bytes_per_sec %d must be >= 0", *p.BandwidthBytesPerSec)
+		}
+		if *p.BandwidthBytesPerSec != s.bandwidthBytesPerSec {
+			s.bandwidthBytesPerSec = *p.BandwidthBytesPerSec
+			changed = true
+		}
 	}
 	if changed {
 		s.updatedAt = now

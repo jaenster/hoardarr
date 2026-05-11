@@ -1303,6 +1303,68 @@ a:hover {
   accent-color: var(--accent);
 }
 
+.settings-form-header {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+}
+.settings-form-actions {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.probe-banner {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  width: 100%;
+}
+.probe-banner.probe-ok {
+  border-color: var(--ok-line, #2f6f3a);
+}
+.probe-banner.probe-fail {
+  border-color: var(--err-line, #813a3a);
+}
+.probe-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.probe-summary .icon-btn {
+  margin-left: auto;
+}
+.probe-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  font-size: 0.8rem;
+}
+.probe-steps li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.probe-step-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.probe-step-ok .probe-step-dot {
+  background: var(--ok, #4caf50);
+}
+.probe-step-fail .probe-step-dot {
+  background: var(--err, #e57373);
+}
+
 /* webhook topic picker — wrap, smaller text */
 .settings-topics {
   flex-wrap: wrap;

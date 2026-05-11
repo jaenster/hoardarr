@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jaenster/hoardarr/internal/adapter/nntptest"
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
@@ -123,7 +124,12 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	// Servers.
 	register("GET", "/api/v1/servers", h.listServers)
 	register("POST", "/api/v1/servers", h.addServer)
+	register("PATCH", "/api/v1/servers/{id}", h.patchServer)
 	register("DELETE", "/api/v1/servers/{id}", h.removeServer)
+	register("POST", "/api/v1/servers/test", h.testServer)
+	register("POST", "/api/v1/servers/{id}/test", h.testExistingServer)
+	register("POST", "/api/v1/servers/{id}/enable", h.enableServer)
+	register("POST", "/api/v1/servers/{id}/disable", h.disableServer)
 
 	// Categories.
 	register("GET", "/api/v1/categories", h.listCategories)
@@ -397,6 +403,155 @@ func (h *Handlers) addServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": int64(id)})
+}
+
+// patchServerReq mirrors UpdateCmd — every field is a pointer so
+// "absent" is distinguishable from "set to zero value". The JSON
+// decoder leaves nil pointers nil when the key isn't present.
+type patchServerReq struct {
+	Host                 *string `json:"host,omitempty"`
+	Port                 *int    `json:"port,omitempty"`
+	TLS                  *bool   `json:"tls,omitempty"`
+	Username             *string `json:"username,omitempty"`
+	Password             *string `json:"password,omitempty"`
+	MaxConns             *int    `json:"max_conns,omitempty"`
+	Priority             *int    `json:"priority,omitempty"`
+	Backup               *bool   `json:"backup,omitempty"`
+	BillingMode          *string `json:"billing_mode,omitempty"`
+	QuotaBytes           *int64  `json:"quota_bytes,omitempty"`
+	BandwidthBytesPerSec *int64  `json:"bandwidth_bytes_per_sec,omitempty"`
+}
+
+func (h *Handlers) patchServer(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var req patchServerReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	cmd := appserver.UpdateCmd{
+		ID:                   domainserver.ServerID(id),
+		Host:                 req.Host,
+		Port:                 req.Port,
+		TLS:                  req.TLS,
+		Username:             req.Username,
+		Password:             req.Password,
+		MaxConns:             req.MaxConns,
+		Priority:             req.Priority,
+		Backup:               req.Backup,
+		QuotaBytes:           req.QuotaBytes,
+		BandwidthBytesPerSec: req.BandwidthBytesPerSec,
+	}
+	if req.BillingMode != nil {
+		bm := domainserver.BillingMode(*req.BillingMode)
+		cmd.BillingMode = &bm
+	}
+	if err := h.Servers.Update(r.Context(), cmd); err != nil {
+		h.writeError(w, statusFor(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) enableServer(w http.ResponseWriter, r *http.Request) {
+	h.setServerEnabled(w, r, true)
+}
+func (h *Handlers) disableServer(w http.ResponseWriter, r *http.Request) {
+	h.setServerEnabled(w, r, false)
+}
+func (h *Handlers) setServerEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Servers.SetEnabled(r.Context(), domainserver.ServerID(id), enabled); err != nil {
+		h.writeError(w, statusFor(err), err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- Test connection ------------------------------------------------
+
+type testServerReq struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	TLS      *bool  `json:"tls,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+type testServerResp struct {
+	OK         bool   `json:"ok"`
+	Dial       bool   `json:"dial"`
+	Greeted    bool   `json:"greeted"`
+	Auth       bool   `json:"auth"`
+	ModeRdr    bool   `json:"mode_reader"`
+	Date       bool   `json:"date"`
+	ServerDate string `json:"server_date,omitempty"`
+	Err        string `json:"err,omitempty"`
+	ElapsedMs  int64  `json:"elapsed_ms"`
+}
+
+func (h *Handlers) testServer(w http.ResponseWriter, r *http.Request) {
+	var req testServerReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	if strings.TrimSpace(req.Host) == "" || req.Port == 0 {
+		h.writeError(w, http.StatusBadRequest, errors.New("host + port required"))
+		return
+	}
+	tls := true
+	if req.TLS != nil {
+		tls = *req.TLS
+	}
+	result := nntptest.Probe(r.Context(), nntptest.Params{
+		Host: req.Host, Port: req.Port, TLS: tls,
+		Username: req.Username, Password: req.Password,
+	})
+	writeJSON(w, http.StatusOK, probeResultToResp(result))
+}
+
+// testExistingServer probes a saved server using its stored creds.
+// Useful from the per-row Test button — operator doesn't have to
+// re-type the password.
+func (h *Handlers) testExistingServer(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	srv, err := h.Servers.Get(r.Context(), domainserver.ServerID(id))
+	if err != nil {
+		h.writeError(w, statusFor(err), err)
+		return
+	}
+	result := nntptest.Probe(r.Context(), nntptest.Params{
+		Host: srv.Host(), Port: srv.Port(), TLS: srv.TLS(),
+		Username: srv.Username(), Password: srv.Password(),
+	})
+	writeJSON(w, http.StatusOK, probeResultToResp(result))
+}
+
+func probeResultToResp(r nntptest.Result) testServerResp {
+	return testServerResp{
+		OK:         r.OK,
+		Dial:       r.Dial,
+		Greeted:    r.Greeted,
+		Auth:       r.Auth,
+		ModeRdr:    r.ModeReader,
+		Date:       r.Date,
+		ServerDate: r.ServerDate,
+		Err:        r.Err,
+		ElapsedMs:  r.Elapsed.Milliseconds(),
+	}
 }
 
 func (h *Handlers) removeServer(w http.ResponseWriter, r *http.Request) {

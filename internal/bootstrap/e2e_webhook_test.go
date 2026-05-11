@@ -152,7 +152,10 @@ func TestWebhook_E2E_DispatchAndHMAC(t *testing.T) {
 	// list to find the id we just created.
 	req, _ = http.NewRequest(http.MethodGet, base+"/api/v1/subscriptions", nil)
 	req.Header.Set("X-Api-Key", apiKey)
-	resp, _ = http.DefaultClient.Do(req)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list subs: %v", err)
+	}
 	defer resp.Body.Close()
 	var listBody struct {
 		Subscriptions []struct {

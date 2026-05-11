@@ -142,8 +142,20 @@ export const api = {
   addServer(body: AddServerBody): Promise<{ id: number }> {
     return jsonReq("POST", "/api/v1/servers", body);
   },
+  patchServer(id: number, body: PatchServerBody): Promise<void> {
+    return jsonReq("PATCH", `/api/v1/servers/${id}`, body);
+  },
   removeServer(id: number): Promise<void> {
     return req("DELETE", `/api/v1/servers/${id}`);
+  },
+  testServer(body: TestServerBody): Promise<TestServerResult> {
+    return jsonReq("POST", "/api/v1/servers/test", body);
+  },
+  testExistingServer(id: number): Promise<TestServerResult> {
+    return req("POST", `/api/v1/servers/${id}/test`);
+  },
+  enableServer(id: number, enabled: boolean): Promise<void> {
+    return req("POST", `/api/v1/servers/${id}/${enabled ? "enable" : "disable"}`);
   },
   listCategories(): Promise<{ categories: Category[] | null }> {
     return req("GET", "/api/v1/categories");
@@ -224,6 +236,31 @@ export type AddServerBody = {
   billing_mode?: "flat" | "metered";
   quota_bytes?: number;
   bandwidth_bytes_per_sec?: number;
+};
+
+// PatchServerBody mirrors AddServerBody but every field is optional.
+// Omitted fields are left unchanged. Pass null on a string field to
+// clear it (e.g. removing a username on a public server).
+export type PatchServerBody = Partial<Omit<AddServerBody, "name">>;
+
+export type TestServerBody = {
+  host: string;
+  port: number;
+  tls?: boolean;
+  username?: string;
+  password?: string;
+};
+
+export type TestServerResult = {
+  ok: boolean;
+  dial: boolean;
+  greeted: boolean;
+  auth: boolean;
+  mode_reader: boolean;
+  date: boolean;
+  server_date?: string;
+  err?: string;
+  elapsed_ms: number;
 };
 
 // streamURL returns the URL for the SSE endpoint. The session cookie

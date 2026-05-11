@@ -100,14 +100,18 @@ func (s *Service) Add(ctx context.Context, cmd AddCmd) (domain.ServerID, error) 
 // UpdateCmd specifies which fields to mutate. Only non-nil fields are
 // applied. ID is required.
 type UpdateCmd struct {
-	ID       domain.ServerID
-	Host     *string
-	Port     *int
-	TLS      *bool
-	Username *string
-	Password *string
-	MaxConns *int
-	Priority *int
+	ID                   domain.ServerID
+	Host                 *string
+	Port                 *int
+	TLS                  *bool
+	Username             *string
+	Password             *string
+	MaxConns             *int
+	Priority             *int
+	Backup               *bool
+	BillingMode          *domain.BillingMode
+	QuotaBytes           *int64
+	BandwidthBytesPerSec *int64
 }
 
 // Update applies the given mutations to the server identified by ID.
@@ -118,13 +122,17 @@ func (s *Service) Update(ctx context.Context, cmd UpdateCmd) error {
 			return err
 		}
 		if err := agg.Update(domain.UpdateParams{
-			Host:     cmd.Host,
-			Port:     cmd.Port,
-			TLS:      cmd.TLS,
-			Username: cmd.Username,
-			Password: cmd.Password,
-			MaxConns: cmd.MaxConns,
-			Priority: cmd.Priority,
+			Host:                 cmd.Host,
+			Port:                 cmd.Port,
+			TLS:                  cmd.TLS,
+			Username:             cmd.Username,
+			Password:             cmd.Password,
+			MaxConns:             cmd.MaxConns,
+			Priority:             cmd.Priority,
+			Backup:               cmd.Backup,
+			BillingMode:          cmd.BillingMode,
+			QuotaBytes:           cmd.QuotaBytes,
+			BandwidthBytesPerSec: cmd.BandwidthBytesPerSec,
 		}, s.now()); err != nil {
 			return err
 		}

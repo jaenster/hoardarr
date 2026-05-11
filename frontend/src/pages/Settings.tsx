@@ -14,12 +14,15 @@ import {
   Webhook,
   Send,
   Gauge,
+  Pencil,
+  PlugZap,
+  X,
 } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
-import { api, ApiError } from "../api/client";
+import { api, ApiError, type TestServerResult } from "../api/client";
 import type {
   BandwidthConfig,
   Category,
@@ -54,6 +57,9 @@ function ServersSection() {
   const [servers, setServers] = useState<Server[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState<Server | null>(null);
+  const [probeBusy, setProbeBusy] = useState<number | null>(null);
+  const [probeResult, setProbeResult] = useState<{ id: number; result: TestServerResult } | null>(null);
 
   const refresh = async () => {
     setLoading(true);
@@ -79,6 +85,19 @@ function ServersSection() {
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const testExisting = async (id: number) => {
+    setProbeBusy(id);
+    setProbeResult(null);
+    try {
+      const result = await api.testExistingServer(id);
+      setProbeResult({ id, result });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProbeBusy(null);
     }
   };
 
@@ -142,6 +161,25 @@ function ServersSection() {
                 <td className="queue-row-actions">
                   <button
                     type="button"
+                    className="icon-btn"
+                    aria-label="Test connection"
+                    title="Test connection"
+                    disabled={probeBusy === s.id}
+                    onClick={() => void testExisting(s.id)}
+                  >
+                    <PlugZap size={14} />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    aria-label="Edit server"
+                    title="Edit"
+                    onClick={() => setEditing(s)}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button
+                    type="button"
                     className="icon-btn icon-btn-danger"
                     aria-label="Remove server"
                     onClick={() => void remove(s.id)}
@@ -155,8 +193,302 @@ function ServersSection() {
         </table>
       )}
 
+      {probeResult && (
+        <ProbeBanner
+          result={probeResult.result}
+          onDismiss={() => setProbeResult(null)}
+        />
+      )}
+
+      {editing && (
+        <EditServerForm
+          server={editing}
+          onClose={() => setEditing(null)}
+          onSaved={async () => {
+            setEditing(null);
+            await refresh();
+          }}
+        />
+      )}
+
       <AddServerForm onAdded={() => void refresh()} />
     </Panel>
+  );
+}
+
+// ProbeBanner renders the result of a connection probe. The hint-list
+// shows each handshake step as ok/fail so the operator can pinpoint
+// where the failure is (dial vs auth vs MODE READER vs DATE).
+function ProbeBanner({
+  result,
+  onDismiss,
+}: {
+  result: TestServerResult;
+  onDismiss: () => void;
+}) {
+  const steps: { label: string; ok: boolean }[] = [
+    { label: "Dial", ok: result.dial },
+    { label: "Greeting", ok: result.greeted },
+    { label: "Auth", ok: result.auth },
+    { label: "MODE READER", ok: result.mode_reader },
+    { label: "DATE", ok: result.date },
+  ];
+  return (
+    <div className={`probe-banner ${result.ok ? "probe-ok" : "probe-fail"}`}>
+      <div className="probe-summary">
+        <strong>{result.ok ? "Connection OK" : "Connection failed"}</strong>
+        <span className="muted"> · {result.elapsed_ms} ms</span>
+        <button
+          type="button"
+          className="icon-btn"
+          aria-label="Dismiss"
+          onClick={onDismiss}
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <ul className="probe-steps">
+        {steps.map((s) => (
+          <li key={s.label} className={s.ok ? "probe-step-ok" : "probe-step-fail"}>
+            <span className="probe-step-dot" /> {s.label}
+          </li>
+        ))}
+      </ul>
+      {result.server_date && (
+        <p className="muted">Server time: {result.server_date}</p>
+      )}
+      {result.err && <p className="text-err">{result.err}</p>}
+    </div>
+  );
+}
+
+// EditServerForm is the same shape as AddServerForm but pre-populated
+// and submitting via PATCH. We don't surface the existing password —
+// leaving the field blank means "don't change it"; typing a new value
+// replaces it.
+function EditServerForm({
+  server,
+  onClose,
+  onSaved,
+}: {
+  server: Server;
+  onClose: () => void;
+  onSaved: () => void | Promise<void>;
+}) {
+  const [host, setHost] = useState(server.host);
+  const [port, setPort] = useState(server.port);
+  const [tls, setTls] = useState(server.tls);
+  const [username, setUsername] = useState(server.username ?? "");
+  const [password, setPassword] = useState("");
+  const [maxConns, setMaxConns] = useState(server.max_conns);
+  const [priority, setPriority] = useState(server.priority);
+  const [backup, setBackup] = useState(server.backup);
+  const [billingMode, setBillingMode] = useState<"flat" | "metered">(
+    server.billing_mode === "metered" ? "metered" : "flat",
+  );
+  const [quotaGB, setQuotaGB] = useState(
+    server.quota_bytes ? Math.round(server.quota_bytes / 1024 / 1024 / 1024) : 0,
+  );
+  const [bandwidthMBPerSec, setBandwidthMBPerSec] = useState(
+    server.bandwidth_bytes_per_sec
+      ? Math.round((server.bandwidth_bytes_per_sec / 1024 / 1024) * 10) / 10
+      : 0,
+  );
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [probe, setProbe] = useState<TestServerResult | null>(null);
+  const [probing, setProbing] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setErr(null);
+    try {
+      await api.patchServer(server.id, {
+        host: host.trim(),
+        port,
+        tls,
+        username: username.trim(),
+        // Empty password = don't change. The backend only mutates when
+        // the field is present, so we omit it entirely when blank.
+        ...(password ? { password } : {}),
+        max_conns: maxConns,
+        priority,
+        backup,
+        billing_mode: billingMode,
+        quota_bytes:
+          billingMode === "metered" && quotaGB > 0
+            ? Math.round(quotaGB * 1024 * 1024 * 1024)
+            : 0,
+        bandwidth_bytes_per_sec:
+          bandwidthMBPerSec > 0
+            ? Math.round(bandwidthMBPerSec * 1024 * 1024)
+            : 0,
+      });
+      await onSaved();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setErr(body?.error ?? e.message);
+      } else {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const runTest = async () => {
+    setProbing(true);
+    setProbe(null);
+    try {
+      const result = await api.testServer({
+        host: host.trim(),
+        port,
+        tls,
+        username: username.trim() || undefined,
+        password: password || undefined,
+      });
+      setProbe(result);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  return (
+    <form className="settings-form" onSubmit={submit}>
+      <div className="settings-form-header">
+        <h3>Edit {server.name}</h3>
+        <button
+          type="button"
+          className="icon-btn"
+          aria-label="Close edit"
+          onClick={onClose}
+        >
+          <X size={14} />
+        </button>
+      </div>
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Host</span>
+          <input value={host} onChange={(e) => setHost(e.target.value)} />
+        </label>
+        <label className="settings-field settings-field-narrow">
+          <span>Port</span>
+          <input
+            type="number"
+            value={port}
+            onChange={(e) => setPort(Number(e.target.value))}
+          />
+        </label>
+        <label className="settings-checkbox">
+          <input
+            type="checkbox"
+            checked={tls}
+            onChange={(e) => setTls(e.target.checked)}
+          />
+          <span>TLS</span>
+        </label>
+      </div>
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Username</span>
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="off"
+          />
+        </label>
+        <label className="settings-field">
+          <span>Password</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="leave blank to keep current"
+            autoComplete="new-password"
+          />
+        </label>
+        <label className="settings-field settings-field-narrow">
+          <span>Max conns</span>
+          <input
+            type="number"
+            value={maxConns}
+            onChange={(e) => setMaxConns(Number(e.target.value))}
+          />
+        </label>
+        <label className="settings-field settings-field-narrow">
+          <span>Priority</span>
+          <input
+            type="number"
+            value={priority}
+            onChange={(e) => setPriority(Number(e.target.value))}
+          />
+        </label>
+        <label className="settings-checkbox">
+          <input
+            type="checkbox"
+            checked={backup}
+            onChange={(e) => setBackup(e.target.checked)}
+          />
+          <span>Backup</span>
+        </label>
+      </div>
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Billing</span>
+          <select
+            value={billingMode}
+            onChange={(e) => setBillingMode(e.target.value as "flat" | "metered")}
+          >
+            <option value="flat">Flat (unlimited)</option>
+            <option value="metered">Metered (block / pay-per-byte)</option>
+          </select>
+        </label>
+        {billingMode === "metered" && (
+          <label className="settings-field settings-field-narrow">
+            <span>Quota (GB)</span>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              value={quotaGB}
+              onChange={(e) => setQuotaGB(Number(e.target.value))}
+              placeholder="0 = unlimited"
+            />
+          </label>
+        )}
+        <label className="settings-field settings-field-narrow">
+          <span>Speed cap (MB/s)</span>
+          <input
+            type="number"
+            min={0}
+            step={0.5}
+            value={bandwidthMBPerSec}
+            onChange={(e) => setBandwidthMBPerSec(Number(e.target.value))}
+            placeholder="0 = no cap"
+          />
+        </label>
+      </div>
+      {err && <p className="text-err">{err}</p>}
+      {probe && <ProbeBanner result={probe} onDismiss={() => setProbe(null)} />}
+      <div className="settings-form-actions">
+        <Button
+          variant="ghost"
+          type="button"
+          icon={<PlugZap size={14} />}
+          disabled={probing || !host.trim() || port <= 0}
+          onClick={() => void runTest()}
+        >
+          {probing ? "Testing…" : "Test connection"}
+        </Button>
+        <Button variant="primary" type="submit" disabled={submitting}>
+          {submitting ? "Saving…" : "Save changes"}
+        </Button>
+      </div>
+    </form>
   );
 }
 
