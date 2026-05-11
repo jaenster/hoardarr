@@ -13,6 +13,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"log"
@@ -25,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jaenster/hoardarr/internal/testserver/fixture"
 	testnntp "github.com/jaenster/hoardarr/internal/testserver/nntp"
 )
 
@@ -62,6 +64,7 @@ func main() {
 	ctl := &controlPlane{srv: srv, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/seed-nzb", ctl.seedNZB)
+	mux.HandleFunc("/seed-fixture", ctl.seedFixture)
 	mux.HandleFunc("/options", ctl.options)
 	mux.HandleFunc("/reset", ctl.reset)
 	mux.HandleFunc("/addr", ctl.addr)
@@ -162,6 +165,63 @@ func (c *controlPlane) seedNZB(w http.ResponseWriter, r *http.Request) {
 	body := testnntp.BuildNZB(files)
 	w.Header().Set("Content-Type", "application/xml")
 	_, _ = w.Write(body)
+}
+
+type seedFixtureReq struct {
+	Name           string `json:"name"`
+	FileCount      int    `json:"file_count"`
+	FileSize       int    `json:"file_size"`
+	ArticleSize    int    `json:"article_size"`
+	PAR2SliceSize  int    `json:"par2_slice_size"`
+	RecoverySlices int    `json:"recovery_slices"`
+}
+
+type seedFixtureResp struct {
+	NZBBase64 string   `json:"nzb_base64"`
+	Files     []string `json:"files"`
+	Articles  int      `json:"article_count"`
+}
+
+// seedFixture generates a realistic multi-file release with PAR2,
+// registers every yEnc article on the fake server, and returns the
+// NZB body (base64-encoded so callers don't have to deal with
+// content-type negotiation). Combine with /options
+// {missing_fraction: 0.1} to exercise the repair path.
+func (c *controlPlane) seedFixture(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req seedFixtureReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	fx, err := fixture.Generate(fixture.Options{
+		Name:           req.Name,
+		FileCount:      req.FileCount,
+		FileSize:       req.FileSize,
+		ArticleSize:    req.ArticleSize,
+		PAR2SliceSize:  req.PAR2SliceSize,
+		RecoverySlices: req.RecoverySlices,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for id, body := range fx.Articles {
+		c.srv.AddArticle(id, body)
+	}
+	files := make([]string, 0, len(fx.Files))
+	for name := range fx.Files {
+		files = append(files, name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(seedFixtureResp{
+		NZBBase64: base64.StdEncoding.EncodeToString(fx.NZB),
+		Files:     files,
+		Articles:  len(fx.Articles),
+	})
 }
 
 type optionsReq struct {
