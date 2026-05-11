@@ -193,24 +193,27 @@ func (o *Orchestrator) Run(ctx context.Context, jobID download.JobID) error {
 	workCh := make(chan *download.Segment, o.workers*2)
 	resultCh := make(chan segmentResult, o.workers*2)
 
-	// Workers.
-	var workerWG sync.WaitGroup
+	// Run() blocks until workers + producer + drainer are all done,
+	// so on ctx-cancel we don't return while one of them is still
+	// alive. Previously the producer was a bare `go func()` not in
+	// any WaitGroup — under aggressive pause/resume + retries those
+	// orphan goroutines accumulated; suspect for the live-container
+	// CPU climb.
+
+	var workersWG sync.WaitGroup
 	for i := 0; i < o.workers; i++ {
-		workerWG.Add(1)
+		workersWG.Add(1)
 		go func() {
-			defer workerWG.Done()
+			defer workersWG.Done()
 			o.workerLoop(ctx, job, jobDir, workCh, resultCh)
 		}()
 	}
 
-	// Drainer.
-	drainerDone := make(chan error, 1)
+	// Producer pushes segments into workCh; its `defer close(workCh)`
+	// is what eventually lets the workers' range loop terminate.
+	producerDone := make(chan struct{})
 	go func() {
-		drainerDone <- o.drainerLoop(ctx, job, resultCh)
-	}()
-
-	// Producer.
-	go func() {
+		defer close(producerDone)
 		defer close(workCh)
 		for _, s := range pending {
 			select {
@@ -221,8 +224,16 @@ func (o *Orchestrator) Run(ctx context.Context, jobID download.JobID) error {
 		}
 	}()
 
-	workerWG.Wait()
+	// Drainer reads from resultCh; it exits when resultCh is closed
+	// (we do that below after workers are done) or when ctx is done.
+	drainerDone := make(chan error, 1)
+	go func() {
+		drainerDone <- o.drainerLoop(ctx, job, resultCh)
+	}()
+
+	workersWG.Wait()
 	close(resultCh)
+	<-producerDone
 	if err := <-drainerDone; err != nil {
 		return err
 	}

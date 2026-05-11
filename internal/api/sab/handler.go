@@ -202,7 +202,7 @@ func (h *Handler) modeQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) modeQueueList(w http.ResponseWriter, r *http.Request) {
-	jobs, err := h.Queue.ActiveShallow(r.Context())
+	jobs, err := h.Queue.ActiveJobsOnly(r.Context())
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)
 		return
@@ -341,7 +341,7 @@ func (h *Handler) modeHistory(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	jobs, err := h.Queue.HistoryShallow(r.Context(), download.HistoryQuery{Limit: limit})
+	jobs, err := h.Queue.HistoryJobsOnly(r.Context(), download.HistoryQuery{Limit: limit})
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)
 		return

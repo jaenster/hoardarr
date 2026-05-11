@@ -226,13 +226,15 @@ func (h *Handlers) listQueue(w http.ResponseWriter, r *http.Request) {
 	includeAll := r.URL.Query().Get("include") == "all"
 	var jobs []*download.Job
 	var err error
-	// Shallow loads — file metadata only, no per-segment hydration.
-	// The DTO drops segments anyway and skipping the N+M repo queries
-	// turns a multi-second response on big releases into milliseconds.
+	// JobsOnly loads — no files, no segments. The wire DTO doesn't
+	// emit per-file rows in the list response anyway (the UI only
+	// reads them on the job-detail page, which uses /api/v1/queue/{id}
+	// with full hydration). Skipping the N file queries per call is
+	// the dominant win under Sonarr/Radarr polling pressure.
 	if includeAll {
-		jobs, err = h.Queue.ListShallow(ctx)
+		jobs, err = h.Queue.ListJobsOnly(ctx)
 	} else {
-		jobs, err = h.Queue.ActiveShallow(ctx)
+		jobs, err = h.Queue.ActiveJobsOnly(ctx)
 	}
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)
@@ -326,7 +328,7 @@ func (h *Handlers) listHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		hq.Limit = n
 	}
-	jobs, err := h.Queue.HistoryShallow(r.Context(), hq)
+	jobs, err := h.Queue.HistoryJobsOnly(r.Context(), hq)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)
 		return

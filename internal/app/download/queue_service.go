@@ -221,3 +221,20 @@ func (s *QueueService) History(ctx context.Context, q download.HistoryQuery) ([]
 func (s *QueueService) HistoryShallow(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
 	return s.repo.HistoryShallow(ctx, q)
 }
+
+// ListJobsOnly / ActiveJobsOnly / HistoryJobsOnly skip BOTH per-file
+// and per-segment hydration. Use for the hot-path list endpoints
+// (REST /api/v1/queue and /api/v1/history, SAB queue+history modes)
+// where the wire DTO only emits job-level fields. Cuts the per-list
+// query count from O(jobs) to O(1).
+func (s *QueueService) ListJobsOnly(ctx context.Context) ([]*download.Job, error) {
+	return s.repo.ListJobsOnly(ctx)
+}
+
+func (s *QueueService) ActiveJobsOnly(ctx context.Context) ([]*download.Job, error) {
+	return s.repo.ActiveJobsOnly(ctx)
+}
+
+func (s *QueueService) HistoryJobsOnly(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
+	return s.repo.HistoryJobsOnly(ctx, q)
+}

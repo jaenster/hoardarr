@@ -190,6 +190,15 @@ func (r *JobRepo) ListShallow(ctx context.Context) ([]*download.Job, error) {
 	return r.queryJobsShallow(ctx, selectAllJobs)
 }
 
+// ListJobsOnly returns all jobs with NO files at all. Use this when
+// callers only need job-level summary fields (state, totals, names) —
+// the queue list endpoint hits this hundreds of times per minute under
+// active downloads and Sonarr polling, and the per-job files query is
+// the dominant cost.
+func (r *JobRepo) ListJobsOnly(ctx context.Context) ([]*download.Job, error) {
+	return r.queryJobsBare(ctx, selectAllJobs)
+}
+
 // Active returns jobs in non-terminal states ordered by priority.
 func (r *JobRepo) Active(ctx context.Context) ([]*download.Job, error) {
 	return r.queryJobs(ctx, selectActiveJobs)
@@ -199,6 +208,13 @@ func (r *JobRepo) Active(ctx context.Context) ([]*download.Job, error) {
 // ListShallow for the motivation.
 func (r *JobRepo) ActiveShallow(ctx context.Context) ([]*download.Job, error) {
 	return r.queryJobsShallow(ctx, selectActiveJobs)
+}
+
+// ActiveJobsOnly returns active jobs with NO files attached. See
+// ListJobsOnly for the motivation. This is the hot path for the
+// /api/v1/queue and SAB queue endpoints.
+func (r *JobRepo) ActiveJobsOnly(ctx context.Context) ([]*download.Job, error) {
+	return r.queryJobsBare(ctx, selectActiveJobs)
 }
 
 // History returns terminal-state jobs (completed/failed/aborted) ordered
@@ -242,6 +258,41 @@ func (r *JobRepo) History(ctx context.Context, q download.HistoryQuery) ([]*down
 	args = append(args, limit)
 
 	return r.queryJobs(ctx, query, args...)
+}
+
+// HistoryJobsOnly is History with NO files attached — even cheaper
+// than HistoryShallow. Use for the SAB history endpoint and the REST
+// /api/v1/history list (Sonarr polls them aggressively). Per-file
+// breakdown is only needed on the job-detail page, which uses ByID.
+func (r *JobRepo) HistoryJobsOnly(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	clauses := []string{"state IN ('completed','failed','aborted')"}
+	args := []any{}
+	if q.State != "" && (q.State == download.JobStateCompleted ||
+		q.State == download.JobStateFailed ||
+		q.State == download.JobStateAborted) {
+		clauses = []string{"state = ?"}
+		args = append(args, string(q.State))
+	}
+	if q.Since != nil {
+		clauses = append(clauses, "finished_at > ?")
+		args = append(args, q.Since.UnixMilli())
+	}
+	if q.Category != "" {
+		clauses = append(clauses, "category = ?")
+		args = append(args, q.Category)
+	}
+	where := "WHERE " + strings.Join(clauses, " AND ")
+	query := `SELECT ` + jobColumns + ` FROM jobs ` + where +
+		` ORDER BY finished_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	return r.queryJobsBare(ctx, query, args...)
 }
 
 // HistoryShallow is History without per-file segment hydration. Used
@@ -332,6 +383,30 @@ func (r *JobRepo) queryJobs(ctx context.Context, query string, args ...any) ([]*
 		if err := r.loadFiles(ctx, j); err != nil {
 			return nil, err
 		}
+	}
+	return out, nil
+}
+
+// queryJobsBare returns jobs with neither files nor segments loaded.
+// Use when callers only need job-level summary fields (state, totals,
+// names) — saves the N file queries per list call. The hot path for
+// the queue and history endpoints under polling pressure (Sonarr).
+func (r *JobRepo) queryJobsBare(ctx context.Context, query string, args ...any) ([]*download.Job, error) {
+	rows, err := r.db.QueryCtx(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*download.Job
+	for rows.Next() {
+		j, err := scanJobRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

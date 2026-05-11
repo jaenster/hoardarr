@@ -28,6 +28,13 @@ type JobRepository interface {
 	ListShallow(ctx context.Context) ([]*Job, error)
 	ActiveShallow(ctx context.Context) ([]*Job, error)
 	HistoryShallow(ctx context.Context, q HistoryQuery) ([]*Job, error)
+	// *JobsOnly variants return Jobs with NO files attached — even
+	// cheaper than Shallow. Use for the queue + history list endpoints
+	// where callers only consume job-level summary fields (state,
+	// totals, names). Saves N file queries per list call.
+	ListJobsOnly(ctx context.Context) ([]*Job, error)
+	ActiveJobsOnly(ctx context.Context) ([]*Job, error)
+	HistoryJobsOnly(ctx context.Context, q HistoryQuery) ([]*Job, error)
 	History(ctx context.Context, q HistoryQuery) ([]*Job, error)
 	Delete(ctx context.Context, id JobID) error
 
