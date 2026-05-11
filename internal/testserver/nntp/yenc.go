@@ -25,14 +25,16 @@ func EncodeArticle(filename string, payload []byte) []byte {
 
 // EncodeArticlePart yEnc-encodes a slice of a multi-part payload.
 // begin/end are 1-based inclusive byte offsets within the full file;
-// part/total are 1-based part numbers. crc32 of the full payload may
-// be 0 (skipped if zero).
-func EncodeArticlePart(filename string, payload []byte, begin, end int64, part, total int) []byte {
+// totalFileSize is the size of the assembled file (i.e. =ybegin size=);
+// part/total are 1-based part numbers. =yend size carries the size of
+// THIS part. This matches the yEnc spec — receivers Truncate to the
+// =ybegin size, so per-segment size there would shrink the file.
+func EncodeArticlePart(filename string, payload []byte, begin, end, totalFileSize int64, part, total int) []byte {
 	const lineWidth = 128
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf,
 		"=ybegin part=%d total=%d line=%d size=%d name=%s\r\n",
-		part, total, lineWidth, end-begin+1, filename)
+		part, total, lineWidth, totalFileSize, filename)
 	fmt.Fprintf(&buf, "=ypart begin=%d end=%d\r\n", begin, end)
 	writeYencBody(&buf, payload, lineWidth)
 	pcrc := crc32.ChecksumIEEE(payload)

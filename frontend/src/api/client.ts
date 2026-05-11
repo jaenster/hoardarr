@@ -197,6 +197,9 @@ export const api = {
   general(): Promise<General> {
     return req("GET", "/api/v1/config/general");
   },
+  setGeneral(body: { url_base?: string }): Promise<void> {
+    return jsonReq("PUT", "/api/v1/config/general", body);
+  },
   bandwidth(): Promise<BandwidthConfig> {
     return req("GET", "/api/v1/config/bandwidth");
   },

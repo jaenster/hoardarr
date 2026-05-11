@@ -39,21 +39,43 @@ type Handlers struct {
 	Outbox        EventReader    // optional; nil disables /api/v1/queue/{id}/events
 	LogHub        *loghub.Hub    // optional; nil disables /api/v1/system/logs*
 	Logger        *slog.Logger
-	// URLBase is the reverse-proxy mount prefix (e.g. "/hoardarr").
-	// Empty when hoardarr is at root. Used as the session cookie's
-	// Path so the browser only sends it back on hoardarr URLs and we
-	// don't leak credentials to other apps on the same origin.
-	URLBase string
+	// Runtime is the runtime-mutable config view. Currently provides
+	// URLBase (live-editable from Settings) so session cookies and
+	// the General response stay in sync after the operator changes
+	// the URL base from the UI. May be nil for tests that don't
+	// care; in that case the cookie path defaults to "/".
+	Runtime URLBaseReader
+}
+
+// URLBaseReader is the slice of *server.Runtime that REST needs.
+// Defined here as an interface so the API package doesn't depend on
+// internal/server (which would be a cycle).
+type URLBaseReader interface {
+	URLBase() string
+}
+
+// URLBaseWriter is implemented by *server.Runtime and exposes the
+// mutation side of the runtime config to the Settings handler. The
+// Handlers field uses URLBaseReader for the common path; the
+// Settings handler type-asserts to URLBaseWriter when it needs to
+// mutate.
+type URLBaseWriter interface {
+	URLBaseReader
+	SetURLBase(v string) (string, error)
 }
 
 // sessionCookiePath returns the Path attribute for the session
 // cookie. Always trailing-slash terminated so the browser includes
 // every URL under the prefix.
 func (h *Handlers) sessionCookiePath() string {
-	if h.URLBase == "" {
+	base := ""
+	if h.Runtime != nil {
+		base = h.Runtime.URLBase()
+	}
+	if base == "" {
 		return "/"
 	}
-	return h.URLBase + "/"
+	return base + "/"
 }
 
 // EventReader is the slice of the outbox bus that the per-job
@@ -173,6 +195,7 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	// mutation lives at config.toml + restart, same as paths.
 	if h.General != nil {
 		register("GET", "/api/v1/config/general", h.getGeneral)
+		register("PUT", "/api/v1/config/general", h.putGeneral)
 	}
 
 	// Bandwidth global cap is runtime-mutable (token bucket reconfigures
@@ -759,13 +782,51 @@ func (h *Handlers) setBandwidth(w http.ResponseWriter, r *http.Request) {
 // --- general config (read-only) -------------------------------------
 
 func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
+	// URLBase is runtime-mutable; prefer the Runtime view over the
+	// frozen snapshot in GeneralView so the response reflects any
+	// edits applied since startup.
+	urlBase := h.General.URLBase
+	if h.Runtime != nil {
+		urlBase = h.Runtime.URLBase()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"listen":    h.General.Listen,
 		"api_key":   h.General.APIKey,
 		"log_level": h.General.LogLevel,
 		"sab_base":  h.General.SABBase,
-		"url_base":  h.General.URLBase,
+		"url_base":  urlBase,
 	})
+}
+
+type putGeneralReq struct {
+	URLBase *string `json:"url_base,omitempty"`
+}
+
+// putGeneral applies runtime-mutable General settings. Currently only
+// url_base is editable; future fields land here without changing the
+// route. Persists to config.toml so the change survives restart.
+func (h *Handlers) putGeneral(w http.ResponseWriter, r *http.Request) {
+	if h.Runtime == nil {
+		h.writeError(w, http.StatusServiceUnavailable, errors.New("runtime config unavailable"))
+		return
+	}
+	writer, ok := h.Runtime.(URLBaseWriter)
+	if !ok {
+		h.writeError(w, http.StatusServiceUnavailable, errors.New("runtime config is read-only"))
+		return
+	}
+	var req putGeneralReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	if req.URLBase != nil {
+		if _, err := writer.SetURLBase(*req.URLBase); err != nil {
+			h.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- subscriptions / webhooks ---------------------------------------

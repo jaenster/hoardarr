@@ -305,9 +305,15 @@ func generateAPIKey() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// writeConfig serialises cfg to path. The directory is created if it
-// does not exist. The file is written 0600 since it contains the
-// API key.
+// Save serialises cfg to path. The directory is created if it does
+// not exist. The file is written 0600 since it contains the API key.
+//
+// Used by runtime settings mutations (e.g. URL_BASE edits from the
+// UI) to persist a fresh state to disk after updating in-memory.
+func Save(path string, cfg Config) error {
+	return writeConfig(path, cfg)
+}
+
 func writeConfig(path string, cfg Config) error {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {

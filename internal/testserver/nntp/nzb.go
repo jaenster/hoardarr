@@ -133,7 +133,7 @@ func (s *Server) SynthesizeFile(msgIDPrefix, filename string, totalSize, segCoun
 		begin1 := int64(start + 1)
 		end1 := int64(end)
 		msgID := fmt.Sprintf("%s-%d@h", msgIDPrefix, i+1)
-		body := EncodeArticlePart(filename, payload[start:end], begin1, end1, i+1, segCount)
+		body := EncodeArticlePart(filename, payload[start:end], begin1, end1, int64(totalSize), i+1, segCount)
 		s.AddArticle(msgID, body)
 		segs = append(segs, SegmentSpec{MessageID: msgID, Bytes: int64(end - start)})
 	}

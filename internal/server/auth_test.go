@@ -12,7 +12,7 @@ func newTestServer(t *testing.T, apiKey string) *Server {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Auth.APIKey = apiKey
-	return New(cfg, nil, nil)
+	return New(cfg, nil, nil, nil)
 }
 
 func TestHealth_PublicAccessible(t *testing.T) {

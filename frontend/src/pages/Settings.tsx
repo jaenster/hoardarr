@@ -904,25 +904,60 @@ function GeneralSection() {
   const [err, setErr] = useState<string | null>(null);
   const [revealKey, setRevealKey] = useState(false);
 
+  // URL base is live-editable; we keep a draft separate from the
+  // committed value so the user can type freely and save explicitly.
+  const [urlBaseDraft, setUrlBaseDraft] = useState("");
+  const [urlBaseSaving, setUrlBaseSaving] = useState(false);
+  const [urlBaseSavedAt, setUrlBaseSavedAt] = useState<number | null>(null);
+  const [urlBaseErr, setUrlBaseErr] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const g = await api.general();
+      setGen(g);
+      setUrlBaseDraft(g.url_base);
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   useEffect(() => {
-    let cancelled = false;
-    api
-      .general()
-      .then((g) => {
-        if (!cancelled) setGen(g);
-      })
-      .catch((e) => {
-        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
-      });
-    return () => {
-      cancelled = true;
-    };
+    void refresh();
   }, []);
+
+  const saveURLBase = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUrlBaseSaving(true);
+    setUrlBaseErr(null);
+    try {
+      // Normalise: ensure leading slash, strip trailing slashes.
+      let next = urlBaseDraft.trim();
+      if (next && !next.startsWith("/")) next = "/" + next;
+      next = next.replace(/\/+$/, "");
+      await api.setGeneral({ url_base: next });
+      setUrlBaseSavedAt(Date.now());
+      // Note: the *current* page is still on the old base. Refresh
+      // recommended for the SPA to pick up the new prefix.
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setUrlBaseErr(body?.error ?? e.message);
+      } else {
+        setUrlBaseErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setUrlBaseSaving(false);
+    }
+  };
+
+  const dirty = gen != null && urlBaseDraft !== gen.url_base;
 
   return (
     <Panel
       title="General"
-      meta={<StatusBadge tone="neutral"><Settings2 size={12} />read-only</StatusBadge>}
+      meta={<StatusBadge tone="neutral"><Settings2 size={12} />runtime</StatusBadge>}
     >
       {err && <p className="text-err">{err}</p>}
       {gen ? (
@@ -958,19 +993,47 @@ function GeneralSection() {
             <dd>
               <code className="inline-code">{gen.log_level}</code>
             </dd>
-            <dt>URL base</dt>
-            <dd>
-              <code className="inline-code">{gen.url_base || "(root)"}</code>
-              <span className="muted" style={{ marginLeft: "0.6rem" }}>
-                set via <code className="inline-code">HOARDARR_URL_BASE</code>
-              </span>
-            </dd>
           </dl>
+
+          <form className="settings-form" onSubmit={saveURLBase}>
+            <h3>URL base</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              Mount path behind a reverse proxy (e.g.{" "}
+              <code className="inline-code">/hoardarr</code>). Leave empty
+              when hoardarr is served at the root. After saving, refresh the
+              page so the embedded frontend picks up the new prefix.
+            </p>
+            <div className="settings-row">
+              <label className="settings-field">
+                <span>Path</span>
+                <input
+                  value={urlBaseDraft}
+                  onChange={(e) => setUrlBaseDraft(e.target.value)}
+                  placeholder="(empty = root)"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+            {urlBaseErr && <p className="text-err">{urlBaseErr}</p>}
+            {urlBaseSavedAt && !dirty && !urlBaseErr && (
+              <p className="muted">
+                Saved. Reload the page to apply (or visit{" "}
+                <code className="inline-code">{gen.url_base || "/"}</code> directly).
+              </p>
+            )}
+            <Button
+              variant="primary"
+              type="submit"
+              disabled={!dirty || urlBaseSaving}
+            >
+              {urlBaseSaving ? "Saving…" : "Save URL base"}
+            </Button>
+          </form>
+
           <p className="muted">
-            Edit <code className="inline-code">config.toml</code> and restart to
-            change these. The API key is shared with *arr clients via the SAB
-            endpoint below. URL base is read at startup so the embedded frontend
-            knows its mount prefix; changing it requires a restart.
+            Listen address, API key, and log level live in{" "}
+            <code className="inline-code">config.toml</code> and require a
+            restart to change.
           </p>
         </>
       ) : null}

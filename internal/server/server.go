@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/jaenster/hoardarr/internal/api/rest"
 	"github.com/jaenster/hoardarr/internal/api/sab"
@@ -27,27 +28,43 @@ import (
 // authentication middleware, and the frontend filesystem.
 type Server struct {
 	cfg     config.Config
+	runtime *Runtime
 	logger  *slog.Logger
 	mux     *http.ServeMux
 	web     fs.FS
 	session SessionAuthenticator // optional; nil disables session auth (API key only)
+	feCache *frontendCache       // lazy; rebuilt when URLBase changes
 }
 
 // New constructs a Server with the given configuration. web may be nil;
 // when nil, requests for the frontend get a dev-placeholder page.
-func New(cfg config.Config, logger *slog.Logger, web fs.FS) *Server {
+//
+// runtime may be nil; when nil, URLBase is taken from cfg and is
+// effectively read-only at runtime.
+func New(cfg config.Config, runtime *Runtime, logger *slog.Logger, web fs.FS) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if runtime == nil {
+		runtime = NewRuntime(cfg, "")
+	}
 	s := &Server{
-		cfg:    cfg,
-		logger: logger,
-		mux:    http.NewServeMux(),
-		web:    web,
+		cfg:     cfg,
+		runtime: runtime,
+		logger:  logger,
+		mux:     http.NewServeMux(),
+		web:     web,
+	}
+	if web != nil {
+		s.feCache = &frontendCache{web: web}
 	}
 	s.routes()
 	return s
 }
+
+// Runtime returns the runtime-mutable config view. Useful for
+// handlers that need to read or mutate URLBase post-construction.
+func (s *Server) Runtime() *Runtime { return s.runtime }
 
 // ServeHTTP makes Server an http.Handler. When URLBase is set, the
 // prefix is stripped from incoming requests before routing — every
@@ -59,7 +76,7 @@ func New(cfg config.Config, logger *slog.Logger, web fs.FS) *Server {
 // instead of 404. Same for "<base>" (no trailing slash) so the
 // document base resolves correctly.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	base := s.cfg.Server.URLBase
+	base := s.runtime.URLBase()
 	if base == "" {
 		s.mux.ServeHTTP(w, r)
 		return
@@ -173,14 +190,48 @@ func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request) {
 // handler swaps it for the runtime base (URLBase + "/") on serve.
 const sentinelBase = "/__HOARDARR_BASE__/"
 
+// frontendCache memoises sentinel-replaced asset bytes per URLBase.
+// On the first request and any time URLBase changes, the cache walks
+// the embed FS once, rewrites every text file, and serves from the
+// resulting map until URLBase changes again.
+type frontendCache struct {
+	web fs.FS
+
+	mu     sync.Mutex
+	base   string             // URLBase that "mapped" + "index" were built for
+	built  bool               // false until the first build succeeds
+	mapped map[string][]byte  // rewritten text files keyed by FS path
+	index  []byte             // rewritten index.html for SPA fallback
+}
+
+// Get returns the rewritten frontend FS for the given URLBase,
+// rebuilding the cache if the base changed since the last call.
+func (c *frontendCache) Get(currentBase string) (map[string][]byte, []byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.built && c.base == currentBase {
+		return c.mapped, c.index, nil
+	}
+	mapped, index, err := buildFrontendFSAt(c.web, currentBase)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.base = currentBase
+	c.mapped = mapped
+	c.index = index
+	c.built = true
+	return mapped, index, nil
+}
+
 // handleFrontend serves the SPA: static files from web FS, with a
 // fallback to index.html for client-side routes.
 //
 // All emitted asset URLs and code references to BASE_URL contain a
-// fixed sentinel string. We walk the embed FS once, replace the
-// sentinel with the configured runtime base in every text file, and
-// serve from the resulting in-memory map. Binary assets (fonts,
-// images) are passed through untouched.
+// fixed sentinel string. The cache walks the embed FS once per
+// URLBase value, replaces the sentinel with the runtime base in
+// every text file, and serves from the resulting in-memory map.
+// When the operator changes URLBase from Settings, the next request
+// rebuilds the cache transparently.
 //
 // If web is nil (no build present), serves a dev placeholder.
 func (s *Server) handleFrontend() http.Handler {
@@ -190,24 +241,18 @@ func (s *Server) handleFrontend() http.Handler {
 			_, _ = w.Write([]byte(devPlaceholderHTML))
 		})
 	}
-
-	mapped, indexHTML, err := s.buildFrontendFS()
-	if err != nil {
-		s.logger.Error("frontend: failed to load assets", "err", err)
-		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			http.Error(w, "frontend assets missing", http.StatusInternalServerError)
-		})
-	}
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mapped, indexHTML, err := s.feCache.Get(s.runtime.URLBase())
+		if err != nil {
+			s.logger.Error("frontend: cache build failed", "err", err)
+			http.Error(w, "frontend assets missing", http.StatusInternalServerError)
+			return
+		}
 		clean := strings.TrimPrefix(r.URL.Path, "/")
 		if clean == "" || clean == "index.html" {
 			serveIndexHTML(w, indexHTML)
 			return
 		}
-		// Look up our pre-processed copy first; fall through to the
-		// raw FS only for entries we deliberately didn't rewrite
-		// (binary assets).
 		if body, ok := mapped[clean]; ok {
 			serveAsset(w, clean, body)
 			return
@@ -221,27 +266,26 @@ func (s *Server) handleFrontend() http.Handler {
 	})
 }
 
-// buildFrontendFS walks the embed FS once and returns a map of
-// path -> rewritten bytes for every text file, plus the rewritten
-// index.html separately for convenient SPA fallback. Binary files
-// are absent from the map (the request handler falls through to the
-// raw FS for those).
+// buildFrontendFSAt walks web once and returns the sentinel-replaced
+// bytes of every text file, plus the rewritten index.html for
+// convenient SPA fallback. Binary files (fonts, images) are absent
+// from the map; the request handler falls through to FileServerFS
+// for those.
 //
 // "Text" here is a static allow-list of extensions Vite emits with
 // the base path baked in. Adding to the list is cheap and safer than
 // trying to sniff content type.
-func (s *Server) buildFrontendFS() (map[string][]byte, []byte, error) {
-	runtimeBase := s.cfg.Server.URLBase + "/"
-	if s.cfg.Server.URLBase == "" {
+func buildFrontendFSAt(web fs.FS, base string) (map[string][]byte, []byte, error) {
+	runtimeBase := base + "/"
+	if base == "" {
 		runtimeBase = "/"
 	}
 	rewrite := func(b []byte) []byte {
 		return []byte(strings.ReplaceAll(string(b), sentinelBase, runtimeBase))
 	}
-
 	out := make(map[string][]byte)
 	var indexHTML []byte
-	err := fs.WalkDir(s.web, ".", func(p string, d fs.DirEntry, walkErr error) error {
+	err := fs.WalkDir(web, ".", func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -251,7 +295,7 @@ func (s *Server) buildFrontendFS() (map[string][]byte, []byte, error) {
 		if !isRewriteable(p) {
 			return nil
 		}
-		body, readErr := fs.ReadFile(s.web, p)
+		body, readErr := fs.ReadFile(web, p)
 		if readErr != nil {
 			return readErr
 		}
@@ -266,10 +310,7 @@ func (s *Server) buildFrontendFS() (map[string][]byte, []byte, error) {
 		return nil, nil, err
 	}
 	if indexHTML == nil {
-		// Fall back to reading directly; an unusual layout that
-		// doesn't put index.html at the root would still surface as
-		// "asset missing".
-		raw, readErr := fs.ReadFile(s.web, "index.html")
+		raw, readErr := fs.ReadFile(web, "index.html")
 		if readErr != nil {
 			return nil, nil, readErr
 		}

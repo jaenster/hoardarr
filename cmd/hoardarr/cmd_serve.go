@@ -44,6 +44,7 @@ func cmdServe(args []string, logger *slog.Logger) error {
 
 	app, err := bootstrap.Build(ctx, cfg, hoardarr.FrontendFS, logger,
 		bootstrap.WithLogHub(logHub),
+		bootstrap.WithConfigPath(*configPath),
 	)
 	if err != nil {
 		return err

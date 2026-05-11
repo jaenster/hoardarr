@@ -123,6 +123,7 @@ type buildOptions struct {
 	nntpDialer nntp.Dialer
 	extractor  extract.Extractor
 	logHub     *loghub.Hub
+	configPath string
 }
 
 // WithNNTPDialer overrides the default network dialer used by all
@@ -143,6 +144,13 @@ func WithExtractor(e extract.Extractor) BuildOption {
 // live tail.
 func WithLogHub(h *loghub.Hub) BuildOption {
 	return func(o *buildOptions) { o.logHub = h }
+}
+
+// WithConfigPath tells bootstrap where the live config.toml lives so
+// runtime settings mutations (URL_BASE from the UI) can persist back
+// to disk. Tests that don't care about persistence can omit this.
+func WithConfigPath(path string) BuildOption {
+	return func(o *buildOptions) { o.configPath = path }
 }
 
 // Build wires the runtime: ensures data directories exist, opens the
@@ -328,7 +336,8 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		return nil, fmt.Errorf("live hub: %w", err)
 	}
 
-	srv := server.New(cfg, logger, frontendFS)
+	runtime := server.NewRuntime(cfg, bo.configPath)
+	srv := server.New(cfg, runtime, logger, frontendFS)
 	srv.SetSessionAuthenticator(authSvc)
 	srv.MountREST(&rest.Handlers{
 		Queue:      queueService,
@@ -354,7 +363,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Bandwidth: bandwidthLimiter,
 		LogHub:    bo.logHub,
 		Logger:    logger,
-		URLBase:   cfg.Server.URLBase,
+		Runtime:   runtime,
 	})
 	srv.MountSAB(&sab.Handler{
 		APIKey:      cfg.Auth.APIKey,
