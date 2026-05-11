@@ -980,6 +980,13 @@ a:hover {
   transition: width 0.1s linear;
 }
 
+.queue-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
 .activity-dropzone {
   position: relative;
   min-height: 100%;

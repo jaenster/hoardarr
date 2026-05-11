@@ -380,7 +380,16 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		// Wire the throughput tracker so SAB queue responses surface
 		// kbpersec / timeleft / per-slot eta. *arr suites import jobs
 		// faster when they get a real ETA instead of "unknown".
-		Throughput: func() int64 { return throughput.Sample().CurrentBytesPerSec },
+		// Use the 10-second average rather than the instantaneous
+		// per-second bucket so kbpersec / timeleft don't jitter with
+		// every successful fetch.
+		Throughput: func() int64 {
+			s := throughput.Sample()
+			if s.Avg10sBytesPerSec > 0 {
+				return s.Avg10sBytesPerSec
+			}
+			return s.CurrentBytesPerSec
+		},
 	})
 	srv.MountSSE(liveHub)
 	httpSrv := &http.Server{

@@ -146,6 +146,8 @@ export type Throughput = {
   series: number[];
   total_bytes: number;
   current_bytes_per_sec: number;
+  avg10s_bytes_per_sec: number;
+  avg60s_bytes_per_sec: number;
 };
 
 export type SubscriptionKind = "webhook" | "discord" | "slack";

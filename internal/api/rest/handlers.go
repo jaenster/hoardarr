@@ -656,6 +656,8 @@ func (h *Handlers) systemThroughput(w http.ResponseWriter, _ *http.Request) {
 			"series":               []int64{},
 			"total_bytes":          0,
 			"current_bytes_per_sec": 0,
+			"avg10s_bytes_per_sec":  0,
+			"avg60s_bytes_per_sec":  0,
 		})
 		return
 	}
@@ -665,6 +667,8 @@ func (h *Handlers) systemThroughput(w http.ResponseWriter, _ *http.Request) {
 		"series":               s.Series,
 		"total_bytes":          s.Total,
 		"current_bytes_per_sec": s.CurrentBytesPerSec,
+		"avg10s_bytes_per_sec":  s.Avg10sBytesPerSec,
+		"avg60s_bytes_per_sec":  s.Avg60sBytesPerSec,
 	})
 }
 
@@ -1058,7 +1062,31 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func (h *Handlers) writeError(w http.ResponseWriter, status int, err error) {
 	if status >= 500 && h.Logger != nil {
-		h.Logger.Error("rest handler", "status", status, "err", err)
+		// Don't ERROR-log client disconnects mid-query. context.Canceled
+		// percolates up from the DB driver when the browser tab closed
+		// or the user hit refresh; that's not a server fault. Surface
+		// them at DEBUG so operators can still find them if needed.
+		if isClientDisconnect(err) {
+			h.Logger.Debug("rest handler: client disconnected", "status", status, "err", err)
+		} else {
+			h.Logger.Error("rest handler", "status", status, "err", err)
+		}
 	}
 	writeJSON(w, status, map[string]any{"error": err.Error()})
+}
+
+// isClientDisconnect reports whether err is the kind of "context
+// cancelled" / "broken pipe" that comes from the client going away,
+// as opposed to a real server-side fault.
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// SQLite driver wraps context.Canceled as a string in some paths.
+	s := err.Error()
+	return strings.Contains(s, "context canceled") ||
+		strings.Contains(s, "context deadline exceeded")
 }

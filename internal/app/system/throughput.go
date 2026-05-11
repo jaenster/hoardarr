@@ -60,16 +60,41 @@ type Sample struct {
 	// Total is the sum across the window.
 	Total int64
 
-	// CurrentBytesPerSec is the last second's bucket.
+	// CurrentBytesPerSec is the last second's bucket. Jitters a lot
+	// under concurrent fetches; use Avg10sBytesPerSec for UI display.
 	CurrentBytesPerSec int64
+
+	// Avg10sBytesPerSec is the average rate over the last 10 seconds.
+	// Smoother than CurrentBytesPerSec — appropriate for human-facing
+	// speed indicators and ETA calculations.
+	Avg10sBytesPerSec int64
+
+	// Avg60sBytesPerSec is the average rate over the last minute.
+	// Slower-moving baseline for stable trends.
+	Avg60sBytesPerSec int64
 }
 
+// AvgWindow is the short-window average bucket count used for the
+// smoother human-facing rate. Tunable but 10 seconds is a good
+// compromise between responsiveness and stability.
+const AvgWindow = 10
+
+// LongAvgWindow is the longer baseline window.
+const LongAvgWindow = 60
+
 // Sample returns the current window snapshot.
+//
+// Skips the most recent second when computing Avg10s/Avg60s because
+// the current bucket is still accruing — including it biases the
+// average downward at sample-time and makes the value lurch as
+// seconds tick over.
 func (t *Throughput) Sample() Sample {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now().Unix()
 	out := Sample{Series: make([]int64, WindowSize)}
+
+	var shortSum, longSum int64
 	for offset := 0; offset < WindowSize; offset++ {
 		sec := now - int64(WindowSize-1-offset)
 		idx := int(sec % int64(WindowSize))
@@ -78,13 +103,26 @@ func (t *Throughput) Sample() Sample {
 		if idx < 0 {
 			idx += WindowSize
 		}
-		if t.stamps[idx] == sec {
-			out.Series[offset] = t.buckets[idx]
-			out.Total += t.buckets[idx]
-			if offset == WindowSize-1 {
-				out.CurrentBytesPerSec = t.buckets[idx]
-			}
+		if t.stamps[idx] != sec {
+			continue
+		}
+		v := t.buckets[idx]
+		out.Series[offset] = v
+		out.Total += v
+		if offset == WindowSize-1 {
+			out.CurrentBytesPerSec = v
+			continue // skip current bucket from averages — still accruing
+		}
+		// secsAgo = how many seconds back the bucket sits, 1 = previous.
+		secsAgo := WindowSize - 1 - offset
+		if secsAgo <= AvgWindow {
+			shortSum += v
+		}
+		if secsAgo <= LongAvgWindow {
+			longSum += v
 		}
 	}
+	out.Avg10sBytesPerSec = shortSum / int64(AvgWindow)
+	out.Avg60sBytesPerSec = longSum / int64(LongAvgWindow)
 	return out
 }

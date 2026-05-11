@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, streamURL } from "../api/client";
-import type { EventEnvelope, Job } from "../api/types";
+import type { EventEnvelope, Job, PoolStatus } from "../api/types";
 
 // useQueue holds the current queue snapshot and applies live SSE
 // updates.
@@ -35,6 +35,10 @@ export function useQueue() {
   // Current overall throughput in bytes/sec. Used by QueueRow to render
   // an ETA next to the progress bar.
   const [bytesPerSec, setBytesPerSec] = useState(0);
+  // Per-server pool connection accounting. Surfaces "8/8 conns" in
+  // the Activity header so operators can see whether they're capped
+  // by their provider's connection limit.
+  const [pools, setPools] = useState<PoolStatus[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const debounceTimer = useRef<number | null>(null);
@@ -119,13 +123,30 @@ export function useQueue() {
     const pollThroughput = async () => {
       try {
         const tp = await api.throughput();
-        if (!stopped) setBytesPerSec(tp.current_bytes_per_sec);
+        if (!stopped) {
+          // Prefer the 10-second rolling average so the displayed
+          // speed doesn't jitter with every fetched article. Falls
+          // back to current-second value while the window fills up.
+          const rate = tp.avg10s_bytes_per_sec || tp.current_bytes_per_sec;
+          setBytesPerSec(rate);
+        }
       } catch {
         /* non-fatal — ETA just won't render */
       }
     };
+    const pollPools = async () => {
+      try {
+        const st = await api.systemStatus();
+        if (!stopped) setPools(st.pools ?? []);
+      } catch {
+        /* non-fatal */
+      }
+    };
     void pollThroughput();
+    void pollPools();
     const tpTimer = window.setInterval(() => void pollThroughput(), 1000);
+    // Pool stats change much more slowly than speed — every 2s is plenty.
+    const poolTimer = window.setInterval(() => void pollPools(), 2000);
 
     const es = new EventSource(streamURL());
 
@@ -201,6 +222,7 @@ export function useQueue() {
     return () => {
       stopped = true;
       window.clearInterval(tpTimer);
+      window.clearInterval(poolTimer);
       if (debounceTimer.current != null) {
         window.clearTimeout(debounceTimer.current);
       }
@@ -208,7 +230,7 @@ export function useQueue() {
     };
   }, [refresh, scheduleRefresh, patchJobBytes]);
 
-  return { jobs, activity, bytesPerSec, error, loading, refresh, applyReorder };
+  return { jobs, activity, bytesPerSec, pools, error, loading, refresh, applyReorder };
 }
 
 // parseEnvelope decodes the SSE data payload. The server emits the

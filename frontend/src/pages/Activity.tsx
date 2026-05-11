@@ -7,9 +7,10 @@ import Button from "../components/Button";
 import QueueList from "../components/QueueList";
 import { api, ApiError } from "../api/client";
 import { useQueue } from "../hooks/useQueue";
+import type { Job, PoolStatus } from "../api/types";
 
 export default function Activity() {
-  const { jobs, activity, bytesPerSec, error, loading, refresh, applyReorder } = useQueue();
+  const { jobs, activity, bytesPerSec, pools, error, loading, refresh, applyReorder } = useQueue();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -202,7 +203,26 @@ export default function Activity() {
 
         <Panel
           title="Queue"
-          meta={<StatusBadge tone="neutral">{queueLabel}</StatusBadge>}
+          meta={
+            <div className="queue-meta">
+              <StatusBadge tone="neutral">{queueLabel}</StatusBadge>
+              {bytesPerSec > 0 && (
+                <StatusBadge tone="ok" dot>
+                  {formatBytesShort(bytesPerSec)}/s
+                </StatusBadge>
+              )}
+              {pools.length > 0 && (
+                <StatusBadge tone="info">
+                  {totalInUse(pools)}/{totalMaxConns(pools)} conns
+                </StatusBadge>
+              )}
+              {activeDownloadingCount(jobs) > 0 && (
+                <StatusBadge tone="info">
+                  {activeDownloadingCount(jobs)} active
+                </StatusBadge>
+              )}
+            </div>
+          }
           flush={jobs != null && jobs.length > 0}
         >
           {jobs == null && (
@@ -243,4 +263,26 @@ export default function Activity() {
       )}
     </div>
   );
+}
+
+function totalInUse(pools: PoolStatus[]): number {
+  return pools.reduce((s, p) => s + p.in_use, 0);
+}
+function totalMaxConns(pools: PoolStatus[]): number {
+  return pools.reduce((s, p) => s + p.max_conns, 0);
+}
+function activeDownloadingCount(jobs: Job[] | null): number {
+  if (!jobs) return 0;
+  return jobs.filter((j) => j.state === "downloading").length;
+}
+function formatBytesShort(n: number): string {
+  if (n < 1024) return Math.round(n) + " B";
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return v.toFixed(v < 10 ? 1 : 0) + " " + units[i];
 }
