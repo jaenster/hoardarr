@@ -211,3 +211,13 @@ func (s *QueueService) ActiveShallow(ctx context.Context) ([]*download.Job, erro
 func (s *QueueService) History(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
 	return s.repo.History(ctx, q)
 }
+
+// HistoryShallow is History without per-file segment hydration.
+// Use for HTTP endpoints that don't need segments — the SAB
+// history mode (which Sonarr polls every ~minute) and the REST
+// /api/v1/history list. Skips the N-extra-queries-per-file segment
+// load, turning multi-second responses into milliseconds on a
+// history with many large releases.
+func (s *QueueService) HistoryShallow(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
+	return s.repo.HistoryShallow(ctx, q)
+}

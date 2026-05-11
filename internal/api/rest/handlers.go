@@ -326,7 +326,7 @@ func (h *Handlers) listHistory(w http.ResponseWriter, r *http.Request) {
 		}
 		hq.Limit = n
 	}
-	jobs, err := h.Queue.History(r.Context(), hq)
+	jobs, err := h.Queue.HistoryShallow(r.Context(), hq)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)
 		return

@@ -244,6 +244,42 @@ func (r *JobRepo) History(ctx context.Context, q download.HistoryQuery) ([]*down
 	return r.queryJobs(ctx, query, args...)
 }
 
+// HistoryShallow is History without per-file segment hydration. Used
+// by the SAB history endpoint (which Sonarr polls every ~minute) and
+// the REST /api/v1/history list — neither needs individual segments.
+// Same query, same filters, same limits as History; only the
+// hydration depth differs.
+func (r *JobRepo) HistoryShallow(ctx context.Context, q download.HistoryQuery) ([]*download.Job, error) {
+	limit := q.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	clauses := []string{"state IN ('completed','failed','aborted')"}
+	args := []any{}
+	if q.State != "" && (q.State == download.JobStateCompleted ||
+		q.State == download.JobStateFailed ||
+		q.State == download.JobStateAborted) {
+		clauses = []string{"state = ?"}
+		args = append(args, string(q.State))
+	}
+	if q.Since != nil {
+		clauses = append(clauses, "finished_at > ?")
+		args = append(args, q.Since.UnixMilli())
+	}
+	if q.Category != "" {
+		clauses = append(clauses, "category = ?")
+		args = append(args, q.Category)
+	}
+	where := "WHERE " + strings.Join(clauses, " AND ")
+	query := `SELECT ` + jobColumns + ` FROM jobs ` + where +
+		` ORDER BY finished_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	return r.queryJobsShallow(ctx, query, args...)
+}
+
 // Delete removes the job (cascades to files/segments).
 func (r *JobRepo) Delete(ctx context.Context, id download.JobID) error {
 	res, err := r.db.ExecCtx(ctx, `DELETE FROM jobs WHERE id = ?`, int64(id))

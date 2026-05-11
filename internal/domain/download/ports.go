@@ -21,11 +21,13 @@ type JobRepository interface {
 	ByNZBHash(ctx context.Context, hash string) (*Job, error)
 	List(ctx context.Context) ([]*Job, error)
 	Active(ctx context.Context) ([]*Job, error)
-	// ListShallow / ActiveShallow return jobs with file metadata only
-	// — no per-file segment hydration. Use these for UI lists where
-	// the cost of loading every segment dominates response time.
+	// ListShallow / ActiveShallow / HistoryShallow return jobs with
+	// file metadata only — no per-file segment hydration. Use these
+	// for UI lists where the cost of loading every segment dominates
+	// response time.
 	ListShallow(ctx context.Context) ([]*Job, error)
 	ActiveShallow(ctx context.Context) ([]*Job, error)
+	HistoryShallow(ctx context.Context, q HistoryQuery) ([]*Job, error)
 	History(ctx context.Context, q HistoryQuery) ([]*Job, error)
 	Delete(ctx context.Context, id JobID) error
 
