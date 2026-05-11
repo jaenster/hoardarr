@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Filter, History as HistoryIcon, RefreshCw } from "lucide-react";
+import { Link } from "react-router-dom";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
@@ -95,7 +96,7 @@ export default function History() {
               {jobs.map((j) => (
                 <tr key={j.id}>
                   <td>
-                    <span className="queue-row-name">{j.name}</span>
+                    <Link to={`/jobs/${j.id}`} className="queue-row-name queue-row-name-link">{j.name}</Link>
                     {j.error ? (
                       <span className="muted" title={j.error}>
                         {" — "}

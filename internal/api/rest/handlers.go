@@ -14,6 +14,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
+	"github.com/jaenster/hoardarr/internal/domain/event"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	"github.com/jaenster/hoardarr/internal/domain/download"
@@ -32,7 +33,14 @@ type Handlers struct {
 	Paths         *PathsView     // optional; nil disables /api/v1/config/paths
 	General       *GeneralView   // optional; nil disables /api/v1/config/general
 	Subscriptions Subscriptions  // optional; nil disables /api/v1/subscriptions
+	Outbox        EventReader    // optional; nil disables /api/v1/queue/{id}/events
 	Logger        *slog.Logger
+}
+
+// EventReader is the slice of the outbox bus that the per-job
+// timeline endpoint needs.
+type EventReader interface {
+	EventsByJob(ctx context.Context, jobID int64) ([]event.Envelope, error)
 }
 
 // Subscriptions is the slice of app/notify the REST handler needs.
@@ -94,6 +102,9 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	register("POST", "/api/v1/queue/{id}/pause", h.pauseJob)
 	register("POST", "/api/v1/queue/{id}/resume", h.resumeJob)
 	register("DELETE", "/api/v1/queue/{id}", h.removeJob)
+	if h.Outbox != nil {
+		register("GET", "/api/v1/queue/{id}/events", h.jobEvents)
+	}
 
 	// History.
 	register("GET", "/api/v1/history", h.listHistory)
@@ -239,6 +250,25 @@ func (h *Handlers) listHistory(w http.ResponseWriter, r *http.Request) {
 		out = append(out, jobToDTO(j))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": out})
+}
+
+// jobEvents returns the bus envelopes (download.*, verify.*, repair.*,
+// deliver.*, extract.*) touching one job, ordered by occurred_at.
+// Used by the UI's per-job timeline view.
+func (h *Handlers) jobEvents(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	events, err := h.Outbox.EventsByJob(r.Context(), id)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// We surface the envelope shape directly; the UI knows the
+	// internal layout because it consumes the same shapes via SSE.
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
 func (h *Handlers) pauseJob(w http.ResponseWriter, r *http.Request) {

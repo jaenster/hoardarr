@@ -6,7 +6,17 @@
 // in the server middleware for *arr clients but the web UI no longer
 // uses it.
 
-import type { Category, General, Job, Paths, Server, Subscription, SystemStatus, User } from "./types";
+import type {
+  Category,
+  EventEnvelope,
+  General,
+  Job,
+  Paths,
+  Server,
+  Subscription,
+  SystemStatus,
+  User,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown, msg: string) {
@@ -98,6 +108,11 @@ export const api = {
   },
   removeJob(id: number): Promise<void> {
     return req("DELETE", `/api/v1/queue/${id}`);
+  },
+
+  // --- per-job event timeline -----------------------------------
+  jobEvents(id: number): Promise<{ events: EventEnvelope[] }> {
+    return req("GET", `/api/v1/queue/${id}/events`);
   },
 
   // --- history ----------------------------------------------------

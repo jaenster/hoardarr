@@ -306,6 +306,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Auth:       authSvc,
 		System:     systemSvc,
 		Subscriptions: notifyFacade,
+		Outbox:        bus,
 		Paths: &rest.PathsView{
 			DataDir:       cfg.Server.DataDir,
 			IncompleteDir: cfg.Paths.IncompleteDir,

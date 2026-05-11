@@ -245,6 +245,61 @@ func (b *OutboxBus) Subscribe(name string, topic string, handler event.Handler) 
 }
 
 // Close stops all dispatcher goroutines and blocks until they return.
+// EventsByJob returns outbox events touching the given job_id,
+// ordered by occurred_at ascending. "Touching" is defined as:
+//
+//   - For download-domain events the aggregate is the job itself or
+//     a segment/file under it; we match by the job_id field embedded
+//     in the JSON payload.
+//   - For verify / repair / deliver / extract events the aggregate
+//     id is the per-context row id, but the payload always carries
+//     job_id.
+//
+// SQLite's json_extract is fine here — the outbox is at most tens of
+// thousands of rows over the daemon's life and we only filter to one
+// job's worth (a few hundred rows). If this becomes hot we'll add
+// either a denormalised job_id column or a separate index, but for
+// v0.1 the json scan is negligible.
+//
+// Returns events with their delivered/retry metadata stripped — this
+// is the operator-facing "what happened to my job" timeline, not the
+// per-subscriber delivery audit.
+func (b *OutboxBus) EventsByJob(ctx context.Context, jobID int64) ([]event.Envelope, error) {
+	rows, err := b.db.QueryCtx(ctx, `
+		SELECT id, topic, aggregate_id, occurred_at, payload
+		FROM outbox
+		WHERE json_extract(payload, '$.job_id') = ?
+		ORDER BY occurred_at ASC, id ASC
+	`, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("query outbox by job: %w", err)
+	}
+	defer rows.Close()
+	var out []event.Envelope
+	for rows.Next() {
+		var (
+			idBlob   []byte
+			topic    string
+			aggID    string
+			occurred int64
+			payload  []byte
+		)
+		if err := rows.Scan(&idBlob, &topic, &aggID, &occurred, &payload); err != nil {
+			return nil, err
+		}
+		var id uuid.UUID
+		copy(id[:], idBlob)
+		out = append(out, event.Envelope{
+			ID:          id,
+			Topic:       topic,
+			AggregateID: aggID,
+			OccurredAt:  time.UnixMilli(occurred).UTC(),
+			Payload:     payload,
+		})
+	}
+	return out, rows.Err()
+}
+
 func (b *OutboxBus) Close() error {
 	b.stopMu.Lock()
 	if b.stopped {

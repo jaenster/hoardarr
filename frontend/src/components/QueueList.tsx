@@ -1,4 +1,5 @@
 import { Pause, Play, Trash2 } from "lucide-react";
+import { Link } from "react-router-dom";
 import type { Job, JobState } from "../api/types";
 import StatusBadge from "./StatusBadge";
 
@@ -75,7 +76,7 @@ function QueueRow({
     <li className="queue-row">
       <div className="queue-row-head">
         <div className="queue-row-title">
-          <span className="queue-row-name">{job.name}</span>
+          <Link to={`/jobs/${job.id}`} className="queue-row-name queue-row-name-link">{job.name}</Link>
           {job.category && (
             <span className="queue-row-cat muted">{job.category}</span>
           )}

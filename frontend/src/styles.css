@@ -1060,6 +1060,81 @@ a:hover {
   color: var(--text);
 }
 
+/* per-job event timeline (JobDetail) */
+
+.timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.timeline-item {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+}
+.timeline-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--bg-elev-2);
+  color: var(--text-muted);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.timeline-marker.is-ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.timeline-marker.is-err {
+  background: var(--err-soft);
+  color: var(--err);
+}
+.timeline-marker.is-info {
+  background: var(--info-soft);
+  color: var(--info);
+}
+.timeline-body {
+  flex: 1;
+  min-width: 0;
+}
+.timeline-head {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+.timeline-time {
+  font-size: 0.78rem;
+}
+.timeline-payload {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.6rem;
+  margin: 0.3rem 0 0 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* row name as link */
+.queue-row-name-link {
+  color: var(--text);
+  text-decoration: none;
+  border-bottom: 1px dotted transparent;
+}
+.queue-row-name-link:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent-line);
+}
+
 /* tiny per-server quota usage bar (System page) */
 
 .usage-bar {
