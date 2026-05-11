@@ -680,13 +680,94 @@ function AuthSection() {
               <code className="inline-code">{user.role}</code>
             </dd>
           </dl>
-          <p className="muted">
-            Change-password lands in a follow-up; until then, edit
-            users directly in the SQLite DB or re-run setup against a fresh DB.
-          </p>
+          <ChangePasswordForm />
         </>
       ) : null}
     </Panel>
+  );
+}
+
+function ChangePasswordForm() {
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErr(null);
+    setDone(false);
+    if (newPassword.length < 8) {
+      setErr("New password must be at least 8 characters.");
+      return;
+    }
+    if (newPassword !== confirm) {
+      setErr("New passwords don't match.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.changePassword(oldPassword, newPassword);
+      setOldPassword("");
+      setNewPassword("");
+      setConfirm("");
+      setDone(true);
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setErr(body?.error ?? e.message);
+      } else {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <form className="settings-form" onSubmit={submit}>
+      <h3>Change password</h3>
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Current password</span>
+          <input
+            type="password"
+            value={oldPassword}
+            onChange={(e) => setOldPassword(e.target.value)}
+            autoComplete="current-password"
+          />
+        </label>
+        <label className="settings-field">
+          <span>New password (8+)</span>
+          <input
+            type="password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+        <label className="settings-field">
+          <span>Confirm new</span>
+          <input
+            type="password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            autoComplete="new-password"
+          />
+        </label>
+      </div>
+      {err && <p className="text-err">{err}</p>}
+      {done && <p className="muted">Password updated.</p>}
+      <Button
+        variant="primary"
+        type="submit"
+        disabled={!oldPassword || !newPassword || !confirm || submitting}
+      >
+        {submitting ? "Saving…" : "Change password"}
+      </Button>
+    </form>
   );
 }
 

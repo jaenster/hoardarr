@@ -25,6 +25,7 @@ type Auther interface {
 	Login(ctx context.Context, username, password string) (auth.Session, error)
 	Logout(ctx context.Context, token string) error
 	AuthenticateRequest(ctx context.Context, token string) (*auth.User, error)
+	ChangePassword(ctx context.Context, userID auth.UserID, oldPassword, newPassword string) error
 }
 
 // Mount registers /api/v1/auth/* routes. setup and login are public;
@@ -35,6 +36,7 @@ func (h *Handlers) mountAuth(mux *http.ServeMux, protect func(http.Handler) http
 	mux.HandleFunc("POST /api/v1/auth/setup", h.handleSetup)
 	mux.HandleFunc("POST /api/v1/auth/login", h.handleLogin)
 	mux.Handle("POST /api/v1/auth/logout", protect(http.HandlerFunc(h.handleLogout)))
+	mux.Handle("POST /api/v1/auth/change-password", protect(http.HandlerFunc(h.handleChangePassword)))
 }
 
 // handleWhoami returns the auth state. The frontend probes this on
@@ -150,6 +152,50 @@ func (h *Handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	setSessionCookie(w, sess)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type changePasswordReq struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+// handleChangePassword requires an authenticated session (the protect
+// wrapper enforces this). The session cookie identifies which user is
+// asking; we reject if the user isn't found despite the valid session
+// (shouldn't happen in practice but tightens the model).
+func (h *Handlers) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if h.Auth == nil {
+		h.writeError(w, http.StatusServiceUnavailable, errors.New("auth disabled"))
+		return
+	}
+	cookie, err := r.Cookie(SessionCookieName)
+	if err != nil || cookie.Value == "" {
+		h.writeError(w, http.StatusUnauthorized, errors.New("session required"))
+		return
+	}
+	user, err := h.Auth.AuthenticateRequest(r.Context(), cookie.Value)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, errors.New("session invalid"))
+		return
+	}
+	var req changePasswordReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	if req.OldPassword == "" || req.NewPassword == "" {
+		h.writeError(w, http.StatusBadRequest, errors.New("old_password and new_password required"))
+		return
+	}
+	if err := h.Auth.ChangePassword(r.Context(), user.ID(), req.OldPassword, req.NewPassword); err != nil {
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			h.writeError(w, http.StatusUnauthorized, errors.New("current password is incorrect"))
+			return
+		}
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) handleLogout(w http.ResponseWriter, r *http.Request) {

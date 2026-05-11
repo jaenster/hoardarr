@@ -86,6 +86,12 @@ export const api = {
   logout(): Promise<void> {
     return req("POST", "/api/v1/auth/logout");
   },
+  changePassword(oldPassword: string, newPassword: string): Promise<void> {
+    return jsonReq("POST", "/api/v1/auth/change-password", {
+      old_password: oldPassword,
+      new_password: newPassword,
+    });
+  },
 
   // --- public -----------------------------------------------------
   health(): Promise<{ status: string; service: string }> {

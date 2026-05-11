@@ -149,6 +149,44 @@ func (s *Service) Login(ctx context.Context, username, password string) (auth.Se
 	return sess, nil
 }
 
+// ChangePassword updates a user's password after verifying the old
+// one. Returns ErrInvalidCredentials on mismatch (covers both "user
+// not found" and "wrong old password" — no enumeration leak).
+//
+// We don't invalidate other sessions on success. That matches
+// SABnzbd / Sonarr behaviour and avoids surprising the operator who's
+// just changed their password from the same browser they're using.
+// A separate "log everywhere out" affordance can land later.
+func (s *Service) ChangePassword(ctx context.Context, userID auth.UserID, oldPassword, newPassword string) error {
+	if len(newPassword) < 8 {
+		return errors.New("auth: password must be at least 8 characters")
+	}
+	u, err := s.users.ByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, auth.ErrUserNotFound) {
+			return auth.ErrInvalidCredentials
+		}
+		return err
+	}
+	if err := s.hasher.Verify(u.PasswordHash(), oldPassword); err != nil {
+		return auth.ErrInvalidCredentials
+	}
+	hash, err := s.hasher.Hash(newPassword)
+	if err != nil {
+		return fmt.Errorf("hash: %w", err)
+	}
+	now := s.now()
+	if err := u.SetPasswordHash(hash, now); err != nil {
+		return err
+	}
+	return s.txm.InTx(ctx, func(ctx context.Context) error {
+		if err := s.users.Save(ctx, u); err != nil {
+			return err
+		}
+		return s.bus.Publish(ctx, u.PullEvents()...)
+	})
+}
+
 // Logout invalidates a session by token. Idempotent — no error if the
 // token is unknown (rate-limit info leak; just delete and move on).
 func (s *Service) Logout(ctx context.Context, token string) error {

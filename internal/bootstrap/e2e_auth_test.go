@@ -250,6 +250,93 @@ func TestAuth_E2E_FullFlow(t *testing.T) {
 	//     bootstrap so we don't fight the existing admin row. Skipped:
 	//     covered by domain-level tests; an HTTP-level repro would
 	//     require a second app instance and adds little signal.
+
+	// 15. change-password flow. Login fresh, change the password,
+	//     then assert old creds fail and new creds succeed.
+	freshClient2 := newClient(t)
+	{
+		body := mustJSON(t, map[string]string{
+			"username": "admin",
+			"password": "supers3cret",
+		})
+		req := must(http.NewRequest(http.MethodPost, base+"/api/v1/auth/login", body))
+		req.Header.Set("Content-Type", "application/json")
+		resp := mustDo(t, freshClient2, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("login for change-password setup: %d", resp.StatusCode)
+		}
+	}
+	// Wrong old → 401.
+	{
+		body := mustJSON(t, map[string]string{
+			"old_password": "wrong",
+			"new_password": "brandnew1234",
+		})
+		req := must(http.NewRequest(http.MethodPost, base+"/api/v1/auth/change-password", body))
+		req.Header.Set("Content-Type", "application/json")
+		resp := mustDo(t, freshClient2, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("wrong old: status %d; want 401", resp.StatusCode)
+		}
+	}
+	// Too-short new → 400.
+	{
+		body := mustJSON(t, map[string]string{
+			"old_password": "supers3cret",
+			"new_password": "short",
+		})
+		req := must(http.NewRequest(http.MethodPost, base+"/api/v1/auth/change-password", body))
+		req.Header.Set("Content-Type", "application/json")
+		resp := mustDo(t, freshClient2, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("short new: status %d; want 400", resp.StatusCode)
+		}
+	}
+	// Happy path → 204.
+	{
+		body := mustJSON(t, map[string]string{
+			"old_password": "supers3cret",
+			"new_password": "brandnew1234",
+		})
+		req := must(http.NewRequest(http.MethodPost, base+"/api/v1/auth/change-password", body))
+		req.Header.Set("Content-Type", "application/json")
+		resp := mustDo(t, freshClient2, req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("change-password: status %d; want 204", resp.StatusCode)
+		}
+	}
+	// Old password no longer logs in.
+	{
+		body := mustJSON(t, map[string]string{
+			"username": "admin",
+			"password": "supers3cret",
+		})
+		req := must(http.NewRequest(http.MethodPost, base+"/api/v1/auth/login", body))
+		req.Header.Set("Content-Type", "application/json")
+		resp := mustDo(t, newClient(t), req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("old password after change: status %d; want 401", resp.StatusCode)
+		}
+	}
+	// New password does.
+	{
+		body := mustJSON(t, map[string]string{
+			"username": "admin",
+			"password": "brandnew1234",
+		})
+		req := must(http.NewRequest(http.MethodPost, base+"/api/v1/auth/login", body))
+		req.Header.Set("Content-Type", "application/json")
+		resp := mustDo(t, newClient(t), req)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("new password after change: status %d; want 200", resp.StatusCode)
+		}
+	}
 }
 
 // --- helpers ----------------------------------------------------------
