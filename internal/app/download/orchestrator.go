@@ -48,6 +48,11 @@ type Orchestrator struct {
 	// segment retry
 	maxAttempts int
 	baseBackoff time.Duration
+	// poolWait is the wait between re-checks when the fetcher reports
+	// ErrNoPoolsAvailable. It is intentionally larger than baseBackoff
+	// — pool availability changes on operator action (adding a server,
+	// quota reset), not on the ms timescale.
+	poolWait time.Duration
 }
 
 // OrchestratorOptions tunes runtime behaviour. Zero values are sensible.
@@ -78,6 +83,11 @@ type OrchestratorOptions struct {
 	// BaseBackoff is the first-retry delay; each subsequent retry
 	// doubles. Default 200ms (so 200 / 400 / 800 ms for 3 attempts).
 	BaseBackoff time.Duration
+
+	// PoolWait is how long the runner sleeps between re-checks when
+	// no pool is available (ErrNoPoolsAvailable). Does not consume
+	// the retry budget — see processSegment. Default 5s.
+	PoolWait time.Duration
 
 	Logger *slog.Logger
 	Now    func() time.Time
@@ -116,6 +126,9 @@ func NewOrchestrator(
 	if opts.BaseBackoff == 0 {
 		opts.BaseBackoff = 200 * time.Millisecond
 	}
+	if opts.PoolWait == 0 {
+		opts.PoolWait = 5 * time.Second
+	}
 	if workers <= 0 {
 		workers = 1
 	}
@@ -136,6 +149,7 @@ func NewOrchestrator(
 		flushBatchMax: opts.FlushBatchMax,
 		maxAttempts:   opts.MaxAttempts,
 		baseBackoff:   opts.BaseBackoff,
+		poolWait:      opts.PoolWait,
 	}
 }
 
@@ -248,6 +262,13 @@ func (o *Orchestrator) workerLoop(
 // processSegment runs one segment to completion, retrying transient
 // failures up to maxAttempts. ErrArticleMissing (430) is terminal on
 // the first attempt — re-asking the same server won't help.
+//
+// ErrNoPoolsAvailable is special: it means there is currently no enabled
+// server to ask. That's expected if the operator queued NZBs before
+// configuring any server, or temporarily disabled them all. We do NOT
+// burn the retry budget on it — we just wait for pools to come back and
+// re-attempt. The runner's ctx cancels if the job is paused/removed or
+// the service stops, so this isn't an infinite loop.
 func (o *Orchestrator) processSegment(
 	ctx context.Context,
 	job *download.Job,
@@ -261,10 +282,22 @@ func (o *Orchestrator) processSegment(
 			return res
 		}
 		if ctx.Err() != nil {
-			// Don't mark this segment failed — the runner is being
-			// torn down. Leave it pending so a fresh start picks
-			// it up.
 			return segmentResult{seg: seg, cancelled: true}
+		}
+		// No pools available — wait for a server to appear, don't
+		// burn the retry budget. Re-checks every poolWait window.
+		if errors.Is(res.err, ErrNoPoolsAvailable) {
+			o.logger.Info("orchestrator: no pools available; waiting",
+				"job_id", int64(job.ID()),
+				"segment_id", int64(seg.ID()),
+			)
+			select {
+			case <-time.After(o.poolWait):
+			case <-ctx.Done():
+				return segmentResult{seg: seg, cancelled: true}
+			}
+			attempt-- // do not consume the budget
+			continue
 		}
 		if attempt < o.maxAttempts {
 			o.logger.Debug("orchestrator: retrying segment",

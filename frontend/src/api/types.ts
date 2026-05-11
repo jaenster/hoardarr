@@ -13,7 +13,8 @@ export type JobState =
   | "unpacking"
   | "completed"
   | "failed"
-  | "aborted";
+  | "aborted"
+  | "waiting_for_server";
 
 export type FileState = "pending" | "downloading" | "complete" | "failed";
 

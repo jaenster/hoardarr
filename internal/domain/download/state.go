@@ -25,13 +25,22 @@ const (
 	JobStateCompleted        JobState = "completed"
 	JobStateFailed           JobState = "failed"
 	JobStateAborted          JobState = "aborted"
+
+	// JobStateWaitingForServer — the job is alive but cannot fetch
+	// because no usable NNTP server is currently configured / enabled
+	// / has quota. The runner exits cleanly on this transition; the
+	// orchestrator restarts the runner (after flipping the state back
+	// to queued) when a server becomes available via
+	// server.usenet.{added,enabled,updated}.
+	JobStateWaitingForServer JobState = "waiting_for_server"
 )
 
 // IsActive returns true for states where downloading or post-processing
-// is in progress.
+// is in progress. WaitingForServer counts as active — the job is alive
+// and will resume the moment a server appears.
 func (s JobState) IsActive() bool {
 	switch s {
-	case JobStateQueued, JobStateDownloading, JobStateVerifying, JobStateRepairing, JobStateUnpacking:
+	case JobStateQueued, JobStateDownloading, JobStateVerifying, JobStateRepairing, JobStateUnpacking, JobStateWaitingForServer:
 		return true
 	default:
 		return false

@@ -244,6 +244,38 @@ func (j *Job) Resume(now time.Time) {
 	j.events = append(j.events, JobResumed{ID: j.id, At: now})
 }
 
+// MarkWaitingForServer parks the job because no usable NNTP server is
+// currently configured. The orchestrator runner exits on this transition
+// and the orchestrator's server-added handler will call ResumeFromWait
+// once a server appears. Idempotent; ignored if the job is in any other
+// state (paused/terminal/etc.).
+func (j *Job) MarkWaitingForServer(reason string, now time.Time) {
+	switch j.state {
+	case JobStateQueued, JobStateDownloading:
+	default:
+		return
+	}
+	j.state = JobStateWaitingForServer
+	j.events = append(j.events, JobWaitingForServer{
+		JobID:  j.id,
+		Reason: reason,
+		At:     now,
+	})
+}
+
+// ResumeFromWait undoes MarkWaitingForServer when a usable server
+// becomes available. Goes back to queued (the orchestrator's normal
+// path will flip to downloading once dispatch starts). Emits JobResumed
+// so existing SSE / runner subscribers pick it up without a new topic.
+// No-op outside waiting_for_server.
+func (j *Job) ResumeFromWait(now time.Time) {
+	if j.state != JobStateWaitingForServer {
+		return
+	}
+	j.state = JobStateQueued
+	j.events = append(j.events, JobResumed{ID: j.id, At: now})
+}
+
 // MarkRemoved is called by the application service before deleting
 // the row. It records JobRemoved on the aggregate so the bus delivers
 // the event in the same tx as the DELETE.
@@ -422,11 +454,34 @@ func (j *Job) allSegmentsResolved() bool {
 	return true
 }
 
-// completeDownloadPhase transitions the job to download_complete and
-// records the appropriate event. If at least one file's segments all
-// went done, the download succeeded; otherwise the orchestrator may
-// still treat it as failed depending on PAR2 outcome (M3+).
+// completeDownloadPhase transitions the job to its post-download state.
+//
+// If nothing got through (doneBytes == 0), the download failed outright:
+// PAR2 can't reconstruct anything from zero successful bytes, so we go
+// straight to JobStateFailed and emit JobDownloadFailed. This covers the
+// "no enabled pools" and "all-segments-missing" cases that would otherwise
+// leave the job stuck in download_complete looking misleadingly green.
+//
+// Otherwise the job moves to download_complete and the verify worker
+// decides fate from there (M3a/b: verify + repair).
 func (j *Job) completeDownloadPhase(now time.Time) {
+	if j.doneBytes == 0 {
+		reason := "download failed: no segments retrieved"
+		j.state = JobStateFailed
+		j.errorMsg = reason
+		j.finishedAt = now
+		j.events = append(j.events, JobDownloadFailed{
+			JobID: j.id,
+			Err:   reason,
+			At:    now,
+		})
+		j.events = append(j.events, JobFailed{
+			JobID: j.id,
+			Err:   reason,
+			At:    now,
+		})
+		return
+	}
 	j.state = JobStateDownloadComplete
 	j.events = append(j.events, JobDownloadComplete{
 		JobID:           j.id,

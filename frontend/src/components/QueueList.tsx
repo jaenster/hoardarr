@@ -18,6 +18,7 @@ const stateTone: Record<JobState, Tone> = {
   completed: "ok",
   failed: "err",
   aborted: "neutral",
+  waiting_for_server: "warn",
 };
 
 const stateLabel: Record<JobState, string> = {
@@ -31,6 +32,7 @@ const stateLabel: Record<JobState, string> = {
   completed: "Completed",
   failed: "Failed",
   aborted: "Aborted",
+  waiting_for_server: "Waiting for server",
 };
 
 export type QueueAction = (jobID: number) => void | Promise<void>;

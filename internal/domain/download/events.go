@@ -65,6 +65,20 @@ func (e JobRemoved) Topic() string         { return TopicPrefix + "job.removed" 
 func (e JobRemoved) AggregateID() string   { return jobAggregateID(e.ID) }
 func (e JobRemoved) OccurredAt() time.Time { return e.At }
 
+// JobWaitingForServer — the orchestrator parked the job because no
+// usable NNTP server is currently configured / enabled / has quota.
+// Counterpart to JobResumed (which fires when a server appears and the
+// job is unparked).
+type JobWaitingForServer struct {
+	JobID  JobID     `json:"job_id"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+func (e JobWaitingForServer) Topic() string         { return TopicPrefix + "job.waiting_for_server" }
+func (e JobWaitingForServer) AggregateID() string   { return jobAggregateID(e.JobID) }
+func (e JobWaitingForServer) OccurredAt() time.Time { return e.At }
+
 // SegmentDispatched — a worker accepted this segment for fetch.
 // MessageID is included so the UI can show "fetching <msg-id>" on
 // the active job without a follow-up lookup. Empty for legacy

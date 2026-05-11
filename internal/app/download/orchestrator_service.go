@@ -243,12 +243,27 @@ func (s *OrchestratorService) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list active jobs: %w", err)
 	}
+	havePools := s.haveAnyUsablePool()
 	for _, j := range active {
 		if j.State() == download.JobStatePaused {
 			continue
 		}
 		if j.State().IsTerminal() {
 			continue
+		}
+		// If a previous run left jobs parked in waiting_for_server
+		// and pools now exist, unpark them before starting the runner.
+		if j.State() == download.JobStateWaitingForServer {
+			if !havePools {
+				// Still no pools — leave parked, don't even start a
+				// runner (the runner would just re-park instantly).
+				continue
+			}
+			if err := s.unparkJobWaiting(ctx, j.ID()); err != nil {
+				s.logger.Warn("startup: unpark job failed",
+					"job_id", int64(j.ID()), "err", err)
+				continue
+			}
 		}
 		s.startRunner(j.ID())
 	}
@@ -422,7 +437,8 @@ func (s *OrchestratorService) onServerDisabledOrRemoved(_ context.Context, env e
 
 // kickIdleJobs starts runners for any queued/downloading jobs that
 // don't currently have one. Called after AddPool so jobs that were
-// queued before a pool existed pick up automatically.
+// queued before a pool existed pick up automatically. Also unparks
+// any jobs that were previously waiting_for_server.
 func (s *OrchestratorService) kickIdleJobs() {
 	active, err := s.repo.Active(s.rootCtx)
 	if err != nil {
@@ -436,8 +452,57 @@ func (s *OrchestratorService) kickIdleJobs() {
 		if j.State().IsTerminal() {
 			continue
 		}
+		if j.State() == download.JobStateWaitingForServer {
+			if err := s.unparkJobWaiting(s.rootCtx, j.ID()); err != nil {
+				s.logger.Warn("kick-idle: unpark job failed",
+					"job_id", int64(j.ID()), "err", err)
+				continue
+			}
+		}
 		s.startRunner(j.ID())
 	}
+}
+
+// parkJobWaiting transitions a job to JobStateWaitingForServer in a
+// single tx, persisting the row and publishing JobWaitingForServer so
+// the UI / webhooks see the transition. Idempotent.
+func (s *OrchestratorService) parkJobWaiting(ctx context.Context, id download.JobID, reason string) error {
+	return s.txm.InTx(ctx, func(ctx context.Context) error {
+		j, err := s.repo.ByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("load: %w", err)
+		}
+		j.MarkWaitingForServer(reason, s.now())
+		evts := j.PullEvents()
+		if len(evts) == 0 {
+			return nil
+		}
+		if err := s.repo.Save(ctx, j); err != nil {
+			return fmt.Errorf("save: %w", err)
+		}
+		return s.bus.Publish(ctx, evts...)
+	})
+}
+
+// unparkJobWaiting moves a job out of JobStateWaitingForServer (back
+// to queued, emitting JobResumed). Called by kickIdleJobs after a
+// server becomes available.
+func (s *OrchestratorService) unparkJobWaiting(ctx context.Context, id download.JobID) error {
+	return s.txm.InTx(ctx, func(ctx context.Context) error {
+		j, err := s.repo.ByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("load: %w", err)
+		}
+		j.ResumeFromWait(s.now())
+		evts := j.PullEvents()
+		if len(evts) == 0 {
+			return nil
+		}
+		if err := s.repo.Save(ctx, j); err != nil {
+			return fmt.Errorf("save: %w", err)
+		}
+		return s.bus.Publish(ctx, evts...)
+	})
 }
 
 // startRunner spawns a goroutine that drives jobID to completion if a
@@ -512,8 +577,16 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 		s.NudgePending()
 	}()
 
+	// No pools yet? Park the job in a dedicated waiting_for_server
+	// state so the UI reflects what's actually going on, and exit the
+	// runner cleanly. The orchestrator's server-added handler unparks
+	// the job (ResumeFromWait → kickIdleJobs) the moment a server
+	// becomes available, so this isn't a dead-end — it just stops the
+	// runner from holding a concurrency slot while no work is possible.
 	if !s.haveAnyUsablePool() {
-		s.logger.Error("orchestrator: no usable pool", "job_id", id)
+		if err := s.parkJobWaiting(s.rootCtx, id, "no enabled usenet server"); err != nil {
+			s.logger.Error("orchestrator: park job failed", "job_id", int64(id), "err", err)
+		}
 		return
 	}
 

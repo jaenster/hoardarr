@@ -48,6 +48,15 @@ type TieredFetcher struct {
 // Compile-time check.
 var _ download.ArticleFetcher = (*TieredFetcher)(nil)
 
+// ErrNoPoolsAvailable is returned by Fetch when no enabled, non-quota-
+// exhausted pool exists. Distinct from a per-pool fetch error: this
+// means there's no one to ask, not that the ask failed. The orchestrator
+// treats it as transient and does NOT consume the segment's retry budget
+// — instead the runner backs off and re-checks, so a job uploaded before
+// any server was configured (or while every server was disabled) picks
+// up the moment a server is added live via the Settings UI.
+var ErrNoPoolsAvailable = errors.New("download: no enabled pools available")
+
 // NewTieredFetcher wraps a live pool source. The accounter may be
 // nil; supplied, it receives per-server byte deltas as fetched bodies
 // are drained by the caller. The limiter may also be nil; supplied,
@@ -65,7 +74,7 @@ func NewTieredFetcher(poolSource func() map[server.ServerID]*nntp.Pool, accounte
 func (f *TieredFetcher) Fetch(ctx context.Context, _ server.ServerID, messageID string) (io.ReadCloser, error) {
 	candidates := f.tieredOrder()
 	if len(candidates) == 0 {
-		return nil, errors.New("tiered: no enabled pools")
+		return nil, ErrNoPoolsAvailable
 	}
 
 	var sawMissing bool
@@ -111,7 +120,9 @@ func (f *TieredFetcher) Fetch(ctx context.Context, _ server.ServerID, messageID 
 	if sawMissing {
 		return nil, nntp.ErrArticleMissing
 	}
-	return nil, errors.New("tiered: every pool ineligible (disabled or quota-exhausted)")
+	// Every candidate became ineligible during the walk (quota tripped
+	// mid-loop, etc). Treat the same as starting with zero pools.
+	return nil, ErrNoPoolsAvailable
 }
 
 // tieredOrder returns the pool list in dispatch order. Filters out
