@@ -125,6 +125,12 @@ func Default() Config {
 			Listen:   ":8085",
 			DataDir:  "./data",
 			LogLevel: "info",
+			// 1 = strict serial (SABnzbd-style). The previous default
+			// of 0 (unlimited) let every queued NZB run in parallel,
+			// which contends for the shared NNTP pool and produces
+			// jittery per-job speeds. Operators who actually want
+			// parallel downloads can raise this from Settings.
+			MaxConcurrentJobs: 1,
 		},
 		Auth: Auth{
 			APIKey: "",
