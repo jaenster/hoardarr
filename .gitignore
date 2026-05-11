@@ -27,3 +27,4 @@
 config.local.yaml
 .env
 .env.local
+.claude/
