@@ -60,6 +60,7 @@ export type Server = {
   billing_mode: BillingMode;
   quota_bytes: number;
   used_bytes: number;
+  bandwidth_bytes_per_sec: number;
   added_at: string;
   updated_at: string;
 };
@@ -126,6 +127,10 @@ export type General = {
   api_key: string;
   log_level: string;
   sab_base: string;
+};
+
+export type BandwidthConfig = {
+  global_bytes_per_sec: number;
 };
 
 export type LogEntry = {

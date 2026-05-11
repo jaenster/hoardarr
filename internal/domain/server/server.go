@@ -57,6 +57,12 @@ type UsenetServer struct {
 	quotaBytes int64
 	usedBytes  int64
 
+	// bandwidthBytesPerSec caps this server's per-fetch throughput.
+	// 0 means "no per-server cap"; the global cap (config) still
+	// applies. Enforced by app/download.Limiter inside the tiered
+	// fetcher's body reader wrapper.
+	bandwidthBytesPerSec int64
+
 	addedAt   time.Time
 	updatedAt time.Time
 
@@ -85,9 +91,11 @@ type NewParams struct {
 
 	// Optional. Backup defaults false. BillingMode defaults BillingFlat.
 	// QuotaBytes defaults 0 (= unknown / unlimited).
-	Backup      bool
-	BillingMode BillingMode
-	QuotaBytes  int64
+	// BandwidthBytesPerSec defaults 0 (= no per-server cap).
+	Backup               bool
+	BillingMode          BillingMode
+	QuotaBytes           int64
+	BandwidthBytesPerSec int64
 }
 
 // New constructs a UsenetServer with validation. The returned aggregate
@@ -136,22 +144,26 @@ func New(p NewParams, now time.Time) (*UsenetServer, error) {
 	if p.QuotaBytes < 0 {
 		return nil, fmt.Errorf("server: quota_bytes %d must be >= 0", p.QuotaBytes)
 	}
+	if p.BandwidthBytesPerSec < 0 {
+		return nil, fmt.Errorf("server: bandwidth_bytes_per_sec %d must be >= 0", p.BandwidthBytesPerSec)
+	}
 
 	s := &UsenetServer{
-		name:        name,
-		host:        host,
-		port:        p.Port,
-		tls:         tls,
-		username:    p.Username,
-		password:    p.Password,
-		maxConns:    maxConns,
-		priority:    p.Priority,
-		enabled:     true,
-		backup:      p.Backup,
-		billingMode: billing,
-		quotaBytes:  p.QuotaBytes,
-		addedAt:     now,
-		updatedAt:   now,
+		name:                 name,
+		host:                 host,
+		port:                 p.Port,
+		tls:                  tls,
+		username:             p.Username,
+		password:             p.Password,
+		maxConns:             maxConns,
+		priority:             p.Priority,
+		enabled:              true,
+		backup:               p.Backup,
+		billingMode:          billing,
+		quotaBytes:           p.QuotaBytes,
+		bandwidthBytesPerSec: p.BandwidthBytesPerSec,
+		addedAt:              now,
+		updatedAt:            now,
 	}
 	s.events = append(s.events, ServerAdded{
 		ID:   0, // repo fills in after Save
@@ -174,12 +186,13 @@ type HydrateParams struct {
 	MaxConns    int
 	Priority    int
 	Enabled     bool
-	Backup      bool
-	BillingMode BillingMode
-	QuotaBytes  int64
-	UsedBytes   int64
-	AddedAt     time.Time
-	UpdatedAt   time.Time
+	Backup               bool
+	BillingMode          BillingMode
+	QuotaBytes           int64
+	UsedBytes            int64
+	BandwidthBytesPerSec int64
+	AddedAt              time.Time
+	UpdatedAt            time.Time
 }
 
 // Hydrate reconstructs a UsenetServer from persistence. No events are
@@ -190,22 +203,23 @@ func Hydrate(p HydrateParams) *UsenetServer {
 		billing = BillingFlat
 	}
 	return &UsenetServer{
-		id:          p.ID,
-		name:        p.Name,
-		host:        p.Host,
-		port:        p.Port,
-		tls:         p.TLS,
-		username:    p.Username,
-		password:    p.Password,
-		maxConns:    p.MaxConns,
-		priority:    p.Priority,
-		enabled:     p.Enabled,
-		backup:      p.Backup,
-		billingMode: billing,
-		quotaBytes:  p.QuotaBytes,
-		usedBytes:   p.UsedBytes,
-		addedAt:     p.AddedAt,
-		updatedAt:   p.UpdatedAt,
+		id:                   p.ID,
+		name:                 p.Name,
+		host:                 p.Host,
+		port:                 p.Port,
+		tls:                  p.TLS,
+		username:             p.Username,
+		password:             p.Password,
+		maxConns:             p.MaxConns,
+		priority:             p.Priority,
+		enabled:              p.Enabled,
+		backup:               p.Backup,
+		billingMode:          billing,
+		quotaBytes:           p.QuotaBytes,
+		usedBytes:            p.UsedBytes,
+		bandwidthBytesPerSec: p.BandwidthBytesPerSec,
+		addedAt:              p.AddedAt,
+		updatedAt:            p.UpdatedAt,
 	}
 }
 
@@ -224,6 +238,7 @@ func (s *UsenetServer) Backup() bool         { return s.backup }
 func (s *UsenetServer) BillingMode() BillingMode { return s.billingMode }
 func (s *UsenetServer) QuotaBytes() int64    { return s.quotaBytes }
 func (s *UsenetServer) UsedBytes() int64     { return s.usedBytes }
+func (s *UsenetServer) BandwidthBytesPerSec() int64 { return s.bandwidthBytesPerSec }
 func (s *UsenetServer) AddedAt() time.Time   { return s.addedAt }
 func (s *UsenetServer) UpdatedAt() time.Time { return s.updatedAt }
 

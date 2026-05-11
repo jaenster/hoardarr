@@ -27,10 +27,11 @@ import (
 
 // Config is the full configuration tree.
 type Config struct {
-	Server  Server  `toml:"server"`
-	Auth    Auth    `toml:"auth"`
-	Storage Storage `toml:"storage"`
-	Paths   Paths   `toml:"paths"`
+	Server    Server    `toml:"server"`
+	Auth      Auth      `toml:"auth"`
+	Storage   Storage   `toml:"storage"`
+	Paths     Paths     `toml:"paths"`
+	Bandwidth Bandwidth `toml:"bandwidth"`
 }
 
 // Server holds HTTP listener configuration.
@@ -74,6 +75,13 @@ type SQLite struct {
 	// Path is the on-disk DB file. If empty, resolves to
 	// <data_dir>/hoardarr.db at validation time.
 	Path string `toml:"path"`
+}
+
+// Bandwidth caps download throughput. Both knobs are bytes/sec; 0 means
+// no cap. Per-server caps in servers.bandwidth_bytes_per_sec are applied
+// in addition: effective rate = min(global, per-server) when both set.
+type Bandwidth struct {
+	GlobalBytesPerSec int64 `toml:"global_bytes_per_sec"`
 }
 
 // Paths configures where incomplete and completed downloads land.
@@ -184,6 +192,9 @@ func (c *Config) Validate() error {
 		// valid
 	default:
 		return fmt.Errorf("server.log_level %q is not supported (valid: debug, info, warn, error)", c.Server.LogLevel)
+	}
+	if c.Bandwidth.GlobalBytesPerSec < 0 {
+		return fmt.Errorf("bandwidth.global_bytes_per_sec %d must be >= 0", c.Bandwidth.GlobalBytesPerSec)
 	}
 	return nil
 }

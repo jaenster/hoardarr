@@ -36,6 +36,7 @@ import (
 type TieredFetcher struct {
 	pools     map[server.ServerID]*nntp.Pool
 	accounter *ByteAccounter
+	limiter   *Limiter // optional; nil disables bandwidth throttling
 	logger    *slog.Logger
 }
 
@@ -44,12 +45,13 @@ var _ download.ArticleFetcher = (*TieredFetcher)(nil)
 
 // NewTieredFetcher wraps the registered pools. The accounter may be
 // nil; supplied, it receives per-server byte deltas as fetched bodies
-// are drained by the caller.
-func NewTieredFetcher(pools map[server.ServerID]*nntp.Pool, accounter *ByteAccounter, logger *slog.Logger) *TieredFetcher {
+// are drained by the caller. The limiter may also be nil; supplied,
+// it throttles per-read.
+func NewTieredFetcher(pools map[server.ServerID]*nntp.Pool, accounter *ByteAccounter, limiter *Limiter, logger *slog.Logger) *TieredFetcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &TieredFetcher{pools: pools, accounter: accounter, logger: logger}
+	return &TieredFetcher{pools: pools, accounter: accounter, limiter: limiter, logger: logger}
 }
 
 // Fetch iterates the tiered pool order and returns the first successful
@@ -68,8 +70,9 @@ func (f *TieredFetcher) Fetch(ctx context.Context, _ server.ServerID, messageID 
 		}
 		body, err := tryOnePool(ctx, p, messageID)
 		if err == nil {
-			// Wrap so used_bytes accounting fires when the caller drains.
-			return f.wrapForAccounting(body, p.Server().ID()), nil
+			// Wrap so used_bytes accounting fires when the caller drains
+			// and bandwidth limiter throttles per-Read.
+			return f.wrapForAccounting(ctx, body, p.Server().ID()), nil
 		}
 		if errors.Is(err, nntp.ErrArticleMissing) {
 			sawMissing = true
@@ -160,34 +163,56 @@ func tryOnePool(ctx context.Context, p *nntp.Pool, messageID string) (io.ReadClo
 	return &releasingReader{ReadCloser: body, release: release}, nil
 }
 
-// wrapForAccounting wraps body in a counting reader that reports
-// total bytes to the accounter on Close. Bytes read but never closed
-// (caller leak) won't be counted — acceptable since the orchestrator
-// always closes (defer release) on every code path.
-func (f *TieredFetcher) wrapForAccounting(body io.ReadCloser, srvID server.ServerID) io.ReadCloser {
-	if f.accounter == nil {
-		return body
-	}
-	return &countingReader{
+// wrapForAccounting wraps body so that:
+//   - Each Read is gated by the bandwidth limiter (if configured).
+//   - Total drained bytes are reported to the accounter on Close.
+//
+// Bytes read but never Close()d (caller leak) won't be counted —
+// acceptable because the orchestrator always closes via defer.
+func (f *TieredFetcher) wrapForAccounting(ctx context.Context, body io.ReadCloser, srvID server.ServerID) io.ReadCloser {
+	wrap := &countingReader{
 		ReadCloser: body,
-		on: func(n int64) {
-			f.accounter.Add(srvID, n)
-		},
+		srvID:      srvID,
 	}
+	if f.accounter != nil {
+		wrap.on = func(n int64) { f.accounter.Add(srvID, n) }
+	}
+	if f.limiter != nil {
+		wrap.limiter = f.limiter
+		wrap.ctx = ctx
+	}
+	return wrap
 }
 
-// countingReader tallies bytes drained from body and reports the total
-// to `on` exactly once when Close is called.
+// countingReader tallies bytes drained from body, throttles Reads
+// via the optional limiter, and reports the total to `on` exactly
+// once when Close is called.
 type countingReader struct {
 	io.ReadCloser
-	n      int64
-	closed bool
-	on     func(int64)
+	n       int64
+	closed  bool
+	on      func(int64)
+	limiter *Limiter
+	srvID   server.ServerID
+	ctx     context.Context
 }
 
 func (r *countingReader) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	r.n += int64(n)
+	if n > 0 && r.limiter != nil {
+		// Post-read throttle: we wait AFTER reading because rate.Limiter
+		// is a token bucket and the natural unit is "you got n bytes,
+		// now wait for the bucket to refill those tokens." Doing this
+		// pre-read would require knowing how much we're about to read
+		// (Read returns a variable amount).
+		if waitErr := r.limiter.Wait(r.ctx, r.srvID, n); waitErr != nil {
+			// ctx-cancel mid-throttle: don't mask the actual read but
+			// surface the cancel as the returned error so the caller
+			// stops.
+			return n, waitErr
+		}
+	}
 	return n, err
 }
 

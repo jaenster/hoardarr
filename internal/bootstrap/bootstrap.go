@@ -206,12 +206,21 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	})
 	byteFlusher := appdownload.NewByteFlusher(byteAccounter, serverRepo, 10*time.Second, logger)
 
+	// Bandwidth limiter: global cap from config, per-server caps from
+	// the registry. Per-server caps applied at runtime via SetServerCap
+	// for every enabled server.
+	bandwidthLimiter := appdownload.NewLimiter(cfg.Bandwidth.GlobalBytesPerSec)
+	for id, p := range pools {
+		bandwidthLimiter.SetServerCap(id, p.Server().BandwidthBytesPerSec())
+	}
+
 	orch := appdownload.NewOrchestratorService(appdownload.OrchestratorServiceParams{
 		Repo:          jobRepo,
 		Bus:           bus,
 		TxManager:     txm,
 		Pools:         pools,
 		Accounter:     byteAccounter,
+		Limiter:       bandwidthLimiter,
 		IncompleteDir: cfg.Paths.IncompleteDir,
 		Logger:        logger,
 	})
@@ -332,7 +341,8 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			LogLevel: cfg.Server.LogLevel,
 			SABBase:  buildSABBase(cfg.Server.Listen),
 		},
-		LogHub: bo.logHub,
+		Bandwidth: bandwidthLimiter,
+		LogHub:    bo.logHub,
 		Logger: logger,
 	})
 	srv.MountSAB(&sab.Handler{

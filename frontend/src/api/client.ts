@@ -7,6 +7,7 @@
 // uses it.
 
 import type {
+  BandwidthConfig,
   Category,
   EventEnvelope,
   General,
@@ -158,6 +159,12 @@ export const api = {
   general(): Promise<General> {
     return req("GET", "/api/v1/config/general");
   },
+  bandwidth(): Promise<BandwidthConfig> {
+    return req("GET", "/api/v1/config/bandwidth");
+  },
+  setBandwidth(body: BandwidthConfig): Promise<BandwidthConfig> {
+    return jsonReq("PUT", "/api/v1/config/bandwidth", body);
+  },
   throughput(): Promise<Throughput> {
     return req("GET", "/api/v1/system/throughput");
   },
@@ -209,6 +216,7 @@ export type AddServerBody = {
   backup?: boolean;
   billing_mode?: "flat" | "metered";
   quota_bytes?: number;
+  bandwidth_bytes_per_sec?: number;
 };
 
 // streamURL returns the URL for the SSE endpoint. The session cookie

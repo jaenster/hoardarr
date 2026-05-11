@@ -40,13 +40,13 @@ func (r *ServerRepo) insert(ctx context.Context, s *server.UsenetServer) error {
 		INSERT INTO servers(
 			name, host, port, tls, username, password,
 			max_conns, priority, enabled,
-			backup, billing_mode, quota_bytes, used_bytes,
+			backup, billing_mode, quota_bytes, used_bytes, bandwidth_bytes_per_sec,
 			added_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		s.Name(), s.Host(), s.Port(), boolToInt(s.TLS()), nullableString(s.Username()), nullableString(s.Password()),
 		s.MaxConns(), s.Priority(), boolToInt(s.Enabled()),
-		boolToInt(s.Backup()), string(s.BillingMode()), s.QuotaBytes(), s.UsedBytes(),
+		boolToInt(s.Backup()), string(s.BillingMode()), s.QuotaBytes(), s.UsedBytes(), s.BandwidthBytesPerSec(),
 		s.AddedAt().UnixMilli(), s.UpdatedAt().UnixMilli(),
 	)
 	if err != nil {
@@ -65,13 +65,13 @@ func (r *ServerRepo) update(ctx context.Context, s *server.UsenetServer) error {
 		UPDATE servers SET
 			name = ?, host = ?, port = ?, tls = ?, username = ?, password = ?,
 			max_conns = ?, priority = ?, enabled = ?,
-			backup = ?, billing_mode = ?, quota_bytes = ?, used_bytes = ?,
+			backup = ?, billing_mode = ?, quota_bytes = ?, used_bytes = ?, bandwidth_bytes_per_sec = ?,
 			updated_at = ?
 		WHERE id = ?
 	`,
 		s.Name(), s.Host(), s.Port(), boolToInt(s.TLS()), nullableString(s.Username()), nullableString(s.Password()),
 		s.MaxConns(), s.Priority(), boolToInt(s.Enabled()),
-		boolToInt(s.Backup()), string(s.BillingMode()), s.QuotaBytes(), s.UsedBytes(),
+		boolToInt(s.Backup()), string(s.BillingMode()), s.QuotaBytes(), s.UsedBytes(), s.BandwidthBytesPerSec(),
 		s.UpdatedAt().UnixMilli(),
 		int64(s.ID()),
 	)
@@ -173,7 +173,7 @@ func (r *ServerRepo) queryServers(ctx context.Context, query string, args ...any
 
 const serverColumns = `id, name, host, port, tls, username, password,
 	max_conns, priority, enabled,
-	backup, billing_mode, quota_bytes, used_bytes,
+	backup, billing_mode, quota_bytes, used_bytes, bandwidth_bytes_per_sec,
 	added_at, updated_at`
 
 const selectServerByID = `SELECT ` + serverColumns + ` FROM servers WHERE id = ?`
@@ -195,48 +195,50 @@ func scanServer(row *sql.Row) (*server.UsenetServer, error) {
 
 func scanServerFromRows(s serverScanner) (*server.UsenetServer, error) {
 	var (
-		id          int64
-		name        string
-		host        string
-		port        int
-		tls         int
-		username    sql.NullString
-		password    sql.NullString
-		maxConns    int
-		priority    int
-		enabled     int
-		backup      int
-		billingMode string
-		quotaBytes  int64
-		usedBytes   int64
-		added       int64
-		updated     int64
+		id            int64
+		name          string
+		host          string
+		port          int
+		tls           int
+		username      sql.NullString
+		password      sql.NullString
+		maxConns      int
+		priority      int
+		enabled       int
+		backup        int
+		billingMode   string
+		quotaBytes    int64
+		usedBytes     int64
+		bandwidthBPS  int64
+		added         int64
+		updated       int64
 	)
 	if err := s.Scan(
 		&id, &name, &host, &port, &tls, &username, &password,
 		&maxConns, &priority, &enabled,
-		&backup, &billingMode, &quotaBytes, &usedBytes,
+		&backup, &billingMode, &quotaBytes, &usedBytes, &bandwidthBPS,
 		&added, &updated,
 	); err != nil {
 		return nil, err
 	}
 	return server.Hydrate(server.HydrateParams{
-		ID:          server.ServerID(id),
-		Name:        name,
-		Host:        host,
-		Port:        port,
-		TLS:         tls != 0,
-		Username:    username.String,
-		Password:    password.String,
-		MaxConns:    maxConns,
-		Priority:    priority,
-		Enabled:     enabled != 0,
-		Backup:      backup != 0,
-		BillingMode: server.BillingMode(billingMode),
-		QuotaBytes:  quotaBytes,
-		UsedBytes:   usedBytes,
-		AddedAt:     time.UnixMilli(added).UTC(),
-		UpdatedAt:   time.UnixMilli(updated).UTC(),
+		ID:                   server.ServerID(id),
+		Name:                 name,
+		Host:                 host,
+		Port:                 port,
+		TLS:                  tls != 0,
+		Username:             username.String,
+		Password:             password.String,
+		MaxConns:             maxConns,
+		Priority:             priority,
+		Enabled:              enabled != 0,
+		Backup:               backup != 0,
+		BillingMode:          server.BillingMode(billingMode),
+		QuotaBytes:           quotaBytes,
+		UsedBytes:            usedBytes,
+		BandwidthBytesPerSec: bandwidthBPS,
+		AddedAt:              time.UnixMilli(added).UTC(),
+		UpdatedAt:            time.UnixMilli(updated).UTC(),
 	}), nil
 }
 

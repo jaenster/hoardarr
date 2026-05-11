@@ -45,6 +45,7 @@ type OrchestratorService struct {
 	txm           tx.TransactionManager
 	pools         map[server.ServerID]*nntp.Pool
 	accounter     *ByteAccounter // optional; per-server byte tally
+	limiter       *Limiter       // optional; bandwidth throttle
 	incompleteDir string
 	logger        *slog.Logger
 	now           func() time.Time
@@ -69,6 +70,7 @@ type OrchestratorServiceParams struct {
 	TxManager     tx.TransactionManager
 	Pools         map[server.ServerID]*nntp.Pool
 	Accounter     *ByteAccounter // optional; supply to capture per-server byte tallies
+	Limiter       *Limiter       // optional; bandwidth throttling
 	IncompleteDir string
 	Logger        *slog.Logger
 	Now           func() time.Time
@@ -97,6 +99,7 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		txm:           p.TxManager,
 		pools:         p.Pools,
 		accounter:     p.Accounter,
+		limiter:       p.Limiter,
 		incompleteDir: p.IncompleteDir,
 		logger:        p.Logger,
 		now:           p.Now,
@@ -309,7 +312,7 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 	// Tiered fetcher handles priority/backup/metered selection per
 	// fetch call. The hint server id we pass to NewOrchestrator below
 	// is purely for logs / metrics — TieredFetcher ignores it.
-	fetcher := NewTieredFetcher(s.pools, s.accounter, s.logger)
+	fetcher := NewTieredFetcher(s.pools, s.accounter, s.limiter, s.logger)
 	hintID, hintMax := s.dispatchHint()
 
 	orch := NewOrchestrator(

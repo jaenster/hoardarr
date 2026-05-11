@@ -34,6 +34,7 @@ const settingsSubNav: SubNavItem[] = [
   { label: "Usenet Servers", href: "#servers" },
   { label: "Categories", href: "#categories" },
   { label: "Paths", href: "#paths" },
+  { label: "Bandwidth", href: "#bandwidth" },
   { label: "General", href: "#general" },
   { label: "Authentication", href: "#authentication" },
   { label: "SABnzbd Compatibility", href: "#sab-compat" },

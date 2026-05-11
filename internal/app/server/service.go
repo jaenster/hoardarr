@@ -49,9 +49,10 @@ type AddCmd struct {
 	// Optional multi-server fields. Backup defaults false. BillingMode
 	// "" means "flat" (the common case). QuotaBytes 0 means "unknown
 	// or unlimited" (no auto-disable).
-	Backup      bool
-	BillingMode domain.BillingMode
-	QuotaBytes  int64
+	Backup               bool
+	BillingMode          domain.BillingMode
+	QuotaBytes           int64
+	BandwidthBytesPerSec int64
 }
 
 // Add creates a new server and persists it. Returns the assigned ID.
@@ -68,17 +69,18 @@ func (s *Service) Add(ctx context.Context, cmd AddCmd) (domain.ServerID, error) 
 		}
 
 		agg, err := domain.New(domain.NewParams{
-			Name:        cmd.Name,
-			Host:        cmd.Host,
-			Port:        cmd.Port,
-			TLS:         cmd.TLS,
-			Username:    cmd.Username,
-			Password:    cmd.Password,
-			MaxConns:    cmd.MaxConns,
-			Priority:    cmd.Priority,
-			Backup:      cmd.Backup,
-			BillingMode: cmd.BillingMode,
-			QuotaBytes:  cmd.QuotaBytes,
+			Name:                 cmd.Name,
+			Host:                 cmd.Host,
+			Port:                 cmd.Port,
+			TLS:                  cmd.TLS,
+			Username:             cmd.Username,
+			Password:             cmd.Password,
+			MaxConns:             cmd.MaxConns,
+			Priority:             cmd.Priority,
+			Backup:               cmd.Backup,
+			BillingMode:          cmd.BillingMode,
+			QuotaBytes:           cmd.QuotaBytes,
+			BandwidthBytesPerSec: cmd.BandwidthBytesPerSec,
 		}, s.now())
 		if err != nil {
 			return err

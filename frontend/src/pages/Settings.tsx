@@ -13,6 +13,7 @@ import {
   EyeOff,
   Webhook,
   Send,
+  Gauge,
 } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
@@ -20,6 +21,7 @@ import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
 import { api, ApiError } from "../api/client";
 import type {
+  BandwidthConfig,
   Category,
   General,
   Paths,
@@ -37,6 +39,7 @@ export default function Settings() {
       <section id="servers"><ServersSection /></section>
       <section id="categories"><CategoriesSection /></section>
       <section id="paths"><PathsSection /></section>
+      <section id="bandwidth"><BandwidthSection /></section>
       <section id="general"><GeneralSection /></section>
       <section id="authentication"><AuthSection /></section>
       <section id="sab-compat"><SABSection /></section>
@@ -169,6 +172,7 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
   const [backup, setBackup] = useState(false);
   const [billingMode, setBillingMode] = useState<"flat" | "metered">("flat");
   const [quotaGB, setQuotaGB] = useState(0); // operator-friendly: GB; converted to bytes on submit
+  const [bandwidthMBPerSec, setBandwidthMBPerSec] = useState(0); // 0 = no per-server cap
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -192,6 +196,10 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
           billingMode === "metered" && quotaGB > 0
             ? Math.round(quotaGB * 1024 * 1024 * 1024)
             : 0,
+        bandwidth_bytes_per_sec:
+          bandwidthMBPerSec > 0
+            ? Math.round(bandwidthMBPerSec * 1024 * 1024)
+            : 0,
       });
       setName("");
       setHost("");
@@ -200,6 +208,7 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
       setBackup(false);
       setBillingMode("flat");
       setQuotaGB(0);
+      setBandwidthMBPerSec(0);
       onAdded();
     } catch (e) {
       if (e instanceof ApiError) {
@@ -316,6 +325,17 @@ function AddServerForm({ onAdded }: { onAdded: () => void }) {
             />
           </label>
         )}
+        <label className="settings-field settings-field-narrow">
+          <span>Speed cap (MB/s)</span>
+          <input
+            type="number"
+            min={0}
+            step={0.5}
+            value={bandwidthMBPerSec}
+            onChange={(e) => setBandwidthMBPerSec(Number(e.target.value))}
+            placeholder="0 = no cap"
+          />
+        </label>
       </div>
       {err && <p className="text-err">{err}</p>}
       <Button
@@ -959,4 +979,98 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
       </Button>
     </form>
   );
+}
+
+// --- Bandwidth ------------------------------------------------------
+
+function BandwidthSection() {
+  const [config, setConfig] = useState<BandwidthConfig | null>(null);
+  const [draft, setDraft] = useState<string>("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const c = await api.bandwidth();
+      setConfig(c);
+      setDraft(c.global_bytes_per_sec > 0 ? formatMB(c.global_bytes_per_sec) : "0");
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const mb = Number(draft);
+    if (!Number.isFinite(mb) || mb < 0) {
+      setError("Speed must be a non-negative number (MB/s).");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      const bytes = Math.round(mb * 1024 * 1024);
+      await api.setBandwidth({ global_bytes_per_sec: bytes });
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setError(body?.error ?? e.message);
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Panel
+      title="Bandwidth"
+      meta={
+        <StatusBadge tone="neutral">
+          <Gauge size={12} />
+          {config && config.global_bytes_per_sec > 0
+            ? `${formatMB(config.global_bytes_per_sec)} MB/s cap`
+            : "no global cap"}
+        </StatusBadge>
+      }
+    >
+      <p className="muted">
+        Global cap throttles total download throughput across every server.
+        Set to 0 for unlimited. Per-server caps (set under each server in the
+        list above) apply in addition: the effective rate is the lower of the
+        two when both are set.
+      </p>
+      {error && <p className="text-err">{error}</p>}
+      <form className="settings-form" onSubmit={submit}>
+        <h3>Global cap</h3>
+        <div className="settings-row">
+          <label className="settings-field settings-field-narrow">
+            <span>MB / second</span>
+            <input
+              type="number"
+              min={0}
+              step={0.5}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="0 = unlimited"
+            />
+          </label>
+        </div>
+        <Button variant="primary" type="submit" disabled={submitting}>
+          {submitting ? "Saving…" : "Save"}
+        </Button>
+      </form>
+    </Panel>
+  );
+}
+
+function formatMB(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, "");
 }

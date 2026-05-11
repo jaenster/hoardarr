@@ -33,6 +33,7 @@ type Handlers struct {
 	System        SystemStatuser // optional; nil disables /api/v1/system/status
 	Paths         *PathsView     // optional; nil disables /api/v1/config/paths
 	General       *GeneralView   // optional; nil disables /api/v1/config/general
+	Bandwidth     BandwidthAdmin // optional; nil disables /api/v1/config/bandwidth
 	Subscriptions Subscriptions  // optional; nil disables /api/v1/subscriptions
 	Outbox        EventReader    // optional; nil disables /api/v1/queue/{id}/events
 	LogHub        *loghub.Hub    // optional; nil disables /api/v1/system/logs*
@@ -43,6 +44,13 @@ type Handlers struct {
 // timeline endpoint needs.
 type EventReader interface {
 	EventsByJob(ctx context.Context, jobID int64) ([]event.Envelope, error)
+}
+
+// BandwidthAdmin is the slice of the download.Limiter that REST needs
+// to expose runtime control of the global cap.
+type BandwidthAdmin interface {
+	GlobalCap() int64
+	SetGlobalCap(bytesPerSec int64)
 }
 
 // Subscriptions is the slice of app/notify the REST handler needs.
@@ -142,6 +150,13 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	// mutation lives at config.toml + restart, same as paths.
 	if h.General != nil {
 		register("GET", "/api/v1/config/general", h.getGeneral)
+	}
+
+	// Bandwidth global cap is runtime-mutable (token bucket reconfigures
+	// in place).
+	if h.Bandwidth != nil {
+		register("GET", "/api/v1/config/bandwidth", h.getBandwidth)
+		register("PUT", "/api/v1/config/bandwidth", h.setBandwidth)
 	}
 
 	// Subscriptions (webhooks).
@@ -334,17 +349,18 @@ func (h *Handlers) listServers(w http.ResponseWriter, r *http.Request) {
 }
 
 type addServerReq struct {
-	Name        string `json:"name"`
-	Host        string `json:"host"`
-	Port        int    `json:"port"`
-	TLS         *bool  `json:"tls,omitempty"`
-	Username    string `json:"username,omitempty"`
-	Password    string `json:"password,omitempty"`
-	MaxConns    int    `json:"max_conns,omitempty"`
-	Priority    int    `json:"priority,omitempty"`
-	Backup      bool   `json:"backup,omitempty"`
-	BillingMode string `json:"billing_mode,omitempty"` // "flat" | "metered"; empty => flat
-	QuotaBytes  int64  `json:"quota_bytes,omitempty"`
+	Name                 string `json:"name"`
+	Host                 string `json:"host"`
+	Port                 int    `json:"port"`
+	TLS                  *bool  `json:"tls,omitempty"`
+	Username             string `json:"username,omitempty"`
+	Password             string `json:"password,omitempty"`
+	MaxConns             int    `json:"max_conns,omitempty"`
+	Priority             int    `json:"priority,omitempty"`
+	Backup               bool   `json:"backup,omitempty"`
+	BillingMode          string `json:"billing_mode,omitempty"` // "flat" | "metered"; empty => flat
+	QuotaBytes           int64  `json:"quota_bytes,omitempty"`
+	BandwidthBytesPerSec int64  `json:"bandwidth_bytes_per_sec,omitempty"`
 }
 
 func (h *Handlers) addServer(w http.ResponseWriter, r *http.Request) {
@@ -358,17 +374,18 @@ func (h *Handlers) addServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, err := h.Servers.Add(r.Context(), appserver.AddCmd{
-		Name:        req.Name,
-		Host:        req.Host,
-		Port:        req.Port,
-		TLS:         req.TLS,
-		Username:    req.Username,
-		Password:    req.Password,
-		MaxConns:    req.MaxConns,
-		Priority:    req.Priority,
-		Backup:      req.Backup,
-		BillingMode: domainserver.BillingMode(req.BillingMode),
-		QuotaBytes:  req.QuotaBytes,
+		Name:                 req.Name,
+		Host:                 req.Host,
+		Port:                 req.Port,
+		TLS:                  req.TLS,
+		Username:             req.Username,
+		Password:             req.Password,
+		MaxConns:             req.MaxConns,
+		Priority:             req.Priority,
+		Backup:               req.Backup,
+		BillingMode:          domainserver.BillingMode(req.BillingMode),
+		QuotaBytes:           req.QuotaBytes,
+		BandwidthBytesPerSec: req.BandwidthBytesPerSec,
 	})
 	if err != nil {
 		switch {
@@ -511,6 +528,34 @@ func (h *Handlers) systemStatus(w http.ResponseWriter, r *http.Request) {
 			"total":  st.QueueTotal,
 		},
 		"pools": pools,
+	})
+}
+
+// --- bandwidth ------------------------------------------------------
+
+func (h *Handlers) getBandwidth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"global_bytes_per_sec": h.Bandwidth.GlobalCap(),
+	})
+}
+
+type setBandwidthReq struct {
+	GlobalBytesPerSec int64 `json:"global_bytes_per_sec"`
+}
+
+func (h *Handlers) setBandwidth(w http.ResponseWriter, r *http.Request) {
+	var req setBandwidthReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	if req.GlobalBytesPerSec < 0 {
+		h.writeError(w, http.StatusBadRequest, errors.New("global_bytes_per_sec must be >= 0"))
+		return
+	}
+	h.Bandwidth.SetGlobalCap(req.GlobalBytesPerSec)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"global_bytes_per_sec": req.GlobalBytesPerSec,
 	})
 }
 
