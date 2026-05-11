@@ -177,12 +177,11 @@ export function useQueue() {
         },
       }));
     });
-    // Segment-missing / failed → tick failed_bytes (best-effort; the
-    // event payload doesn't carry a byte count for missing, so we
-    // leave failed_bytes alone and rely on the next refresh for the
-    // exact figure).
-    es.addEventListener("download.segment.failed", () => scheduleRefresh());
-    es.addEventListener("download.segment.missing", () => scheduleRefresh());
+    // Segment missing/failed events used to trigger a queue refresh,
+    // but on a flaky provider they fire constantly and we'd refresh
+    // the queue many times per second. failed_bytes will surface on
+    // the next legitimate state-change refresh (file.completed,
+    // download.job.*, verify.*, etc.) — no need to chase every byte.
 
     // Anything that mutates job state (or the job set itself) → full
     // refresh. These are infrequent, so the cost is fine.

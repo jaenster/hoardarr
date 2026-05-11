@@ -64,6 +64,8 @@ var DefaultTopics = []string{
 	"notify.subscription.enabled",
 	"notify.subscription.disabled",
 	"notify.subscription.removed",
+	"system.throughput",
+	"system.pools",
 }
 
 // Hub broadcasts event envelopes to subscribed SSE clients.
