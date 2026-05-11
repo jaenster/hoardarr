@@ -137,6 +137,21 @@ func (v *VerifySet) MarkFailed(reason string, now time.Time) error {
 	return nil
 }
 
+// Reset transitions repair_needed → pending so a subsequent verify
+// pass can run after the M3b repair worker has reconstructed damaged
+// files. Returns an error from any other state to keep callers honest;
+// nobody should reset an OK or Failed verify. No event is emitted —
+// the verify service will emit VerifyStarted when it picks up.
+func (v *VerifySet) Reset() error {
+	if v.state != VerifyStateRepairNeeded {
+		return errors.New("verify: Reset requires repair_needed state")
+	}
+	v.state = VerifyStatePending
+	v.failedFiles = nil
+	v.errorMsg = ""
+	return nil
+}
+
 // PullEvents drains and returns the pending event list.
 func (v *VerifySet) PullEvents() []event.Event {
 	out := v.events

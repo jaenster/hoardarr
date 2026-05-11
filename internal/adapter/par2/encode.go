@@ -91,6 +91,19 @@ func EncodeIFSC(setID, fileID [16]byte, slices []SliceCheck) []byte {
 	return EncodePacket(setID, typeIFSC, body)
 }
 
+// EncodeRecvSlc builds a Recovery Slice packet: 4-byte exponent then
+// the slice body. The exponent is a 16-bit value in PAR2 but the wire
+// format uses 4 bytes (the high two are zero), matching what par2cmdline
+// emits.
+func EncodeRecvSlc(setID [16]byte, exponent uint16, body []byte) []byte {
+	out := make([]byte, 0, 4+len(body))
+	var eb [4]byte
+	binary.LittleEndian.PutUint32(eb[:], uint32(exponent))
+	out = append(out, eb[:]...)
+	out = append(out, body...)
+	return EncodePacket(setID, typeRecvSlc, out)
+}
+
 // EncodeCreator builds a Creator packet — a free-form ASCII string
 // identifying the producing client.
 func EncodeCreator(setID [16]byte, name string) []byte {

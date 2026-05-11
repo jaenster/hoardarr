@@ -61,6 +61,12 @@ type RecoverySet struct {
 	// across input files; used by M3b to decide whether enough vol
 	// files have been fetched. M3a doesn't consume it.
 	RecoverySliceCount int
+
+	// RecoverySlices maps exponent → slice body for every RecvSlc
+	// packet observed. M3b's repair worker uses this directly; M3a
+	// can ignore it. Duplicates (same exponent from multiple .par2
+	// vol files) are deduped on first arrival.
+	RecoverySlices map[uint16][]byte
 }
 
 // ParFile is one recoverable file's descriptor + per-slice checksums.
@@ -256,7 +262,7 @@ func (s *RecoverySet) consume(pkt Packet) error {
 		return s.consumeIFSC(pkt.Body)
 	case typeRecvSlc:
 		s.RecoverySliceCount++
-		return nil
+		return s.consumeRecvSlc(pkt.Body)
 	case typeCreator:
 		// Free-form ASCII string, possibly NUL-padded.
 		s.Creator = strings.TrimRight(string(pkt.Body), "\x00 \r\n\t")
@@ -338,6 +344,31 @@ func (s *RecoverySet) consumeIFSC(body []byte) error {
 		copy(f.Slices[i].MD5[:], rest[off:off+16])
 		f.Slices[i].CRC32 = binary.LittleEndian.Uint32(rest[off+16 : off+20])
 	}
+	return nil
+}
+
+// consumeRecvSlc captures the recovery slice body keyed by exponent.
+// First-wins on dedupe: when the same exponent appears in multiple
+// .par2 vol files we trust the first parse and skip the rest.
+func (s *RecoverySet) consumeRecvSlc(body []byte) error {
+	if len(body) < 4 {
+		return errors.New("par2: recvslc too short")
+	}
+	exp := binary.LittleEndian.Uint32(body[0:4])
+	if exp > 0xFFFF {
+		return fmt.Errorf("par2: recvslc exponent %d exceeds uint16", exp)
+	}
+	if s.RecoverySlices == nil {
+		s.RecoverySlices = make(map[uint16][]byte)
+	}
+	if _, ok := s.RecoverySlices[uint16(exp)]; ok {
+		return nil
+	}
+	// Copy out of the parser's buffer — the underlying body is shared
+	// with the file-read buffer in scanPackets.
+	data := make([]byte, len(body)-4)
+	copy(data, body[4:])
+	s.RecoverySlices[uint16(exp)] = data
 	return nil
 }
 

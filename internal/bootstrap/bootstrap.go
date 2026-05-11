@@ -30,6 +30,7 @@ import (
 	appdeliver "github.com/jaenster/hoardarr/internal/app/deliver"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
 	appextract "github.com/jaenster/hoardarr/internal/app/extract"
+	apprepair "github.com/jaenster/hoardarr/internal/app/repair"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
@@ -73,6 +74,7 @@ type App struct {
 	Pools        map[domainserver.ServerID]*nntp.Pool
 	Orchestrator *appdownload.OrchestratorService
 	Verify       *appverify.Service
+	Repair       *apprepair.Service
 	Deliver      *appdeliver.Service
 	Extract      *appextract.Service
 
@@ -201,6 +203,16 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Logger:        logger,
 	})
 
+	repairRepo := sqlite.NewRepairRepo(db)
+	repairSvc := apprepair.New(apprepair.ServiceParams{
+		JobRepo:       jobRepo,
+		Repo:          repairRepo,
+		Bus:           bus,
+		TxManager:     txm,
+		IncompleteDir: cfg.Paths.IncompleteDir,
+		Logger:        logger,
+	})
+
 	extractRepo := sqlite.NewExtractRepo(db)
 	categoryRepoForExtract := sqlite.NewCategoryRepo(db)
 	extractor := bo.extractor
@@ -301,6 +313,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Pools:         pools,
 		Orchestrator:  orch,
 		Verify:        verifySvc,
+		Repair:        repairSvc,
 		Deliver:       deliverSvc,
 		Extract:       extractSvc,
 		AuthService:   authSvc,
@@ -338,6 +351,9 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	if err := a.Verify.Start(ctx); err != nil {
 		return fmt.Errorf("start verify: %w", err)
+	}
+	if err := a.Repair.Start(ctx); err != nil {
+		return fmt.Errorf("start repair: %w", err)
 	}
 	if err := a.Deliver.Start(ctx); err != nil {
 		return fmt.Errorf("start deliver: %w", err)
@@ -387,6 +403,9 @@ func (a *App) Shutdown() error {
 		}
 		if err := a.Deliver.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("deliver stop: %w", err)
+		}
+		if err := a.Repair.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("repair stop: %w", err)
 		}
 		if err := a.Verify.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("verify stop: %w", err)

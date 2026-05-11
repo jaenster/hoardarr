@@ -97,7 +97,15 @@ func (s *Service) Start(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("subscribe job.download_complete: %w", err)
 	}
-	s.subs = []event.Subscription{sub}
+	// Also subscribe to repair.ok — after the repair worker reconstructs
+	// damaged files we re-run verification, which then fires verify.ok
+	// for deliver/extract.
+	sub2, err := s.bus.Subscribe("verify-worker-postrepair", "repair.ok", s.onRepairOK)
+	if err != nil {
+		_ = sub.Close()
+		return fmt.Errorf("subscribe repair.ok: %w", err)
+	}
+	s.subs = []event.Subscription{sub, sub2}
 	s.started = true
 	s.logger.Info("verify service started")
 	return nil
@@ -140,9 +148,53 @@ func (s *Service) onJobDownloadComplete(ctx context.Context, env event.Envelope)
 			s.logger.Error("verify run", "job_id", e.JobID, "err", err)
 		}
 	}()
+	_ = ctx
+	return nil
+}
+
+// onRepairOK fires after the repair worker reconstructs damaged files.
+// We reset the VerifySet to pending and re-run verification — the
+// follow-up VerifyOK event is what deliver/extract listen for to take
+// the job to terminal completion.
+func (s *Service) onRepairOK(ctx context.Context, env event.Envelope) error {
+	var e struct {
+		JobID download.JobID `json:"job_id"`
+	}
+	if err := json.Unmarshal(env.Payload, &e); err != nil {
+		return fmt.Errorf("decode RepairOK: %w", err)
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := s.resetAndRunVerify(s.rootCtx, e.JobID); err != nil {
+			s.logger.Error("verify rerun (post-repair)", "job_id", e.JobID, "err", err)
+		}
+	}()
 	// Acknowledge to the bus immediately — we're committed to running.
 	_ = ctx
 	return nil
+}
+
+// resetAndRunVerify flips the existing VerifySet from repair_needed
+// back to pending and then runs verify again. If the set isn't in
+// repair_needed (or doesn't exist) we still run verify — it's an
+// idempotent restart from the caller's perspective.
+func (s *Service) resetAndRunVerify(ctx context.Context, jobID download.JobID) error {
+	vset, err := s.verifyRepo.ByJobID(ctx, jobID)
+	if err != nil && !errors.Is(err, verify.ErrNotFound) {
+		return fmt.Errorf("load verify set for reset: %w", err)
+	}
+	if vset != nil && vset.State() == verify.VerifyStateRepairNeeded {
+		if err := s.txm.InTx(ctx, func(ctx context.Context) error {
+			if err := vset.Reset(); err != nil {
+				return err
+			}
+			return s.verifyRepo.Save(ctx, vset)
+		}); err != nil {
+			return fmt.Errorf("reset verify set: %w", err)
+		}
+	}
+	return s.runVerify(ctx, jobID)
 }
 
 // runVerify executes the full verification flow for a single job.
