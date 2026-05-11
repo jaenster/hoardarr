@@ -147,17 +147,89 @@ func chooseName(d *nzb.Document) string {
 			return m.Value
 		}
 	}
-	// Fallback: derive from the longest filename.
-	best := ""
+	// Prefer a non-PAR2 filename. PAR2 fragments like
+	// "release.vol00+01.par2" make terrible job labels because they
+	// expose internal release naming + the volume suffix; pick a
+	// data filename if any exist.
+	var dataNames []string
+	var allNames []string
 	for _, f := range d.Files {
-		if len(f.Filename) > len(best) {
-			best = f.Filename
+		allNames = append(allNames, f.Filename)
+		if !isPar2Filename(f.Filename) {
+			dataNames = append(dataNames, f.Filename)
 		}
 	}
-	if best == "" {
-		return "unnamed"
+	if name := releaseFromFilenames(dataNames); name != "" {
+		return name
 	}
-	return best
+	if name := releaseFromFilenames(allNames); name != "" {
+		return name
+	}
+	return "unnamed"
+}
+
+// releaseFromFilenames derives a release-name string from a set of
+// filenames by stripping the common "this is part N of M" suffix:
+//
+//	release.part001.rar → release
+//	release.r00, release.r01 → release
+//	release.001, release.002 → release
+//
+// If no suffix pattern matches, returns the first filename verbatim.
+func releaseFromFilenames(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	for _, n := range names {
+		if base := stripRelaseSuffix(n); base != "" && base != n {
+			return base
+		}
+	}
+	return names[0]
+}
+
+// stripRelaseSuffix strips the common multi-part suffix from a
+// filename. Returns "" when nothing matched. Recognised:
+//
+//	".partNNN.rar"   → "release"   (most modern releases)
+//	".rNN"           → "release"   (legacy splits)
+//	".NNN"           → "release"   (split archives)
+//	".vol*.par2"     → "release"   (PAR2 volume — kept as defence in
+//	                                depth though chooseName filters)
+func stripRelaseSuffix(name string) string {
+	low := strings.ToLower(name)
+	// .partNNN.rar
+	if i := strings.LastIndex(low, ".part"); i >= 0 && strings.HasSuffix(low, ".rar") {
+		return name[:i]
+	}
+	// .rNN  (.r00, .r01, …)
+	if i := strings.LastIndex(low, ".r"); i >= 0 && len(low)-i == 4 && allDigits(low[i+2:]) {
+		return name[:i]
+	}
+	// .NNN (numeric split)
+	if i := strings.LastIndex(low, "."); i >= 0 && len(low)-i == 4 && allDigits(low[i+1:]) {
+		return name[:i]
+	}
+	// .vol*+*.par2
+	if i := strings.LastIndex(low, ".vol"); i >= 0 && strings.HasSuffix(low, ".par2") {
+		return name[:i]
+	}
+	if i := strings.LastIndex(low, "."); i >= 0 && (strings.HasSuffix(low, ".rar") || strings.HasSuffix(low, ".par2")) {
+		return name[:i]
+	}
+	return ""
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func buildFiles(d *nzb.Document) ([]download.NewFileParams, int64) {

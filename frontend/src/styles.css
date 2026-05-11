@@ -942,6 +942,83 @@ a:hover {
 .queue-row-activity code {
   font-size: 0.74rem;
 }
+
+.file-list .file-name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: 32rem;
+  overflow: hidden;
+}
+.file-list .file-name span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-list .file-icon {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.file-progress-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 9rem;
+}
+.file-progress {
+  position: relative;
+  height: 6px;
+  width: 6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.file-progress-fill {
+  height: 100%;
+  background: var(--accent, #4f7bb2);
+  transition: width 0.1s linear;
+}
+
+.activity-dropzone {
+  position: relative;
+  min-height: 100%;
+}
+.activity-dropzone.is-drag-over::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px dashed var(--accent-line, #4f7bb2);
+  border-radius: var(--radius-md, 0.5rem);
+  pointer-events: none;
+  z-index: 20;
+}
+.drag-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 12, 18, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+  pointer-events: none;
+}
+.drag-overlay-card {
+  background: var(--bg);
+  border: 1px solid var(--accent-line, #4f7bb2);
+  border-radius: var(--radius-md, 0.5rem);
+  padding: 2rem 3rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+.drag-overlay-card p {
+  margin: 0;
+  font-weight: 500;
+}
 .queue-row:last-child {
   border-bottom: none;
 }

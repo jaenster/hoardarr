@@ -251,15 +251,26 @@ func (h *Handlers) addNZB(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, fmt.Errorf("parse form: %w", err))
 		return
 	}
-	file, _, err := r.FormFile("nzb")
+	file, header, err := r.FormFile("nzb")
 	if err != nil {
 		h.writeError(w, http.StatusBadRequest, fmt.Errorf("nzb file required: %w", err))
 		return
 	}
 	defer file.Close()
 
+	// Display name = the uploaded filename minus the ".nzb" suffix.
+	// Operators upload "Release.Name.S01E01.1080p.WEB-DL.nzb"; that's
+	// what they want to see in the queue, not an arbitrary internal
+	// file ID picked out of the NZB's <file> list.
+	var displayName string
+	if header != nil {
+		displayName = strings.TrimSuffix(header.Filename, ".nzb")
+		displayName = strings.TrimSuffix(displayName, ".NZB")
+	}
+
 	id, err := h.AddJob.AddJob(ctx, appdownload.AddJobCmd{
 		NZB:      file,
+		Name:     displayName,
 		Category: r.FormValue("category"),
 	})
 	if err != nil {

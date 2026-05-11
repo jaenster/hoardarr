@@ -149,16 +149,23 @@ func (h *Handler) modeGetCats(w http.ResponseWriter, r *http.Request) {
 // "name" as the file part name (real SAB) and "nzbfile" (some forks).
 // We accept both.
 func (h *Handler) modeAddFile(w http.ResponseWriter, r *http.Request) {
-	file, _, err := firstFormFile(r, "name", "nzbfile")
+	file, filename, err := firstFormFile(r, "name", "nzbfile")
 	if err != nil {
 		h.writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	defer file.Close()
 
+	// Display name from the multipart filename so *arr clients
+	// uploading "Release.Name.S01E01.nzb" show up under that label
+	// in the queue.
+	displayName := strings.TrimSuffix(filename, ".nzb")
+	displayName = strings.TrimSuffix(displayName, ".NZB")
+
 	cat := formGet(r, "cat")
 	id, err := h.AddJob.AddJob(r.Context(), appdownload.AddJobCmd{
 		NZB:      file,
+		Name:     displayName,
 		Category: cat,
 	})
 	if err != nil && !errors.Is(err, appdownload.ErrDuplicateNZB) {
