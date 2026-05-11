@@ -58,6 +58,14 @@ type Server struct {
 	// + window.HOARDARR_BASE so client-side routes and assets resolve
 	// correctly. One binary, picks up its mount path from env/config.
 	URLBase string `toml:"url_base"`
+
+	// MaxConcurrentJobs caps the number of jobs the orchestrator
+	// drives in parallel. 0 means unlimited (default — every job
+	// runs in its own goroutine as soon as it lands). Set to 1 for
+	// strict serial behaviour (SABnzbd default); set to N>1 to
+	// allow N jobs at once. Excess jobs sit in pending state until
+	// a slot frees up. Live-editable from Settings → General.
+	MaxConcurrentJobs int `toml:"max_concurrent_jobs"`
 }
 
 // Auth holds authentication configuration. Currently API-key only;

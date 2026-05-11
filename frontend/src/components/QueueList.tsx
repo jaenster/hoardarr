@@ -39,13 +39,28 @@ export type QueueReorder = (orderedIds: number[]) => void | Promise<void>;
 type Props = {
   jobs: Job[];
   activity?: Record<number, JobActivity>;
+  bytesPerSec?: number;
   onPause: QueueAction;
   onResume: QueueAction;
   onRemove: QueueAction;
   onReorder?: QueueReorder;
 };
 
-export default function QueueList({ jobs, activity, onPause, onResume, onRemove, onReorder }: Props) {
+export default function QueueList({
+  jobs,
+  activity,
+  bytesPerSec,
+  onPause,
+  onResume,
+  onRemove,
+  onReorder,
+}: Props) {
+  // Share the global rate evenly across active downloading jobs for
+  // per-row ETA. Crude but matches the user's mental model: "speed
+  // = total rate, split between what's running".
+  const activeCount = jobs.filter((j) => j.state === "downloading").length;
+  const perJobRate =
+    bytesPerSec && activeCount > 0 ? bytesPerSec / Math.max(1, activeCount) : 0;
   // Live drag state — index of the row being dragged and the drop
   // target. Used to render a "drop here" placeholder line.
   const [dragIdx, setDragIdx] = useState<number | null>(null);
@@ -76,6 +91,7 @@ export default function QueueList({ jobs, activity, onPause, onResume, onRemove,
           key={j.id}
           job={j}
           activity={activity?.[j.id]}
+          bytesPerSec={perJobRate}
           index={i}
           isDragging={dragIdx === i}
           isDropTarget={overIdx === i && dragIdx !== null && dragIdx !== i}
@@ -99,6 +115,7 @@ export default function QueueList({ jobs, activity, onPause, onResume, onRemove,
 function QueueRow({
   job,
   activity,
+  bytesPerSec,
   index,
   isDragging,
   isDropTarget,
@@ -113,6 +130,7 @@ function QueueRow({
 }: {
   job: Job;
   activity?: JobActivity;
+  bytesPerSec?: number;
   index: number;
   isDragging: boolean;
   isDropTarget: boolean;
@@ -212,6 +230,15 @@ function QueueRow({
         <span className="progress-label">
           {formatBytes(job.done_bytes)} / {formatBytes(job.total_bytes)}{" "}
           ({pct.toFixed(1)}%)
+          {job.state === "downloading" && bytesPerSec && bytesPerSec > 0 && (
+            <>
+              {" · "}
+              <span className="muted">
+                {formatBytes(bytesPerSec)}/s · ETA{" "}
+                {formatETA((job.total_bytes - job.done_bytes) / bytesPerSec)}
+              </span>
+            </>
+          )}
         </span>
       </div>
       {activity?.currentMessageID && job.state === "downloading" && (
@@ -234,6 +261,17 @@ function QueueRow({
 function truncateMsgID(s: string): string {
   if (s.length <= 56) return s;
   return s.slice(0, 30) + "…" + s.slice(-22);
+}
+
+function formatETA(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h ${mm}m`;
 }
 
 function formatBytes(n: number): string {

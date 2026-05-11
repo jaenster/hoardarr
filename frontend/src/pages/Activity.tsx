@@ -9,7 +9,7 @@ import { api, ApiError } from "../api/client";
 import { useQueue } from "../hooks/useQueue";
 
 export default function Activity() {
-  const { jobs, activity, error, loading, refresh, applyReorder } = useQueue();
+  const { jobs, activity, bytesPerSec, error, loading, refresh, applyReorder } = useQueue();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -223,6 +223,7 @@ export default function Activity() {
             <QueueList
               jobs={jobs}
               activity={activity}
+              bytesPerSec={bytesPerSec}
               onPause={onPause}
               onResume={onResume}
               onRemove={onRemove}

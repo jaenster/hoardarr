@@ -377,6 +377,10 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Categories:  categoryRepo,
 		Logger:      logger,
 		CompleteDir: cfg.Paths.CompleteDir,
+		// Wire the throughput tracker so SAB queue responses surface
+		// kbpersec / timeleft / per-slot eta. *arr suites import jobs
+		// faster when they get a real ETA instead of "unknown".
+		Throughput: func() int64 { return throughput.Sample().CurrentBytesPerSec },
 	})
 	srv.MountSSE(liveHub)
 	httpSrv := &http.Server{

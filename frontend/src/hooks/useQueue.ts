@@ -32,6 +32,9 @@ export type JobActivity = {
 export function useQueue() {
   const [jobs, setJobs] = useState<Job[] | null>(null);
   const [activity, setActivity] = useState<Record<number, JobActivity>>({});
+  // Current overall throughput in bytes/sec. Used by QueueRow to render
+  // an ETA next to the progress bar.
+  const [bytesPerSec, setBytesPerSec] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const debounceTimer = useRef<number | null>(null);
@@ -109,6 +112,21 @@ export function useQueue() {
   useEffect(() => {
     void refresh();
 
+    // Poll throughput once per second so the ETA stays responsive
+    // without hammering the server. Window is 300s rolling; this
+    // is a cheap snapshot read.
+    let stopped = false;
+    const pollThroughput = async () => {
+      try {
+        const tp = await api.throughput();
+        if (!stopped) setBytesPerSec(tp.current_bytes_per_sec);
+      } catch {
+        /* non-fatal — ETA just won't render */
+      }
+    };
+    void pollThroughput();
+    const tpTimer = window.setInterval(() => void pollThroughput(), 1000);
+
     const es = new EventSource(streamURL());
 
     // Segment-completed → tick done_bytes immediately. Payload carries
@@ -181,6 +199,8 @@ export function useQueue() {
     };
 
     return () => {
+      stopped = true;
+      window.clearInterval(tpTimer);
       if (debounceTimer.current != null) {
         window.clearTimeout(debounceTimer.current);
       }
@@ -188,7 +208,7 @@ export function useQueue() {
     };
   }, [refresh, scheduleRefresh, patchJobBytes]);
 
-  return { jobs, activity, error, loading, refresh, applyReorder };
+  return { jobs, activity, bytesPerSec, error, loading, refresh, applyReorder };
 }
 
 // parseEnvelope decodes the SSE data payload. The server emits the

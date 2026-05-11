@@ -14,6 +14,14 @@ import (
 // emits as strings (mb / mbleft) stay strings here too — we mimic
 // the wire shape exactly so consumers don't need to special-case us.
 func jobToSABSlot(j *download.Job) map[string]any {
+	return jobToSABSlotWithETA(j, 0)
+}
+
+// jobToSABSlotWithETA is jobToSABSlot with a per-job rate estimate
+// (bytes/sec). When > 0, timeleft / eta are populated; when 0, they
+// fall back to SAB's "unknown" sentinels (real SAB does the same
+// during early download).
+func jobToSABSlotWithETA(j *download.Job, perJobBytesPerSec int64) map[string]any {
 	totalMB := bytesToMBString(j.TotalBytes())
 	doneMB := bytesToMBString(j.DoneBytes())
 	leftMB := bytesToMBString(j.TotalBytes() - j.DoneBytes())
@@ -21,6 +29,16 @@ func jobToSABSlot(j *download.Job) map[string]any {
 	if j.TotalBytes() > 0 {
 		pct = int((j.DoneBytes() * 100) / j.TotalBytes())
 	}
+
+	timeLeft := "0:00:00"
+	etaStr := "unknown"
+	bytesLeft := j.TotalBytes() - j.DoneBytes()
+	if perJobBytesPerSec > 0 && bytesLeft > 0 && j.State() == download.JobStateDownloading {
+		secs := bytesLeft / perJobBytesPerSec
+		timeLeft = formatSABHMS(secs)
+		etaStr = time.Now().Add(time.Duration(secs) * time.Second).Format("Mon 15:04")
+	}
+
 	return map[string]any{
 		"index":         0,
 		"nzo_id":        nzoID(j.ID()),
@@ -32,13 +50,13 @@ func jobToSABSlot(j *download.Job) map[string]any {
 		"mbleft":        leftMB,
 		"mb":            totalMB,
 		"size":          formatBytesHuman(j.TotalBytes()),
-		"sizeleft":      formatBytesHuman(j.TotalBytes() - j.DoneBytes()),
+		"sizeleft":      formatBytesHuman(bytesLeft),
 		"percentage":    fmt.Sprintf("%d", pct),
 		"mbmissing":     "0.00",
 		"status":        stateToSABStatus(j.State()),
-		"timeleft":      "0:00:00",
+		"timeleft":      timeLeft,
 		"avg_age":       "0d",
-		"eta":           "unknown",
+		"eta":           etaStr,
 		"missing":       0,
 		// SAB v3.7.x parity. *arr ignores these; SAB-mobile reads them:
 		"labels":        []string{},
@@ -47,6 +65,17 @@ func jobToSABSlot(j *download.Job) map[string]any {
 		"time_added":    formatTimeISO(j.AddedAt()),
 		"_doneMB":       doneMB,
 	}
+}
+
+// formatSABHMS renders a duration in seconds as SAB's "h:mm:ss".
+func formatSABHMS(seconds int64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	h := seconds / 3600
+	m := (seconds % 3600) / 60
+	s := seconds % 60
+	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 }
 
 // jobToSABHistorySlot maps a terminal Job to a SAB history-slot map.

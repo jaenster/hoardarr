@@ -53,6 +53,11 @@ type Handler struct {
 	Categories *sqlite.CategoryRepo
 	Logger     *slog.Logger
 	CompleteDir string
+	// Throughput returns current overall download rate in bytes/sec.
+	// Used to populate queue.kbpersec / queue.timeleft and per-slot
+	// eta/timeleft. May be nil; the SAB API then reports 0 / unknown
+	// (existing behaviour, but *arr clients prefer numbers).
+	Throughput func() int64
 }
 
 // ServeHTTP dispatches on mode=.
@@ -196,21 +201,51 @@ func (h *Handler) modeQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) modeQueueList(w http.ResponseWriter, r *http.Request) {
-	jobs, err := h.Queue.Active(r.Context())
+	jobs, err := h.Queue.ActiveShallow(r.Context())
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	var rate int64
+	if h.Throughput != nil {
+		rate = h.Throughput()
+	}
+	// Total bytes left across the active queue. We share the
+	// throughput evenly across non-paused jobs for per-slot ETA
+	// since hoardarr fetches them concurrently (one runner per job).
+	var totalLeft int64
+	activeCount := 0
+	for _, j := range jobs {
+		if j.State() == download.JobStatePaused {
+			continue
+		}
+		left := j.TotalBytes() - j.DoneBytes()
+		if left > 0 {
+			totalLeft += left
+			activeCount++
+		}
+	}
+	perJobRate := rate
+	if activeCount > 1 && rate > 0 {
+		perJobRate = rate / int64(activeCount)
+	}
+
 	slots := make([]map[string]any, 0, len(jobs))
 	for _, j := range jobs {
-		slots = append(slots, jobToSABSlot(j))
+		slots = append(slots, jobToSABSlotWithETA(j, perJobRate))
 	}
+
+	queueTimeLeft := "0:00:00"
+	if rate > 0 && totalLeft > 0 {
+		queueTimeLeft = formatHMS(totalLeft / rate)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"queue": map[string]any{
 			"version":         reportedVersion,
 			"paused":          false,
-			"speed":           "0 B/s",
-			"kbpersec":        "0.00",
+			"speed":           formatBytesPerSec(rate),
+			"kbpersec":        fmt.Sprintf("%.2f", float64(rate)/1024),
 			"speedlimit":      "0",
 			"speedlimit_abs":  "",
 			"size":            totalSizeHuman(jobs),
@@ -224,13 +259,44 @@ func (h *Handler) modeQueueList(w http.ResponseWriter, r *http.Request) {
 			"finish":          len(slots),
 			"slots":           slots,
 			"status":          queueStatus(jobs),
-			"timeleft":        "0:00:00",
+			"timeleft":        queueTimeLeft,
 			"diskspace1":      "0",
 			"diskspace2":      "0",
 			"diskspacetotal1": "0",
 			"diskspacetotal2": "0",
 		},
 	})
+}
+
+// formatBytesPerSec renders bytes/sec the way SAB's "speed" field
+// does it: "<value> <unit>/s" where unit is human-readable.
+func formatBytesPerSec(bps int64) string {
+	if bps <= 0 {
+		return "0 B/s"
+	}
+	const k = 1024
+	if bps < k {
+		return fmt.Sprintf("%d B/s", bps)
+	}
+	units := []string{"K", "M", "G", "T"}
+	v := float64(bps) / float64(k)
+	i := 0
+	for v >= k && i < len(units)-1 {
+		v /= float64(k)
+		i++
+	}
+	return fmt.Sprintf("%.1f %sB/s", v, units[i])
+}
+
+// formatHMS renders a duration in seconds as "h:mm:ss" (SAB format).
+func formatHMS(seconds int64) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	h := seconds / 3600
+	m := (seconds % 3600) / 60
+	s := seconds % 60
+	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 }
 
 func (h *Handler) modeQueueAction(w http.ResponseWriter, r *http.Request, action string) {
