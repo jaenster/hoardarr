@@ -11,6 +11,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io/fs"
 	"log/slog"
@@ -47,7 +48,15 @@ func New(cfg config.Config, runtime *Runtime, logger *slog.Logger, web fs.FS) *S
 		logger = slog.Default()
 	}
 	if runtime == nil {
-		runtime = NewRuntime(cfg, "")
+		// Tests / no-DB call sites: fall back to an in-memory store.
+		// Real bootstrap always plumbs a real Runtime in.
+		rt, err := NewRuntime(context.Background(), nil, cfg, logger)
+		if err != nil {
+			// NewRuntime with a memory store never fails; the only
+			// error path is store==nil, which we explicitly handle.
+			rt = &Runtime{store: NewMemoryStore()}
+		}
+		runtime = rt
 	}
 	s := &Server{
 		cfg:     cfg,

@@ -1,77 +1,159 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
 	"github.com/jaenster/hoardarr/internal/config"
 )
 
+// SettingsStore is the slice of adapter/sqlite.SettingsRepo the Runtime
+// uses for live persistence. Defined here as an interface so the server
+// package doesn't import sqlite directly (which would couple the HTTP
+// layer to the persistence adapter).
+type SettingsStore interface {
+	GetStringOr(ctx context.Context, key, dflt string) (string, error)
+	GetIntOr(ctx context.Context, key string, dflt int) (int, error)
+	GetFloatOr(ctx context.Context, key string, dflt float64) (float64, error)
+	GetBoolOr(ctx context.Context, key string, dflt bool) (bool, error)
+	Set(ctx context.Context, key, value string) error
+	SetInt(ctx context.Context, key string, v int) error
+	SetFloat(ctx context.Context, key string, v float64) error
+	SetBool(ctx context.Context, key string, v bool) error
+}
+
+// Setting keys. These are the runtime-mutable fields that used to
+// live in config.toml; they now persist in the SQLite settings table.
+const (
+	SettingURLBase             = "server.url_base"
+	SettingMaxConcurrentJobs   = "server.max_concurrent_jobs"
+	SettingFailHopelessRatio   = "server.fail_hopeless_ratio"
+	SettingDeferRecoveryVols   = "server.defer_recovery_vols"
+	SettingBandwidthGlobalBPS  = "bandwidth.global_bytes_per_sec"
+)
+
 // Runtime holds runtime-mutable config that the UI can edit at any
 // time and that the server consults on every request.
 //
-// Currently this is just URLBase, but the shape is set up so future
-// runtime-mutable settings (LogLevel, etc.) can land without
-// repeating the persistence + invalidation dance.
-//
-// Mutations: SetURLBase rewrites both the in-memory value and the
-// config file on disk in a single critical section. Callers either
-// see the old value or the new one — never a half-applied state.
+// Persistence lives in the SQLite `settings` table (one row per key),
+// loaded once at construction and written through on every Set*. The
+// in-memory mirror under rt.mu is the hot-path read; the DB write only
+// happens on operator-driven changes (rare).
 type Runtime struct {
 	mu                sync.RWMutex
-	configPath        string // empty disables persistence (used in tests)
-	urlBase           string
-	maxConcurrentJobs int
-	failHopelessRatio float64
-	deferRecoveryVols bool
-	// listeners are notified on max-concurrent changes so the
-	// orchestrator can drain its pending-jobs backlog when the cap
-	// goes up.
-	listeners []func(maxConcurrent int)
+	store             SettingsStore
+	urlBase            string
+	maxConcurrentJobs  int
+	failHopelessRatio  float64
+	deferRecoveryVols  bool
+	bandwidthGlobalBPS int64
+	listeners          []func(maxConcurrent int)
+	bandwidthListeners []func(bytesPerSec int64)
 }
 
-// NewRuntime constructs a Runtime seeded from the given config and
-// bound to the config file at configPath. Pass an empty path to
-// disable persistence (writes become in-memory only).
-func NewRuntime(cfg config.Config, configPath string) *Runtime {
-	return &Runtime{
-		configPath:        configPath,
-		urlBase:           cfg.Server.URLBase,
-		maxConcurrentJobs: cfg.Server.MaxConcurrentJobs,
-		failHopelessRatio: cfg.Server.FailHopelessRatio,
-		deferRecoveryVols: cfg.Server.DeferRecoveryVols,
+// NewRuntime constructs a Runtime backed by store. Initial values are
+// read from store; missing keys take their value from cfg (one-time
+// migration from config.toml on first run) and are written back so
+// the DB becomes authoritative. Returns the populated Runtime and a
+// non-nil error only if the initial read fails.
+//
+// Pass a nil store to use an ephemeral in-memory store — useful in
+// tests that don't open the DB. The cfg defaults still apply.
+func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, logger *slog.Logger) (*Runtime, error) {
+	if logger == nil {
+		logger = slog.Default()
 	}
+	if store == nil {
+		store = NewMemoryStore()
+	}
+	rt := &Runtime{store: store}
+
+	urlBase, err := store.GetStringOr(ctx, SettingURLBase, cfg.Server.URLBase)
+	if err != nil {
+		return nil, err
+	}
+	maxConc, err := store.GetIntOr(ctx, SettingMaxConcurrentJobs, cfg.Server.MaxConcurrentJobs)
+	if err != nil {
+		return nil, err
+	}
+	failHop, err := store.GetFloatOr(ctx, SettingFailHopelessRatio, cfg.Server.FailHopelessRatio)
+	if err != nil {
+		return nil, err
+	}
+	deferVols, err := store.GetBoolOr(ctx, SettingDeferRecoveryVols, cfg.Server.DeferRecoveryVols)
+	if err != nil {
+		return nil, err
+	}
+	bwGlobal, err := store.GetIntOr(ctx, SettingBandwidthGlobalBPS, int(cfg.Bandwidth.GlobalBytesPerSec))
+	if err != nil {
+		return nil, err
+	}
+
+	// Idempotent backfill: writing what we just read is a no-op for
+	// existing rows and seeds the row for missing keys. Cheap on every
+	// startup; fully decouples future runtime from config.toml.
+	if err := store.Set(ctx, SettingURLBase, urlBase); err != nil {
+		logger.Warn("runtime: seed url_base", "err", err)
+	}
+	if err := store.SetInt(ctx, SettingMaxConcurrentJobs, maxConc); err != nil {
+		logger.Warn("runtime: seed max_concurrent_jobs", "err", err)
+	}
+	if err := store.SetFloat(ctx, SettingFailHopelessRatio, failHop); err != nil {
+		logger.Warn("runtime: seed fail_hopeless_ratio", "err", err)
+	}
+	if err := store.SetBool(ctx, SettingDeferRecoveryVols, deferVols); err != nil {
+		logger.Warn("runtime: seed defer_recovery_vols", "err", err)
+	}
+	if err := store.SetInt(ctx, SettingBandwidthGlobalBPS, bwGlobal); err != nil {
+		logger.Warn("runtime: seed bandwidth_global_bps", "err", err)
+	}
+
+	rt.urlBase = urlBase
+	rt.maxConcurrentJobs = maxConc
+	rt.failHopelessRatio = failHop
+	rt.deferRecoveryVols = deferVols
+	rt.bandwidthGlobalBPS = int64(bwGlobal)
+	return rt, nil
 }
 
-// DeferRecoveryVols reports whether new jobs should hide PAR2
-// per-slice recovery files from initial download (SAB-style).
-func (rt *Runtime) DeferRecoveryVols() bool {
+// BandwidthGlobalCap returns the persisted global download cap in
+// bytes/second. 0 = uncapped.
+func (rt *Runtime) BandwidthGlobalCap() int64 {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
-	return rt.deferRecoveryVols
+	return rt.bandwidthGlobalBPS
 }
 
-// SetDeferRecoveryVols persists v and returns the stored value. Takes
-// effect on newly-added jobs; in-flight jobs keep their existing
-// fetch_recovery_vols flag.
-func (rt *Runtime) SetDeferRecoveryVols(v bool) (bool, error) {
-	rt.mu.Lock()
-	if rt.configPath != "" {
-		cfg, err := config.LoadOrCreate(rt.configPath)
-		if err != nil {
-			rt.mu.Unlock()
-			return false, fmt.Errorf("load config: %w", err)
-		}
-		cfg.Server.DeferRecoveryVols = v
-		if err := config.Save(rt.configPath, cfg); err != nil {
-			rt.mu.Unlock()
-			return false, fmt.Errorf("save config: %w", err)
-		}
+// SetBandwidthGlobalCap persists the new global cap and fans the value
+// out to registered listeners (the download limiter). Negative values
+// are clamped to 0 (uncapped).
+func (rt *Runtime) SetBandwidthGlobalCap(v int64) (int64, error) {
+	if v < 0 {
+		v = 0
 	}
-	rt.deferRecoveryVols = v
+	if err := rt.store.SetInt(context.Background(), SettingBandwidthGlobalBPS, int(v)); err != nil {
+		return 0, fmt.Errorf("persist bandwidth_global_bps: %w", err)
+	}
+	rt.mu.Lock()
+	rt.bandwidthGlobalBPS = v
+	listeners := append([]func(int64){}, rt.bandwidthListeners...)
 	rt.mu.Unlock()
+	for _, l := range listeners {
+		l(v)
+	}
 	return v, nil
+}
+
+// OnBandwidthGlobalChange registers fn for invocation whenever the
+// global bandwidth cap changes. The download.Limiter subscribes so
+// changes take effect immediately on the next dispatch.
+func (rt *Runtime) OnBandwidthGlobalChange(fn func(bytesPerSec int64)) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.bandwidthListeners = append(rt.bandwidthListeners, fn)
 }
 
 // FailHopelessRatio returns the SAB fail_hopeless threshold (0-1).
@@ -89,20 +171,32 @@ func (rt *Runtime) SetFailHopelessRatio(v float64) (float64, error) {
 	if v < 0 || v >= 1 {
 		return 0, fmt.Errorf("fail_hopeless_ratio %v must be in [0, 1)", v)
 	}
-	rt.mu.Lock()
-	if rt.configPath != "" {
-		cfg, err := config.LoadOrCreate(rt.configPath)
-		if err != nil {
-			rt.mu.Unlock()
-			return 0, fmt.Errorf("load config: %w", err)
-		}
-		cfg.Server.FailHopelessRatio = v
-		if err := config.Save(rt.configPath, cfg); err != nil {
-			rt.mu.Unlock()
-			return 0, fmt.Errorf("save config: %w", err)
-		}
+	if err := rt.store.SetFloat(context.Background(), SettingFailHopelessRatio, v); err != nil {
+		return 0, fmt.Errorf("persist fail_hopeless_ratio: %w", err)
 	}
+	rt.mu.Lock()
 	rt.failHopelessRatio = v
+	rt.mu.Unlock()
+	return v, nil
+}
+
+// DeferRecoveryVols reports whether new jobs should hide PAR2
+// per-slice recovery files from initial download (SAB-style).
+func (rt *Runtime) DeferRecoveryVols() bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.deferRecoveryVols
+}
+
+// SetDeferRecoveryVols persists v and returns the stored value. Takes
+// effect on newly-added jobs; in-flight jobs keep their existing
+// fetch_recovery_vols flag.
+func (rt *Runtime) SetDeferRecoveryVols(v bool) (bool, error) {
+	if err := rt.store.SetBool(context.Background(), SettingDeferRecoveryVols, v); err != nil {
+		return false, fmt.Errorf("persist defer_recovery_vols: %w", err)
+	}
+	rt.mu.Lock()
+	rt.deferRecoveryVols = v
 	rt.mu.Unlock()
 	return v, nil
 }
@@ -132,20 +226,10 @@ func (rt *Runtime) SetMaxConcurrentJobs(v int) (int, error) {
 	if v > 1024 {
 		return 0, fmt.Errorf("max_concurrent_jobs %d unreasonably high", v)
 	}
-
-	rt.mu.Lock()
-	if rt.configPath != "" {
-		cfg, err := config.LoadOrCreate(rt.configPath)
-		if err != nil {
-			rt.mu.Unlock()
-			return 0, fmt.Errorf("load config: %w", err)
-		}
-		cfg.Server.MaxConcurrentJobs = v
-		if err := config.Save(rt.configPath, cfg); err != nil {
-			rt.mu.Unlock()
-			return 0, fmt.Errorf("save config: %w", err)
-		}
+	if err := rt.store.SetInt(context.Background(), SettingMaxConcurrentJobs, v); err != nil {
+		return 0, fmt.Errorf("persist max_concurrent_jobs: %w", err)
 	}
+	rt.mu.Lock()
 	rt.maxConcurrentJobs = v
 	listeners := append([]func(int){}, rt.listeners...)
 	rt.mu.Unlock()
@@ -167,7 +251,7 @@ func (rt *Runtime) OnMaxConcurrentJobsChange(fn func(maxConcurrent int)) {
 	rt.listeners = append(rt.listeners, fn)
 }
 
-// SetURLBase validates v, persists it to the config file, and
+// SetURLBase validates v, persists it to the settings store, and
 // publishes the new value to readers. Returns the normalised value
 // (trailing slash stripped) on success.
 //
@@ -180,26 +264,15 @@ func (rt *Runtime) SetURLBase(v string) (string, error) {
 		if !strings.HasPrefix(v, "/") {
 			return "", fmt.Errorf("url_base %q must start with /", v)
 		}
-		// Reject obviously broken values; further validation
-		// happens via config.Validate when reloading.
 		if strings.Contains(v, "//") {
 			return "", fmt.Errorf("url_base %q must not contain consecutive slashes", v)
 		}
 	}
-
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-
-	if rt.configPath != "" {
-		cfg, err := config.LoadOrCreate(rt.configPath)
-		if err != nil {
-			return "", fmt.Errorf("load config: %w", err)
-		}
-		cfg.Server.URLBase = v
-		if err := config.Save(rt.configPath, cfg); err != nil {
-			return "", fmt.Errorf("save config: %w", err)
-		}
+	if err := rt.store.Set(context.Background(), SettingURLBase, v); err != nil {
+		return "", fmt.Errorf("persist url_base: %w", err)
 	}
+	rt.mu.Lock()
 	rt.urlBase = v
+	rt.mu.Unlock()
 	return v, nil
 }

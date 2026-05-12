@@ -221,15 +221,26 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	})
 	byteFlusher := appdownload.NewByteFlusher(byteAccounter, serverRepo, 10*time.Second, logger)
 
-	// Bandwidth limiter: global cap from config, per-server caps from
-	// the registry. Per-server caps applied at runtime via SetServerCap
-	// for every enabled server.
-	bandwidthLimiter := appdownload.NewLimiter(cfg.Bandwidth.GlobalBytesPerSec)
+	settingsRepo := sqlite.NewSettingsRepo(db)
+	runtime, err := server.NewRuntime(ctx, settingsRepo, cfg, logger)
+	if err != nil {
+		_ = bus.Close()
+		_ = db.Close()
+		return nil, fmt.Errorf("build runtime: %w", err)
+	}
+
+	// Bandwidth limiter: global cap from the runtime (which seeded
+	// from cfg + SQLite settings), per-server caps from the registry.
+	// Per-server caps applied via SetServerCap for every enabled
+	// server.
+	bandwidthLimiter := appdownload.NewLimiter(runtime.BandwidthGlobalCap())
 	for id, p := range pools {
 		bandwidthLimiter.SetServerCap(id, p.Server().BandwidthBytesPerSec())
 	}
-
-	runtime := server.NewRuntime(cfg, bo.configPath)
+	// Live: when the operator changes the global cap from Settings,
+	// fan it out to the in-memory token bucket so the next dispatch
+	// honours the new rate.
+	runtime.OnBandwidthGlobalChange(func(v int64) { bandwidthLimiter.SetGlobalCap(v) })
 	orch := appdownload.NewOrchestratorService(appdownload.OrchestratorServiceParams{
 		Repo:          jobRepo,
 		Bus:           bus,
@@ -410,7 +421,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			SABBase:  buildSABBase(cfg.Server.Listen),
 			URLBase:  cfg.Server.URLBase,
 		},
-		Bandwidth: bandwidthLimiter,
+		Bandwidth: bandwidthAdmin{runtime: runtime},
 		LogHub:    bo.logHub,
 		Logger:    logger,
 		Runtime:   runtime,
@@ -480,6 +491,22 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		HTTPServer:    httpSrv,
 		dataDirLock:   lock,
 	}, nil
+}
+
+// bandwidthAdmin adapts *server.Runtime to rest.BandwidthAdmin. The
+// REST handler asks "what's the cap" / "set the cap"; Runtime owns
+// persistence and fans changes out to the in-memory limiter via its
+// OnBandwidthGlobalChange listener.
+type bandwidthAdmin struct {
+	runtime *server.Runtime
+}
+
+func (a bandwidthAdmin) GlobalCap() int64 {
+	return a.runtime.BandwidthGlobalCap()
+}
+
+func (a bandwidthAdmin) SetGlobalCap(v int64) {
+	_, _ = a.runtime.SetBandwidthGlobalCap(v)
 }
 
 func closePools(pools map[domainserver.ServerID]*nntp.Pool) {
