@@ -36,12 +36,15 @@ export default function JobDetail() {
   const refresh = async () => {
     setLoading(true);
     try {
-      const [queue, evResp] = await Promise.all([
-        api.listQueue(true),
+      // Fetch the job by id directly — the queue list endpoint strips
+      // files for perf, so we need the dedicated detail endpoint to
+      // render the per-file breakdown. Falls back to null on 404 so
+      // a removed-mid-poll job doesn't crash the page.
+      const [jobResp, evResp] = await Promise.all([
+        api.getJob(id).catch(() => ({ job: null as Job | null })),
         api.jobEvents(id),
       ]);
-      const j = (queue.jobs ?? []).find((x) => x.id === id) ?? null;
-      setJob(j);
+      setJob(jobResp.job);
       setEvents(evResp.events ?? []);
       setError(null);
     } catch (e) {

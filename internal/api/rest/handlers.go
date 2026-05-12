@@ -150,6 +150,7 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 
 	// Queue.
 	register("GET", "/api/v1/queue", h.listQueue)
+	register("GET", "/api/v1/queue/{id}", h.getJob)
 	register("POST", "/api/v1/queue/nzb", h.addNZB)
 	register("POST", "/api/v1/queue/{id}/pause", h.pauseJob)
 	register("POST", "/api/v1/queue/{id}/resume", h.resumeJob)
@@ -360,6 +361,24 @@ func (h *Handlers) jobEvents(w http.ResponseWriter, r *http.Request) {
 	// We surface the envelope shape directly; the UI knows the
 	// internal layout because it consumes the same shapes via SSE.
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+// getJob returns a single job with full file + segment hydration —
+// the queue list path was changed to JobsOnly for perf and no longer
+// embeds files, so the JobDetail page relies on this endpoint to
+// render the per-file breakdown.
+func (h *Handlers) getJob(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	job, err := h.Queue.Get(r.Context(), download.JobID(id))
+	if err != nil {
+		h.writeError(w, statusFor(err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"job": jobToDTO(job)})
 }
 
 func (h *Handlers) pauseJob(w http.ResponseWriter, r *http.Request) {

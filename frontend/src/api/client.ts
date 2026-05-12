@@ -120,6 +120,12 @@ export const api = {
     const qs = includeAll ? "?include=all" : "";
     return req("GET", "/api/v1/queue" + qs);
   },
+  // getJob returns a job with files + segments populated. Used by the
+  // detail page; the list endpoint strips files for perf reasons so
+  // we can't reuse its payload to render the file panel.
+  getJob(id: number): Promise<{ job: Job }> {
+    return req("GET", `/api/v1/queue/${id}`);
+  },
   uploadNZB(file: File, category?: string): Promise<{ job_id: number; duplicate?: boolean }> {
     const fd = new FormData();
     fd.append("nzb", file);
