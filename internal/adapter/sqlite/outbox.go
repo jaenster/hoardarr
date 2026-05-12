@@ -37,6 +37,8 @@ type OutboxBus struct {
 	backoffBase         time.Duration
 	backoffMax          time.Duration
 	maxDeliveryAttempts int
+	pruneRetention      time.Duration
+	pruneInterval       time.Duration
 
 	now func() time.Time // injectable for tests
 
@@ -44,11 +46,12 @@ type OutboxBus struct {
 	byName  map[string]*outboxSub
 	byTopic map[string]map[string]*outboxSub
 
-	stopMu sync.Mutex
-	stopped bool
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel context.CancelFunc
+	stopMu       sync.Mutex
+	stopped      bool
+	prunerOnce   sync.Once
+	wg           sync.WaitGroup
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // Compile-time check.
@@ -79,6 +82,22 @@ type OutboxOptions struct {
 	// or accept the loss. Default: 20.
 	MaxDeliveryAttempts int
 
+	// PruneRetention is how long delivered outbox_subs rows are kept
+	// before the background pruner deletes them. Older rows are
+	// reaped together with any outbox rows that have no remaining
+	// outbox_subs references. Default 1 hour — long enough to debug
+	// recent activity, short enough to keep the tables lean.
+	//
+	// Without pruning the bus accretes one row per (subscription,
+	// event) forever; the dispatcher's working set then grows with
+	// total events processed, which on a busy installation reaches
+	// millions per day and drags every query through huge indexes.
+	PruneRetention time.Duration
+
+	// PruneInterval is how often the background pruner runs.
+	// Default 1 minute.
+	PruneInterval time.Duration
+
 	// Logger is the slog used for dispatcher diagnostics. Defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -102,6 +121,12 @@ func (o OutboxOptions) withDefaults() OutboxOptions {
 	}
 	if o.MaxDeliveryAttempts == 0 {
 		o.MaxDeliveryAttempts = 20
+	}
+	if o.PruneRetention == 0 {
+		o.PruneRetention = 1 * time.Hour
+	}
+	if o.PruneInterval == 0 {
+		o.PruneInterval = 1 * time.Minute
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -127,11 +152,88 @@ func NewOutboxBus(db *DB, opts OutboxOptions) *OutboxBus {
 		backoffBase:         opts.BackoffBase,
 		backoffMax:          opts.BackoffMax,
 		maxDeliveryAttempts: opts.MaxDeliveryAttempts,
+		pruneRetention:      opts.PruneRetention,
+		pruneInterval:       opts.PruneInterval,
 		now:                 opts.Now,
 		byName:              make(map[string]*outboxSub),
 		byTopic:             make(map[string]map[string]*outboxSub),
 		ctx:                 ctx,
 		cancel:              cancel,
+	}
+}
+
+// pruneLoop is the background reaper. Deletes delivered outbox_subs
+// rows older than pruneRetention and orphaned outbox rows that no
+// subscription still references. Lazy-started on first Subscribe so
+// tests that build an OutboxBus without ever subscribing don't see
+// a stray goroutine.
+func (b *OutboxBus) pruneLoop() {
+	defer b.wg.Done()
+	// Run once on entry — clears any stale backlog from a previous
+	// run before the periodic ticker kicks in.
+	b.prune()
+	t := time.NewTicker(b.pruneInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-t.C:
+			b.prune()
+		}
+	}
+}
+
+// prune deletes delivered outbox_subs rows older than the retention
+// window and orphaned outbox rows. Each DELETE is bounded so we
+// don't lock SQLite for seconds on a huge first run.
+func (b *OutboxBus) prune() {
+	cutoff := b.now().Add(-b.pruneRetention).UnixMilli()
+	// Subs first — the outbox FK has ON DELETE CASCADE, so any outbox
+	// rows that lose all referencing subs would cascade; but in
+	// practice outbox is the parent. We use a separate orphan-sweep
+	// below to delete outbox rows that have NO outbox_subs left.
+	for {
+		res, err := b.db.ExecContext(b.ctx, `
+			DELETE FROM outbox_subs
+			WHERE delivered_at IS NOT NULL AND delivered_at < ?
+			LIMIT 5000
+		`, cutoff)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			b.logger.Warn("outbox prune subs", "err", err)
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			break
+		}
+	}
+	// Orphan outbox rows — events with no subscribers left to deliver.
+	// Same bounded-loop pattern.
+	for {
+		res, err := b.db.ExecContext(b.ctx, `
+			DELETE FROM outbox
+			WHERE id IN (
+				SELECT o.id FROM outbox o
+				LEFT JOIN outbox_subs s ON s.event_id = o.id
+				WHERE s.event_id IS NULL
+				LIMIT 5000
+			)
+		`)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			b.logger.Warn("outbox prune orphans", "err", err)
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			break
+		}
 	}
 }
 
@@ -241,6 +343,14 @@ func (b *OutboxBus) Subscribe(name string, topic string, handler event.Handler) 
 		defer b.wg.Done()
 		b.dispatchLoop(sub)
 	}()
+
+	// Lazy-start the background pruner on the first Subscribe. Tests
+	// that build an OutboxBus without subscribing don't pay the cost.
+	b.prunerOnce.Do(func() {
+		b.wg.Add(1)
+		go b.pruneLoop()
+	})
+
 	return sub, nil
 }
 
