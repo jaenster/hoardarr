@@ -525,9 +525,8 @@ function formatBytesShort(n: number): string {
 function CategoriesSection() {
   const [cats, setCats] = useState<Category[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [dir, setDir] = useState("");
-  const [priority, setPriority] = useState(0);
+  const [editing, setEditing] = useState<Category | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   const refresh = async () => {
     try {
@@ -543,35 +542,6 @@ function CategoriesSection() {
     void refresh();
   }, []);
 
-  const add = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await api.upsertCategory({ name: name.trim(), dir: dir.trim(), priority });
-      setName("");
-      setDir("");
-      setPriority(0);
-      await refresh();
-    } catch (e) {
-      if (e instanceof ApiError) {
-        const body = e.body as { error?: string } | null;
-        setError(body?.error ?? e.message);
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    }
-  };
-
-  const remove = async (n: string) => {
-    if (n === "*") return;
-    if (!confirm(`Remove category "${n}"?`)) return;
-    try {
-      await api.removeCategory(n);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
   return (
     <Panel
       title="Categories"
@@ -584,81 +554,174 @@ function CategoriesSection() {
     >
       {error && <p className="text-err">{error}</p>}
 
-      <table className="table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Subdirectory</th>
-            <th>Priority</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {cats.map((c) => (
-            <tr key={c.name}>
-              <td>
-                {c.name === "*" ? (
-                  <>
-                    <span className="queue-row-name">{c.name}</span>{" "}
-                    <span className="muted">(default)</span>
-                  </>
-                ) : (
-                  c.name
-                )}
-              </td>
-              <td className="muted">{c.dir || "—"}</td>
-              <td className="muted">{c.priority}</td>
-              <td className="queue-row-actions">
-                {c.name !== "*" && (
-                  <button
-                    type="button"
-                    className="icon-btn icon-btn-danger"
-                    aria-label="Remove category"
-                    onClick={() => void remove(c.name)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <CardGrid onAdd={() => setAddOpen(true)} addLabel="Add category">
+        {cats.map((c) => (
+          <EntityCard
+            key={c.name}
+            title={c.name === "*" ? "* (default)" : c.name}
+            ariaLabel={`Edit ${c.name}`}
+            badge={
+              <span className="muted entity-card-meta">
+                {c.dir || "no subdir"}
+                {c.priority !== 0 ? ` · priority ${c.priority}` : ""}
+              </span>
+            }
+            onClick={() => setEditing(c)}
+          />
+        ))}
+      </CardGrid>
 
-      <form className="settings-form" onSubmit={add}>
-        <h3>Add category</h3>
+      {editing && (
+        <Modal
+          title={editing.name === "*" ? "Edit default category" : `Edit ${editing.name}`}
+          onClose={() => setEditing(null)}
+        >
+          <CategoryForm
+            category={editing}
+            onClose={() => setEditing(null)}
+            onSaved={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+            onDeleted={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+          />
+        </Modal>
+      )}
+
+      {addOpen && (
+        <Modal title="Add category" onClose={() => setAddOpen(false)}>
+          <CategoryForm
+            category={null}
+            onClose={() => setAddOpen(false)}
+            onSaved={async () => {
+              setAddOpen(false);
+              await refresh();
+            }}
+          />
+        </Modal>
+      )}
+    </Panel>
+  );
+}
+
+// CategoryForm is the unified add/edit form. Name is locked in edit
+// mode (it's the PK) and the default category (`*`) can't be deleted.
+function CategoryForm({
+  category,
+  onClose,
+  onSaved,
+  onDeleted,
+}: {
+  category: Category | null;
+  onClose: () => void;
+  onSaved: () => void | Promise<void>;
+  onDeleted?: () => void | Promise<void>;
+}) {
+  const isEdit = category !== null;
+  const isDefault = category?.name === "*";
+  const [name, setName] = useState(category?.name ?? "");
+  const [dir, setDir] = useState(category?.dir ?? "");
+  const [priority, setPriority] = useState(category?.priority ?? 0);
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    setErr(null);
+    try {
+      await api.upsertCategory({
+        name: (category?.name ?? name).trim(),
+        dir: dir.trim(),
+        priority,
+      });
+      await onSaved();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setErr(body?.error ?? e.message);
+      } else {
+        setErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const remove = async () => {
+    if (!category || !onDeleted || isDefault) return;
+    if (!confirm(`Remove category "${category.name}"?`)) return;
+    try {
+      await api.removeCategory(category.name);
+      await onDeleted();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const valid = isEdit || name.trim().length > 0;
+
+  return (
+    <form className="settings-form is-modal" onSubmit={submit}>
+      {!isEdit && (
         <div className="settings-row">
           <label className="settings-field">
             <span>Name</span>
-            <input value={name} onChange={(e) => setName(e.target.value)} />
-          </label>
-          <label className="settings-field">
-            <span>Subdirectory</span>
             <input
-              value={dir}
-              onChange={(e) => setDir(e.target.value)}
-              placeholder="e.g. movies"
-            />
-          </label>
-          <label className="settings-field settings-field-narrow">
-            <span>Priority</span>
-            <input
-              type="number"
-              value={priority}
-              onChange={(e) => setPriority(Number(e.target.value))}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              autoFocus
+              required
             />
           </label>
         </div>
-        <Button
-          variant="primary"
-          type="submit"
-          icon={<Plus size={14} />}
-          disabled={name.trim().length === 0}
-        >
-          Add category
-        </Button>
-      </form>
-    </Panel>
+      )}
+      <div className="settings-row">
+        <label className="settings-field">
+          <span>Subdirectory</span>
+          <input
+            value={dir}
+            onChange={(e) => setDir(e.target.value)}
+            placeholder="e.g. movies"
+            autoFocus={isEdit}
+          />
+        </label>
+        <label className="settings-field settings-field-narrow">
+          <span>Priority</span>
+          <input
+            type="number"
+            value={priority}
+            onChange={(e) => setPriority(Number(e.target.value))}
+          />
+        </label>
+      </div>
+      {err && <p className="text-err">{err}</p>}
+      <div className="settings-form-actions is-modal-actions">
+        {isEdit && !isDefault && onDeleted ? (
+          <Button
+            variant="ghost"
+            type="button"
+            icon={<Trash2 size={14} />}
+            onClick={() => void remove()}
+          >
+            Delete
+          </Button>
+        ) : (
+          <span />
+        )}
+        <div className="settings-form-actions-right">
+          <Button variant="ghost" type="button" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" type="submit" disabled={submitting || !valid}>
+            {submitting ? "Saving…" : isEdit ? "Save changes" : "Add category"}
+          </Button>
+        </div>
+      </div>
+    </form>
   );
 }
 
