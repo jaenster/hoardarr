@@ -207,6 +207,7 @@ export const api = {
     url_base?: string;
     max_concurrent_jobs?: number;
     fail_hopeless_ratio?: number;
+    defer_recovery_vols?: boolean;
   }): Promise<void> {
     return jsonReq("PUT", "/api/v1/config/general", body);
   },

@@ -45,8 +45,9 @@ func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
 		INSERT INTO jobs(
 			nzb_hash, name, category, priority, queue_order, source, state,
 			total_bytes, done_bytes, failed_bytes,
-			added_at, started_at, finished_at, error_msg, nzb_blob
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			added_at, started_at, finished_at, error_msg, nzb_blob,
+			fetch_recovery_vols
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		j.NZBHash(), j.Name(), j.Category(), j.Priority(), j.QueueOrder(), j.Source(), string(j.State()),
 		j.TotalBytes(), j.DoneBytes(), j.FailedBytes(),
@@ -54,6 +55,7 @@ func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
 		nullableMillis(j.StartedAt()), nullableMillis(j.FinishedAt()),
 		nullableString(j.ErrorMsg()),
 		j.NZBBlob(),
+		boolToInt(j.FetchRecoveryVols()),
 	)
 	if err != nil {
 		if isNZBHashUniqueViolation(err) {
@@ -80,13 +82,15 @@ func (r *JobRepo) update(ctx context.Context, j *download.Job) error {
 		UPDATE jobs SET
 			name = ?, category = ?, priority = ?, queue_order = ?, state = ?,
 			total_bytes = ?, done_bytes = ?, failed_bytes = ?,
-			started_at = ?, finished_at = ?, error_msg = ?
+			started_at = ?, finished_at = ?, error_msg = ?,
+			fetch_recovery_vols = ?
 		WHERE id = ?
 	`,
 		j.Name(), j.Category(), j.Priority(), j.QueueOrder(), string(j.State()),
 		j.TotalBytes(), j.DoneBytes(), j.FailedBytes(),
 		nullableMillis(j.StartedAt()), nullableMillis(j.FinishedAt()),
 		nullableString(j.ErrorMsg()),
+		boolToInt(j.FetchRecoveryVols()),
 		int64(j.ID()),
 	)
 	if err != nil {
@@ -103,12 +107,12 @@ func (r *JobRepo) insertFile(ctx context.Context, f *download.File) error {
 	res, err := r.db.ExecCtx(ctx, `
 		INSERT INTO files(
 			job_id, filename, poster, groups, size_bytes, state,
-			segment_count, segments_done, is_par2
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			segment_count, segments_done, is_par2, is_recovery_vol
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		int64(f.JobID()), f.Filename(), nullableString(f.Poster()), string(groupsJSON),
 		f.SizeBytes(), string(f.State()),
-		f.SegmentCount(), f.SegmentsDone(), boolToInt(f.IsPar2()),
+		f.SegmentCount(), f.SegmentsDone(), boolToInt(f.IsPar2()), boolToInt(f.IsRecoveryVol()),
 	)
 	if err != nil {
 		return fmt.Errorf("insert file %q: %w", f.Filename(), err)
@@ -481,8 +485,9 @@ func (r *JobRepo) loadFilesShallow(ctx context.Context, j *download.Job) error {
 			segmentCount  int
 			segmentsDone  int
 			isPar2        int
+			isRecoveryVol int
 		)
-		if err := rows.Scan(&fid, &jobID, &filename, &poster, &groupsJSON, &sizeBytes, &state, &segmentCount, &segmentsDone, &isPar2); err != nil {
+		if err := rows.Scan(&fid, &jobID, &filename, &poster, &groupsJSON, &sizeBytes, &state, &segmentCount, &segmentsDone, &isPar2, &isRecoveryVol); err != nil {
 			return fmt.Errorf("scan file: %w", err)
 		}
 		var groups []string
@@ -490,16 +495,17 @@ func (r *JobRepo) loadFilesShallow(ctx context.Context, j *download.Job) error {
 			_ = json.Unmarshal([]byte(groupsJSON), &groups)
 		}
 		files = append(files, download.HydrateFile(download.HydrateFileParams{
-			ID:           download.FileID(fid),
-			JobID:        download.JobID(jobID),
-			Filename:     filename,
-			Poster:       poster.String,
-			Groups:       groups,
-			SizeBytes:    sizeBytes,
-			State:        download.FileState(state),
-			SegmentCount: segmentCount,
-			SegmentsDone: segmentsDone,
-			IsPar2:       isPar2 != 0,
+			ID:            download.FileID(fid),
+			JobID:         download.JobID(jobID),
+			Filename:      filename,
+			Poster:        poster.String,
+			Groups:        groups,
+			SizeBytes:     sizeBytes,
+			State:         download.FileState(state),
+			SegmentCount:  segmentCount,
+			SegmentsDone:  segmentsDone,
+			IsPar2:        isPar2 != 0,
+			IsRecoveryVol: isRecoveryVol != 0,
 			// Segments intentionally nil — shallow load.
 		}))
 	}
@@ -529,8 +535,9 @@ func (r *JobRepo) loadFiles(ctx context.Context, j *download.Job) error {
 			segmentCount  int
 			segmentsDone  int
 			isPar2        int
+			isRecoveryVol int
 		)
-		if err := rows.Scan(&fid, &jobID, &filename, &poster, &groupsJSON, &sizeBytes, &state, &segmentCount, &segmentsDone, &isPar2); err != nil {
+		if err := rows.Scan(&fid, &jobID, &filename, &poster, &groupsJSON, &sizeBytes, &state, &segmentCount, &segmentsDone, &isPar2, &isRecoveryVol); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan file: %w", err)
 		}
@@ -539,16 +546,17 @@ func (r *JobRepo) loadFiles(ctx context.Context, j *download.Job) error {
 			_ = json.Unmarshal([]byte(groupsJSON), &groups)
 		}
 		f := download.HydrateFile(download.HydrateFileParams{
-			ID:           download.FileID(fid),
-			JobID:        download.JobID(jobID),
-			Filename:     filename,
-			Poster:       poster.String,
-			Groups:       groups,
-			SizeBytes:    sizeBytes,
-			State:        download.FileState(state),
-			SegmentCount: segmentCount,
-			SegmentsDone: segmentsDone,
-			IsPar2:       isPar2 != 0,
+			ID:            download.FileID(fid),
+			JobID:         download.JobID(jobID),
+			Filename:      filename,
+			Poster:        poster.String,
+			Groups:        groups,
+			SizeBytes:     sizeBytes,
+			State:         download.FileState(state),
+			SegmentCount:  segmentCount,
+			SegmentsDone:  segmentsDone,
+			IsPar2:        isPar2 != 0,
+			IsRecoveryVol: isRecoveryVol != 0,
 			// Segments populated below.
 		})
 		fileRows = append(fileRows, fileRow{f: f, fid: fid})
@@ -579,17 +587,18 @@ func (r *JobRepo) loadFiles(ctx context.Context, j *download.Job) error {
 // private; the domain exposes Segments() as a copy. Use HydrateFile.
 func rehydrateWithSegments(f *download.File, segs []*download.Segment) *download.File {
 	return download.HydrateFile(download.HydrateFileParams{
-		ID:           f.ID(),
-		JobID:        f.JobID(),
-		Filename:     f.Filename(),
-		Poster:       f.Poster(),
-		Groups:       f.Groups(),
-		SizeBytes:    f.SizeBytes(),
-		State:        f.State(),
-		SegmentCount: f.SegmentCount(),
-		SegmentsDone: f.SegmentsDone(),
-		IsPar2:       f.IsPar2(),
-		Segments:     segs,
+		ID:            f.ID(),
+		JobID:         f.JobID(),
+		Filename:      f.Filename(),
+		Poster:        f.Poster(),
+		Groups:        f.Groups(),
+		SizeBytes:     f.SizeBytes(),
+		State:         f.State(),
+		SegmentCount:  f.SegmentCount(),
+		SegmentsDone:  f.SegmentsDone(),
+		IsPar2:        f.IsPar2(),
+		IsRecoveryVol: f.IsRecoveryVol(),
+		Segments:      segs,
 	})
 }
 
@@ -597,23 +606,24 @@ func rehydrateWithSegments(f *download.File, segs []*download.Segment) *download
 // loaded.
 func rehydrateJob(j *download.Job, files []*download.File) *download.Job {
 	return download.HydrateJob(download.HydrateJobParams{
-		ID:          j.ID(),
-		NZBHash:     j.NZBHash(),
-		Name:        j.Name(),
-		Category:    j.Category(),
-		Priority:    j.Priority(),
-		QueueOrder:  j.QueueOrder(),
-		Source:      j.Source(),
-		State:       j.State(),
-		TotalBytes:  j.TotalBytes(),
-		DoneBytes:   j.DoneBytes(),
-		FailedBytes: j.FailedBytes(),
-		AddedAt:     j.AddedAt(),
-		StartedAt:   j.StartedAt(),
-		FinishedAt:  j.FinishedAt(),
-		ErrorMsg:    j.ErrorMsg(),
-		NZBBlob:     j.NZBBlob(),
-		Files:       files,
+		ID:                j.ID(),
+		NZBHash:           j.NZBHash(),
+		Name:              j.Name(),
+		Category:          j.Category(),
+		Priority:          j.Priority(),
+		QueueOrder:        j.QueueOrder(),
+		Source:            j.Source(),
+		State:             j.State(),
+		TotalBytes:        j.TotalBytes(),
+		DoneBytes:         j.DoneBytes(),
+		FailedBytes:       j.FailedBytes(),
+		AddedAt:           j.AddedAt(),
+		StartedAt:         j.StartedAt(),
+		FinishedAt:        j.FinishedAt(),
+		ErrorMsg:          j.ErrorMsg(),
+		NZBBlob:           j.NZBBlob(),
+		Files:             files,
+		FetchRecoveryVols: j.FetchRecoveryVols(),
 	})
 }
 
@@ -656,7 +666,8 @@ func (r *JobRepo) loadSegments(ctx context.Context, fileID download.FileID) ([]*
 
 const jobColumns = `id, nzb_hash, name, category, priority, queue_order, source, state,
 		total_bytes, done_bytes, failed_bytes,
-		added_at, started_at, finished_at, error_msg, nzb_blob`
+		added_at, started_at, finished_at, error_msg, nzb_blob,
+		fetch_recovery_vols`
 
 const selectJobByID = `SELECT ` + jobColumns + ` FROM jobs WHERE id = ?`
 const selectJobByHash = `SELECT ` + jobColumns + ` FROM jobs WHERE nzb_hash = ?`
@@ -666,7 +677,7 @@ const selectActiveJobs = `SELECT ` + jobColumns + ` FROM jobs
 	ORDER BY priority ASC, queue_order ASC`
 
 const selectFilesForJob = `SELECT id, job_id, filename, poster, groups, size_bytes, state,
-	segment_count, segments_done, is_par2
+	segment_count, segments_done, is_par2, is_recovery_vol
 	FROM files WHERE job_id = ? ORDER BY id ASC`
 
 const selectSegmentsForFile = `SELECT id, file_id, seq_index, message_id, bytes, state,
@@ -687,45 +698,48 @@ func scanJobRows(s serverScanner) (*download.Job, error) {
 
 func scanJobFromScanner(s serverScanner) (*download.Job, error) {
 	var (
-		id          int64
-		nzbHash     string
-		name        string
-		category    string
-		priority    int
-		queueOrder  int64
-		source      string
-		state       string
-		totalBytes  int64
-		doneBytes   int64
-		failedBytes int64
-		addedAt     int64
-		startedAt   sql.NullInt64
-		finishedAt  sql.NullInt64
-		errorMsg    sql.NullString
-		nzbBlob     []byte
+		id              int64
+		nzbHash         string
+		name            string
+		category        string
+		priority        int
+		queueOrder      int64
+		source          string
+		state           string
+		totalBytes      int64
+		doneBytes       int64
+		failedBytes     int64
+		addedAt         int64
+		startedAt       sql.NullInt64
+		finishedAt      sql.NullInt64
+		errorMsg        sql.NullString
+		nzbBlob         []byte
+		fetchRecoveryV  int
 	)
 	if err := s.Scan(&id, &nzbHash, &name, &category, &priority, &queueOrder, &source, &state,
 		&totalBytes, &doneBytes, &failedBytes,
-		&addedAt, &startedAt, &finishedAt, &errorMsg, &nzbBlob); err != nil {
+		&addedAt, &startedAt, &finishedAt, &errorMsg, &nzbBlob,
+		&fetchRecoveryV); err != nil {
 		return nil, err
 	}
 	return download.HydrateJob(download.HydrateJobParams{
-		ID:          download.JobID(id),
-		NZBHash:     nzbHash,
-		Name:        name,
-		Category:    category,
-		Priority:    priority,
-		QueueOrder:  queueOrder,
-		Source:      source,
-		State:       download.JobState(state),
-		TotalBytes:  totalBytes,
-		DoneBytes:   doneBytes,
-		FailedBytes: failedBytes,
-		AddedAt:     time.UnixMilli(addedAt).UTC(),
-		StartedAt:   nullableTime(startedAt),
-		FinishedAt:  nullableTime(finishedAt),
-		ErrorMsg:    errorMsg.String,
-		NZBBlob:     append([]byte(nil), nzbBlob...),
+		ID:                download.JobID(id),
+		NZBHash:           nzbHash,
+		Name:              name,
+		Category:          category,
+		Priority:          priority,
+		QueueOrder:        queueOrder,
+		Source:            source,
+		State:             download.JobState(state),
+		TotalBytes:        totalBytes,
+		DoneBytes:         doneBytes,
+		FailedBytes:       failedBytes,
+		AddedAt:           time.UnixMilli(addedAt).UTC(),
+		StartedAt:         nullableTime(startedAt),
+		FinishedAt:        nullableTime(finishedAt),
+		ErrorMsg:          errorMsg.String,
+		NZBBlob:           append([]byte(nil), nzbBlob...),
+		FetchRecoveryVols: fetchRecoveryV != 0,
 	}), nil
 }
 

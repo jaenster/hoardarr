@@ -79,6 +79,20 @@ func (e JobWaitingForServer) Topic() string         { return TopicPrefix + "job.
 func (e JobWaitingForServer) AggregateID() string   { return jobAggregateID(e.JobID) }
 func (e JobWaitingForServer) OccurredAt() time.Time { return e.At }
 
+// RecoveryVolsRequested fires when the repair worker determines it
+// needs PAR2 recovery-volume files that were deferred at job-add
+// time (because the runtime "defer recovery vols" knob was on). The
+// orchestrator service subscribes and re-enters the runner so the
+// previously-hidden recovery-vol segments get dispatched.
+type RecoveryVolsRequested struct {
+	JobID JobID     `json:"job_id"`
+	At    time.Time `json:"at"`
+}
+
+func (e RecoveryVolsRequested) Topic() string         { return TopicPrefix + "job.recovery_vols_requested" }
+func (e RecoveryVolsRequested) AggregateID() string   { return jobAggregateID(e.JobID) }
+func (e RecoveryVolsRequested) OccurredAt() time.Time { return e.At }
+
 // SegmentDispatched — a worker accepted this segment for fetch.
 // MessageID is included so the UI can show "fetching <msg-id>" on
 // the active job without a follow-up lookup. Empty for legacy

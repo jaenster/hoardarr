@@ -810,6 +810,10 @@ function GeneralSection() {
   const [failHopelessSavedAt, setFailHopelessSavedAt] = useState<number | null>(null);
   const [failHopelessErr, setFailHopelessErr] = useState<string | null>(null);
 
+  // defer_recovery_vols toggle (instant-save).
+  const [deferVolsSaving, setDeferVolsSaving] = useState(false);
+  const [deferVolsErr, setDeferVolsErr] = useState<string | null>(null);
+
   const refresh = async () => {
     try {
       const g = await api.general();
@@ -820,6 +824,24 @@ function GeneralSection() {
       setErr(null);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const toggleDeferVols = async (v: boolean) => {
+    setDeferVolsSaving(true);
+    setDeferVolsErr(null);
+    try {
+      await api.setGeneral({ defer_recovery_vols: v });
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setDeferVolsErr(body?.error ?? e.message);
+      } else {
+        setDeferVolsErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setDeferVolsSaving(false);
     }
   };
 
@@ -1052,6 +1074,28 @@ function GeneralSection() {
               {failHopelessSaving ? "Saving…" : "Save"}
             </Button>
           </form>
+
+          <div className="settings-form">
+            <h3>Defer PAR2 recovery volumes</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              When enabled, per-slice PAR2 recovery files
+              (<code className="inline-code">.vol###+##.par2</code>) are
+              skipped on initial download. The repair worker fetches them
+              on demand if a job actually needs them. Saves bandwidth on
+              healthy releases; adds a round-trip when repair is needed.
+              SAB calls this "smart par2".
+            </p>
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={gen.defer_recovery_vols}
+                disabled={deferVolsSaving}
+                onChange={(e) => void toggleDeferVols(e.target.checked)}
+              />
+              <span>Defer recovery volumes</span>
+            </label>
+            {deferVolsErr && <p className="text-err">{deferVolsErr}</p>}
+          </div>
 
           <p className="muted">
             Listen address, API key, and log level live in{" "}

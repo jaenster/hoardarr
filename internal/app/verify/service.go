@@ -227,6 +227,20 @@ func (s *Service) runVerify(ctx context.Context, jobID download.JobID) error {
 	}
 	if vset == nil {
 		vset = verify.NewVerifySet(verify.NewVerifySetParams{JobID: jobID})
+	} else if vset.State() == verify.VerifyStateRepairNeeded && job.FetchRecoveryVols() {
+		// Second-round JobDownloadComplete after recovery vols landed:
+		// reset the VerifySet so we re-run with the new files in hand.
+		// The flag flip is what tells us "the previous repair_needed is
+		// stale" — repair worker only sets fetch_recovery_vols=true
+		// when it has actually requested more vols.
+		if err := s.txm.InTx(ctx, func(ctx context.Context) error {
+			if err := vset.Reset(); err != nil {
+				return err
+			}
+			return s.verifyRepo.Save(ctx, vset)
+		}); err != nil {
+			return fmt.Errorf("reset verify set for recovery: %w", err)
+		}
 	} else if vset.State().IsTerminal() {
 		// Already verified previously; nothing to do.
 		s.logger.Info("verify: already terminal, skipping",

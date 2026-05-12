@@ -338,6 +338,7 @@ func (s *OrchestratorService) subscribe() ([]event.Subscription, error) {
 		{"orchestrator-job-paused", "download.job.paused", s.onJobPaused},
 		{"orchestrator-job-resumed", "download.job.resumed", s.onJobResumed},
 		{"orchestrator-job-removed", "download.job.removed", s.onJobRemoved},
+		{"orchestrator-job-recovery-vols", "download.job.recovery_vols_requested", s.onRecoveryVolsRequested},
 	}
 	if s.poolFactory != nil {
 		pairs = append(pairs,
@@ -394,6 +395,20 @@ func (s *OrchestratorService) onJobRemoved(_ context.Context, env event.Envelope
 		return fmt.Errorf("decode JobRemoved: %w", err)
 	}
 	s.stopRunner(e.ID)
+	return nil
+}
+
+// onRecoveryVolsRequested re-enters the per-job runner after the repair
+// worker has flipped fetch_recovery_vols=true on the Job. The Job's
+// state was already transitioned back to JobStateDownloading inside
+// RequestRecoveryVols; startRunner picks up the now-visible recovery
+// vol segments via PendingSegments.
+func (s *OrchestratorService) onRecoveryVolsRequested(_ context.Context, env event.Envelope) error {
+	var e download.RecoveryVolsRequested
+	if err := json.Unmarshal(env.Payload, &e); err != nil {
+		return fmt.Errorf("decode RecoveryVolsRequested: %w", err)
+	}
+	s.startRunner(e.JobID)
 	return nil
 }
 

@@ -188,6 +188,21 @@ func (s *Service) runRepair(ctx context.Context, jobID download.JobID) error {
 		Par2Paths: par2Paths,
 		DataPaths: dataPaths,
 	})
+	// On-demand recovery-vol fetching: if PAR2 can't repair because
+	// recovery slices are short AND the job has deferred recovery vols
+	// it hasn't fetched yet, request them and let the orchestrator
+	// re-enter. Verify+Repair will fire again once the new vols land.
+	if errors.Is(err, par2.ErrUnrecoverableSet) && job.HasDeferredRecoveryVols() {
+		if rerr := s.requestRecoveryVols(ctx, job); rerr != nil {
+			return s.failRepair(ctx, r, fmt.Sprintf("request recovery vols: %v", rerr))
+		}
+		s.logger.Info("repair: insufficient slices, requesting deferred recovery vols",
+			"job_id", jobID,
+			"recovery_slices", len(result.AlreadyOK)+len(result.Failed))
+		// Don't transition repair to failed — we're parked, waiting for
+		// the second-round JobDownloadComplete to trigger verify again.
+		return nil
+	}
 	if err != nil && !errors.Is(err, par2.ErrUnrecoverableSet) {
 		return s.failRepair(ctx, r, err.Error())
 	}
@@ -230,6 +245,24 @@ func (s *Service) failRepair(ctx context.Context, r *repair.Repair, reason strin
 			return nil
 		}
 		if err := s.jobs.Save(ctx, j); err != nil {
+			return err
+		}
+		return s.bus.Publish(ctx, evts...)
+	})
+}
+
+// requestRecoveryVols flips the Job's fetch_recovery_vols flag to true
+// and publishes RecoveryVolsRequested so the orchestrator restarts the
+// runner. Caller must guarantee job.HasDeferredRecoveryVols() before
+// calling. Repair state stays "running" — verify will pick the job
+// up again after the second-round JobDownloadComplete.
+func (s *Service) requestRecoveryVols(ctx context.Context, job *download.Job) error {
+	return s.txm.InTx(ctx, func(ctx context.Context) error {
+		if err := job.RequestRecoveryVols(s.now()); err != nil {
+			return err
+		}
+		evts := job.PullEvents()
+		if err := s.jobs.Save(ctx, job); err != nil {
 			return err
 		}
 		return s.bus.Publish(ctx, evts...)

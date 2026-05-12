@@ -24,6 +24,7 @@ type Runtime struct {
 	urlBase           string
 	maxConcurrentJobs int
 	failHopelessRatio float64
+	deferRecoveryVols bool
 	// listeners are notified on max-concurrent changes so the
 	// orchestrator can drain its pending-jobs backlog when the cap
 	// goes up.
@@ -39,7 +40,38 @@ func NewRuntime(cfg config.Config, configPath string) *Runtime {
 		urlBase:           cfg.Server.URLBase,
 		maxConcurrentJobs: cfg.Server.MaxConcurrentJobs,
 		failHopelessRatio: cfg.Server.FailHopelessRatio,
+		deferRecoveryVols: cfg.Server.DeferRecoveryVols,
 	}
+}
+
+// DeferRecoveryVols reports whether new jobs should hide PAR2
+// per-slice recovery files from initial download (SAB-style).
+func (rt *Runtime) DeferRecoveryVols() bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.deferRecoveryVols
+}
+
+// SetDeferRecoveryVols persists v and returns the stored value. Takes
+// effect on newly-added jobs; in-flight jobs keep their existing
+// fetch_recovery_vols flag.
+func (rt *Runtime) SetDeferRecoveryVols(v bool) (bool, error) {
+	rt.mu.Lock()
+	if rt.configPath != "" {
+		cfg, err := config.LoadOrCreate(rt.configPath)
+		if err != nil {
+			rt.mu.Unlock()
+			return false, fmt.Errorf("load config: %w", err)
+		}
+		cfg.Server.DeferRecoveryVols = v
+		if err := config.Save(rt.configPath, cfg); err != nil {
+			rt.mu.Unlock()
+			return false, fmt.Errorf("save config: %w", err)
+		}
+	}
+	rt.deferRecoveryVols = v
+	rt.mu.Unlock()
+	return v, nil
 }
 
 // FailHopelessRatio returns the SAB fail_hopeless threshold (0-1).

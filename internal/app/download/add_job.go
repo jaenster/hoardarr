@@ -28,10 +28,11 @@ import (
 // Returns ErrDuplicateNZB if the same NZB body has already been
 // queued (matched by SHA-256).
 type AddJobService struct {
-	repo download.JobRepository
-	bus  event.Bus
-	tx   tx.TransactionManager
-	now  func() time.Time
+	repo                download.JobRepository
+	bus                 event.Bus
+	tx                  tx.TransactionManager
+	now                 func() time.Time
+	deferRecoveryVols   func() bool // runtime knob; nil means false (legacy behaviour)
 }
 
 // NewAddJobService wires the use case.
@@ -40,6 +41,16 @@ func NewAddJobService(repo download.JobRepository, bus event.Bus, txm tx.Transac
 		now = func() time.Time { return time.Now().UTC() }
 	}
 	return &AddJobService{repo: repo, bus: bus, tx: txm, now: now}
+}
+
+// WithDeferRecoveryVols installs a live-reading callback that gates
+// whether new jobs defer per-slice PAR2 recovery files at add time.
+// When the callback returns true, the Job is created with
+// fetch_recovery_vols=false and the orchestrator skips recovery-vol
+// segments until repair requests them.
+func (s *AddJobService) WithDeferRecoveryVols(fn func() bool) *AddJobService {
+	s.deferRecoveryVols = fn
+	return s
 }
 
 // AddJobCmd is the input shape for AddJob. Either NZB body or NZBPath
@@ -101,15 +112,20 @@ func (s *AddJobService) AddJob(ctx context.Context, cmd AddJobCmd) (download.Job
 		}
 
 		now := s.now()
+		defer_ := false
+		if s.deferRecoveryVols != nil {
+			defer_ = s.deferRecoveryVols()
+		}
 		j, err := download.NewJob(download.NewJobParams{
-			NZBHash:    hash,
-			Name:       name,
-			Category:   cmd.Category,
-			Priority:   cmd.Priority,
-			QueueOrder: now.UnixNano(),
-			Source:     cmd.Source,
-			NZBBlob:    body,
-			Files:      files,
+			NZBHash:           hash,
+			Name:              name,
+			Category:          cmd.Category,
+			Priority:          cmd.Priority,
+			QueueOrder:        now.UnixNano(),
+			Source:            cmd.Source,
+			NZBBlob:           body,
+			Files:             files,
+			DeferRecoveryVols: defer_,
 		}, now)
 		if err != nil {
 			return err
@@ -256,12 +272,13 @@ func buildFiles(d *nzb.Document) ([]download.NewFileParams, int64) {
 			size += s.Bytes
 		}
 		out = append(out, download.NewFileParams{
-			Filename:  f.Filename,
-			Poster:    f.Poster,
-			Groups:    f.Groups,
-			SizeBytes: size,
-			IsPar2:    isPar2Filename(f.Filename),
-			Segments:  segParams,
+			Filename:      f.Filename,
+			Poster:        f.Poster,
+			Groups:        f.Groups,
+			SizeBytes:     size,
+			IsPar2:        isPar2Filename(f.Filename),
+			IsRecoveryVol: isRecoveryVolFilename(f.Filename),
+			Segments:      segParams,
 		})
 		total += size
 	}
@@ -273,4 +290,18 @@ func isPar2Filename(name string) bool {
 	return strings.HasSuffix(low, ".par2") ||
 		strings.Contains(low, ".vol") ||
 		strings.HasSuffix(low, ".par")
+}
+
+// isRecoveryVolFilename reports whether the file is a per-slice PAR2
+// recovery volume (`<base>.vol###+##.par2`) as opposed to the small
+// index `.par2` (which carries FileDesc/IFSC and is needed for verify
+// even when no repair is wanted). The split lets the orchestrator
+// fetch only the index initially; the bulky vol files come down on
+// demand when repair needs them.
+func isRecoveryVolFilename(name string) bool {
+	low := strings.ToLower(name)
+	if !strings.HasSuffix(low, ".par2") {
+		return false
+	}
+	return strings.Contains(low, ".vol")
 }

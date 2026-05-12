@@ -250,6 +250,11 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	// Drain pending when the operator raises the cap from Settings.
 	runtime.OnMaxConcurrentJobsChange(func(_ int) { orch.NudgePending() })
 
+	// On-demand PAR2 recovery-vol fetching: AddJob reads the live knob
+	// so toggling defer_recovery_vols from Settings → General takes
+	// effect on the next upload.
+	addJobService.WithDeferRecoveryVols(runtime.DeferRecoveryVols)
+
 	verifyRepo := sqlite.NewVerifyRepo(db)
 	verifySvc := appverify.New(appverify.ServiceParams{
 		JobRepo:       jobRepo,

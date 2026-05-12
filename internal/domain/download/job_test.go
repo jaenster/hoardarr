@@ -160,6 +160,113 @@ func TestMarkSegmentMissing_StillCompletesJob(t *testing.T) {
 	t.Error("no JobDownloadComplete event emitted")
 }
 
+func TestPendingSegments_SkipsDeferredRecoveryVols(t *testing.T) {
+	j, err := NewJob(NewJobParams{
+		NZBHash: "deadbeef",
+		Name:    "release",
+		Files: []NewFileParams{
+			{
+				Filename:  "release.bin",
+				SizeBytes: 1000,
+				Segments:  []NewSegmentParams{{SeqIndex: 1, MessageID: "data@host", Bytes: 1000}},
+			},
+			{
+				Filename:      "release.par2",
+				SizeBytes:     200,
+				IsPar2:        true,
+				IsRecoveryVol: false,
+				Segments:      []NewSegmentParams{{SeqIndex: 1, MessageID: "idx@host", Bytes: 200}},
+			},
+			{
+				Filename:      "release.vol000+01.par2",
+				SizeBytes:     500,
+				IsPar2:        true,
+				IsRecoveryVol: true,
+				Segments:      []NewSegmentParams{{SeqIndex: 1, MessageID: "vol0@host", Bytes: 500}},
+			},
+			{
+				Filename:      "release.vol001+02.par2",
+				SizeBytes:     500,
+				IsPar2:        true,
+				IsRecoveryVol: true,
+				Segments:      []NewSegmentParams{{SeqIndex: 1, MessageID: "vol1@host", Bytes: 500}},
+			},
+		},
+		DeferRecoveryVols: true,
+	}, time.UnixMilli(1).UTC())
+	if err != nil {
+		t.Fatalf("NewJob: %v", err)
+	}
+
+	pending := j.PendingSegments()
+	if len(pending) != 2 {
+		t.Fatalf("pending = %d; want 2 (data + index, not vols)", len(pending))
+	}
+
+	if !j.HasDeferredRecoveryVols() {
+		t.Error("HasDeferredRecoveryVols = false; want true")
+	}
+}
+
+func TestRequestRecoveryVols_RevealsHiddenSegments(t *testing.T) {
+	j, _ := NewJob(NewJobParams{
+		NZBHash: "deadbeef",
+		Name:    "release",
+		Files: []NewFileParams{
+			{
+				Filename:  "release.bin",
+				SizeBytes: 1000,
+				Segments:  []NewSegmentParams{{SeqIndex: 1, MessageID: "data@host", Bytes: 1000}},
+			},
+			{
+				Filename:      "release.vol000+01.par2",
+				SizeBytes:     500,
+				IsPar2:        true,
+				IsRecoveryVol: true,
+				Segments:      []NewSegmentParams{{SeqIndex: 1, MessageID: "vol0@host", Bytes: 500}},
+			},
+		},
+		DeferRecoveryVols: true,
+	}, time.UnixMilli(1).UTC())
+	j.SetID(42)
+	_ = j.PullEvents()
+
+	// Simulate the post-first-download state: the data + index are done,
+	// job is in download_complete.
+	id := SegmentID(100)
+	for _, f := range j.files {
+		for _, s := range f.segments {
+			s.SetID(id)
+			id++
+		}
+	}
+	_ = j.MarkSegmentDone(SegmentResult{SegmentID: 100, BytesOnDisk: 1000}, time.UnixMilli(10).UTC())
+	if j.State() != JobStateDownloadComplete {
+		t.Fatalf("state = %s; want download_complete", j.State())
+	}
+	_ = j.PullEvents()
+
+	// Request vols → transitions back to downloading, vol segment becomes visible.
+	if err := j.RequestRecoveryVols(time.UnixMilli(20).UTC()); err != nil {
+		t.Fatalf("RequestRecoveryVols: %v", err)
+	}
+	if j.State() != JobStateDownloading {
+		t.Errorf("state after request = %s; want downloading", j.State())
+	}
+	pending := j.PendingSegments()
+	if len(pending) != 1 {
+		t.Fatalf("pending after request = %d; want 1 (the vol)", len(pending))
+	}
+	if pending[0].MessageID() != "vol0@host" {
+		t.Errorf("revealed segment = %s; want vol0@host", pending[0].MessageID())
+	}
+
+	// Second call should refuse — flag already flipped.
+	if err := j.RequestRecoveryVols(time.UnixMilli(30).UTC()); err == nil {
+		t.Error("second RequestRecoveryVols returned nil; want error")
+	}
+}
+
 func TestResetInflightToPending(t *testing.T) {
 	j := mkJob(t)
 	_ = j.PullEvents()

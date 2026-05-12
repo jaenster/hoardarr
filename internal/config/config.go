@@ -73,6 +73,15 @@ type Server struct {
 	// editable from Settings → General. Reasonable defaults sit
 	// in the 5–10% range for typical PAR2-protected releases.
 	FailHopelessRatio float64 `toml:"fail_hopeless_ratio"`
+
+	// DeferRecoveryVols defers PAR2 per-slice recovery files
+	// (`<base>.vol###+##.par2`) at job-add time. The data + the
+	// small index .par2 download immediately; vol files come down
+	// on demand when repair determines it needs them. Default
+	// false (legacy behaviour: fetch every file eagerly). When
+	// enabled, the SAB-style bandwidth savings apply only to
+	// PAR2-protected releases that don't need repair.
+	DeferRecoveryVols bool `toml:"defer_recovery_vols"`
 }
 
 // Auth holds authentication configuration. Currently API-key only;

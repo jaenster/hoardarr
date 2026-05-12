@@ -46,6 +46,16 @@ type Job struct {
 	errorMsg string
 	nzbBlob  []byte
 
+	// fetchRecoveryVols gates whether the orchestrator picks up
+	// recovery-volume PAR2 files (those matching <base>.vol###+##.par2)
+	// during normal download. When false, those files' segments are
+	// hidden from PendingSegments and excluded from the
+	// "all segments resolved" check, so JobDownloadComplete fires after
+	// just the data + index PAR2 have landed. The repair worker flips
+	// this to true (via RequestRecoveryVols) when par2.Repair finds
+	// insufficient slices and there are deferred files to fetch.
+	fetchRecoveryVols bool
+
 	files []*File
 
 	events []event.Event
@@ -61,6 +71,11 @@ type NewJobParams struct {
 	Source     string // requesting client UA (e.g. "Sonarr/4.x"); empty for manual
 	NZBBlob    []byte
 	Files      []NewFileParams
+	// DeferRecoveryVols defers per-slice PAR2 recovery files
+	// (`<base>.vol###+##.par2`) until repair needs them. The Job is
+	// constructed with fetch_recovery_vols=false when this is true.
+	// Default false → legacy behaviour: fetch every file eagerly.
+	DeferRecoveryVols bool
 }
 
 // NewJob constructs a fresh queued Job. The nzb bytes are persisted
@@ -79,15 +94,16 @@ func NewJob(p NewJobParams, now time.Time) (*Job, error) {
 	}
 
 	j := &Job{
-		nzbHash:    p.NZBHash,
-		name:       p.Name,
-		category:   p.Category,
-		priority:   p.Priority,
-		queueOrder: p.QueueOrder,
-		source:     p.Source,
-		state:      JobStateQueued,
-		addedAt:    now,
-		nzbBlob:    append([]byte(nil), p.NZBBlob...),
+		nzbHash:           p.NZBHash,
+		name:              p.Name,
+		category:          p.Category,
+		priority:          p.Priority,
+		queueOrder:        p.QueueOrder,
+		source:            p.Source,
+		state:             JobStateQueued,
+		addedAt:           now,
+		nzbBlob:           append([]byte(nil), p.NZBBlob...),
+		fetchRecoveryVols: !p.DeferRecoveryVols,
 	}
 	for _, fp := range p.Files {
 		f := newFile(fp)
@@ -122,32 +138,34 @@ type HydrateJobParams struct {
 	AddedAt     time.Time
 	StartedAt   time.Time
 	FinishedAt  time.Time
-	ErrorMsg    string
-	NZBBlob     []byte
-	Files       []*File
+	ErrorMsg          string
+	NZBBlob           []byte
+	Files             []*File
+	FetchRecoveryVols bool
 }
 
 // HydrateJob reconstructs a Job from persistence. No events are
 // emitted.
 func HydrateJob(p HydrateJobParams) *Job {
 	return &Job{
-		id:          p.ID,
-		nzbHash:     p.NZBHash,
-		name:        p.Name,
-		category:    p.Category,
-		priority:    p.Priority,
-		queueOrder:  p.QueueOrder,
-		source:      p.Source,
-		state:       p.State,
-		totalBytes:  p.TotalBytes,
-		doneBytes:   p.DoneBytes,
-		failedBytes: p.FailedBytes,
-		addedAt:     p.AddedAt,
-		startedAt:   p.StartedAt,
-		finishedAt:  p.FinishedAt,
-		errorMsg:    p.ErrorMsg,
-		nzbBlob:     append([]byte(nil), p.NZBBlob...),
-		files:       p.Files,
+		id:                p.ID,
+		nzbHash:           p.NZBHash,
+		name:              p.Name,
+		category:          p.Category,
+		priority:          p.Priority,
+		queueOrder:        p.QueueOrder,
+		source:            p.Source,
+		state:             p.State,
+		totalBytes:        p.TotalBytes,
+		doneBytes:         p.DoneBytes,
+		failedBytes:       p.FailedBytes,
+		addedAt:           p.AddedAt,
+		startedAt:         p.StartedAt,
+		finishedAt:        p.FinishedAt,
+		errorMsg:          p.ErrorMsg,
+		nzbBlob:           append([]byte(nil), p.NZBBlob...),
+		files:             p.Files,
+		fetchRecoveryVols: p.FetchRecoveryVols,
 	}
 }
 
@@ -465,10 +483,16 @@ func (j *Job) ResetInflightToPending() int {
 }
 
 // PendingSegments returns segments awaiting dispatch. Useful for the
-// orchestrator's per-job loop.
+// orchestrator's per-job loop. When fetch_recovery_vols is false,
+// segments belonging to recovery-vol files are hidden — repair will
+// flip the flag (via RequestRecoveryVols) and a re-entry of the
+// orchestrator picks them up at that point.
 func (j *Job) PendingSegments() []*Segment {
 	var out []*Segment
 	for _, f := range j.files {
+		if f.isRecoveryVol && !j.fetchRecoveryVols {
+			continue
+		}
 		for _, s := range f.segments {
 			if s.state == SegmentStatePending {
 				out = append(out, s)
@@ -479,9 +503,13 @@ func (j *Job) PendingSegments() []*Segment {
 }
 
 // allSegmentsResolved reports whether every segment has reached a
-// terminal state.
+// terminal state. Recovery-vol segments are ignored when the job has
+// not opted in to fetching them (mirrors PendingSegments).
 func (j *Job) allSegmentsResolved() bool {
 	for _, f := range j.files {
+		if f.isRecoveryVol && !j.fetchRecoveryVols {
+			continue
+		}
 		for _, s := range f.segments {
 			if !s.state.IsTerminal() {
 				return false
@@ -489,6 +517,63 @@ func (j *Job) allSegmentsResolved() bool {
 		}
 	}
 	return true
+}
+
+// FetchRecoveryVols reports whether this Job's orchestrator should
+// pick up recovery-volume segments. Initially set from the runtime
+// "defer recovery vols" knob (inverted) at job creation; toggled to
+// true by the repair worker via RequestRecoveryVols.
+func (j *Job) FetchRecoveryVols() bool { return j.fetchRecoveryVols }
+
+// HasDeferredRecoveryVols reports whether the Job still has recovery-
+// vol files whose segments haven't been fetched (because
+// fetch_recovery_vols=false). Used by the repair worker to decide
+// whether on-demand fetching is even possible.
+func (j *Job) HasDeferredRecoveryVols() bool {
+	if j.fetchRecoveryVols {
+		return false
+	}
+	for _, f := range j.files {
+		if !f.isRecoveryVol {
+			continue
+		}
+		for _, s := range f.segments {
+			if s.state == SegmentStatePending {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// RequestRecoveryVols flips fetch_recovery_vols=true and transitions
+// the Job back to JobStateDownloading so the orchestrator picks up
+// the deferred segments. Emits RecoveryVolsRequested. Returns an
+// error if there's nothing to fetch (caller should fail the repair
+// outright in that case).
+func (j *Job) RequestRecoveryVols(now time.Time) error {
+	if j.fetchRecoveryVols {
+		return errors.New("download: recovery vols already requested")
+	}
+	if !j.HasDeferredRecoveryVols() {
+		return errors.New("download: no deferred recovery vol segments")
+	}
+	j.fetchRecoveryVols = true
+	// Reopen the active phase so the orchestrator's per-job runner
+	// will pick up the now-visible pending segments. Anything past
+	// download_complete (verifying/repairing/etc.) is moved back to
+	// downloading; terminal states reject the request.
+	switch j.state {
+	case JobStateDownloadComplete, JobStateVerifying, JobStateRepairing:
+		j.state = JobStateDownloading
+	case JobStateCompleted, JobStateFailed, JobStateAborted:
+		return fmt.Errorf("download: cannot request recovery vols from %s", j.state)
+	}
+	j.events = append(j.events, RecoveryVolsRequested{
+		JobID: j.id,
+		At:    now,
+	})
+	return nil
 }
 
 // completeDownloadPhase transitions the job to its post-download state.

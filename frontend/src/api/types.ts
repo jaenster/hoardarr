@@ -132,6 +132,7 @@ export type General = {
   url_base: string;
   max_concurrent_jobs: number;
   fail_hopeless_ratio: number;
+  defer_recovery_vols: boolean;
 };
 
 export type BandwidthConfig = {
