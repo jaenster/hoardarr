@@ -53,6 +53,7 @@ type Handlers struct {
 type URLBaseReader interface {
 	URLBase() string
 	MaxConcurrentJobs() int
+	FailHopelessRatio() float64
 }
 
 // URLBaseWriter is implemented by *server.Runtime and exposes the
@@ -64,6 +65,7 @@ type URLBaseWriter interface {
 	URLBaseReader
 	SetURLBase(v string) (string, error)
 	SetMaxConcurrentJobs(v int) (int, error)
+	SetFailHopelessRatio(v float64) (float64, error)
 }
 
 // sessionCookiePath returns the Path attribute for the session
@@ -832,9 +834,11 @@ func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
 	// response reflects any edits applied since startup.
 	urlBase := h.General.URLBase
 	maxConcurrent := 0
+	failHopeless := 0.0
 	if h.Runtime != nil {
 		urlBase = h.Runtime.URLBase()
 		maxConcurrent = h.Runtime.MaxConcurrentJobs()
+		failHopeless = h.Runtime.FailHopelessRatio()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"listen":              h.General.Listen,
@@ -843,12 +847,14 @@ func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
 		"sab_base":            h.General.SABBase,
 		"url_base":            urlBase,
 		"max_concurrent_jobs": maxConcurrent,
+		"fail_hopeless_ratio": failHopeless,
 	})
 }
 
 type putGeneralReq struct {
-	URLBase           *string `json:"url_base,omitempty"`
-	MaxConcurrentJobs *int    `json:"max_concurrent_jobs,omitempty"`
+	URLBase           *string  `json:"url_base,omitempty"`
+	MaxConcurrentJobs *int     `json:"max_concurrent_jobs,omitempty"`
+	FailHopelessRatio *float64 `json:"fail_hopeless_ratio,omitempty"`
 }
 
 // putGeneral applies runtime-mutable General settings. Currently only
@@ -877,6 +883,12 @@ func (h *Handlers) putGeneral(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaxConcurrentJobs != nil {
 		if _, err := writer.SetMaxConcurrentJobs(*req.MaxConcurrentJobs); err != nil {
+			h.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.FailHopelessRatio != nil {
+		if _, err := writer.SetFailHopelessRatio(*req.FailHopelessRatio); err != nil {
 			h.writeError(w, http.StatusBadRequest, err)
 			return
 		}

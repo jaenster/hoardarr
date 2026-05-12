@@ -48,6 +48,13 @@ type Orchestrator struct {
 	// segment retry
 	maxAttempts int
 	baseBackoff time.Duration
+
+	// failHopelessRatio is SABnzbd's fail_hopeless threshold expressed
+	// as a fraction (0.05 = 5%). When a job's failed_bytes exceed this
+	// fraction of total_bytes mid-download, the orchestrator aborts
+	// rather than keep wasting bandwidth on something PAR2 can't fix.
+	// 0 disables.
+	failHopelessRatio float64
 	// poolWait is the wait between re-checks when the fetcher reports
 	// ErrNoPoolsAvailable. It is intentionally larger than baseBackoff
 	// — pool availability changes on operator action (adding a server,
@@ -83,6 +90,12 @@ type OrchestratorOptions struct {
 	// BaseBackoff is the first-retry delay; each subsequent retry
 	// doubles. Default 200ms (so 200 / 400 / 800 ms for 3 attempts).
 	BaseBackoff time.Duration
+
+	// FailHopelessRatio aborts the download mid-flight when failed
+	// bytes exceed this fraction of total bytes. Saves bandwidth on
+	// releases beyond PAR2's repair capacity. 0 disables. Reasonable
+	// values: 0.05 (5%) - 0.10 (10%) for typical 10% PAR2 sets.
+	FailHopelessRatio float64
 
 	// PoolWait is how long the runner sleeps between re-checks when
 	// no pool is available (ErrNoPoolsAvailable). Does not consume
@@ -150,6 +163,7 @@ func NewOrchestrator(
 		maxAttempts:   opts.MaxAttempts,
 		baseBackoff:   opts.BaseBackoff,
 		poolWait:      opts.PoolWait,
+		failHopelessRatio: opts.FailHopelessRatio,
 	}
 }
 
@@ -475,6 +489,14 @@ func (o *Orchestrator) flushBatch(ctx context.Context, job *download.Job, batch 
 			}
 		}
 		persisted = append(persisted, r)
+	}
+	// fail_hopeless: if the failed-bytes ratio has crossed the
+	// configured threshold, abort the download phase here. Saves
+	// the user bandwidth on a release PAR2 can't repair anyway.
+	// 0 (default) disables — matches SABnzbd's behaviour of fail-
+	// hopeless being an opt-in.
+	if o.failHopelessRatio > 0 {
+		job.AbortIfHopeless(o.failHopelessRatio, now)
 	}
 	return o.flushAggregate(ctx, job, persisted)
 }

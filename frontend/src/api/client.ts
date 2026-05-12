@@ -206,6 +206,7 @@ export const api = {
   setGeneral(body: {
     url_base?: string;
     max_concurrent_jobs?: number;
+    fail_hopeless_ratio?: number;
   }): Promise<void> {
     return jsonReq("PUT", "/api/v1/config/general", body);
   },

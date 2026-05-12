@@ -131,6 +131,7 @@ export type General = {
   sab_base: string;
   url_base: string;
   max_concurrent_jobs: number;
+  fail_hopeless_ratio: number;
 };
 
 export type BandwidthConfig = {

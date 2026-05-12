@@ -804,12 +804,19 @@ function GeneralSection() {
   const [maxConcurrentSavedAt, setMaxConcurrentSavedAt] = useState<number | null>(null);
   const [maxConcurrentErr, setMaxConcurrentErr] = useState<string | null>(null);
 
+  // fail_hopeless threshold (percent for display, fraction in API).
+  const [failHopelessDraft, setFailHopelessDraft] = useState(0);
+  const [failHopelessSaving, setFailHopelessSaving] = useState(false);
+  const [failHopelessSavedAt, setFailHopelessSavedAt] = useState<number | null>(null);
+  const [failHopelessErr, setFailHopelessErr] = useState<string | null>(null);
+
   const refresh = async () => {
     try {
       const g = await api.general();
       setGen(g);
       setUrlBaseDraft(g.url_base);
       setMaxConcurrentDraft(g.max_concurrent_jobs);
+      setFailHopelessDraft(Math.round((g.fail_hopeless_ratio || 0) * 100));
       setErr(null);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -868,6 +875,30 @@ function GeneralSection() {
       }
     } finally {
       setMaxConcurrentSaving(false);
+    }
+  };
+
+  const failHopelessDirty =
+    gen != null && Math.round((gen.fail_hopeless_ratio || 0) * 100) !== failHopelessDraft;
+
+  const saveFailHopeless = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFailHopelessSaving(true);
+    setFailHopelessErr(null);
+    try {
+      const pct = Math.max(0, Math.min(99, Math.floor(failHopelessDraft || 0)));
+      await api.setGeneral({ fail_hopeless_ratio: pct / 100 });
+      setFailHopelessSavedAt(Date.now());
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setFailHopelessErr(body?.error ?? e.message);
+      } else {
+        setFailHopelessErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setFailHopelessSaving(false);
     }
   };
 
@@ -980,6 +1011,45 @@ function GeneralSection() {
               disabled={!maxConcurrentDirty || maxConcurrentSaving}
             >
               {maxConcurrentSaving ? "Saving…" : "Save"}
+            </Button>
+          </form>
+
+          <form className="settings-form" onSubmit={saveFailHopeless}>
+            <h3>Fail hopeless jobs</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              Abort a download mid-flight when this fraction of bytes is
+              already missing — PAR2 can't repair a hole bigger than its
+              recovery slices anyway, so further bandwidth is wasted.{" "}
+              <strong>0</strong> disables the check (SABnzbd default).
+              Reasonable values: <strong>5–10</strong>% for typical
+              10%-PAR2 releases.
+            </p>
+            <div className="settings-row">
+              <label className="settings-field settings-field-narrow">
+                <span>Threshold (%)</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={99}
+                  value={failHopelessDraft}
+                  onChange={(e) =>
+                    setFailHopelessDraft(
+                      Math.max(0, Math.min(99, parseInt(e.target.value, 10) || 0)),
+                    )
+                  }
+                />
+              </label>
+            </div>
+            {failHopelessErr && <p className="text-err">{failHopelessErr}</p>}
+            {failHopelessSavedAt && !failHopelessDirty && !failHopelessErr && (
+              <p className="muted">Saved. Takes effect on the next job.</p>
+            )}
+            <Button
+              variant="primary"
+              type="submit"
+              disabled={!failHopelessDirty || failHopelessSaving}
+            >
+              {failHopelessSaving ? "Saving…" : "Save"}
             </Button>
           </form>
 

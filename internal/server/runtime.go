@@ -23,6 +23,7 @@ type Runtime struct {
 	configPath        string // empty disables persistence (used in tests)
 	urlBase           string
 	maxConcurrentJobs int
+	failHopelessRatio float64
 	// listeners are notified on max-concurrent changes so the
 	// orchestrator can drain its pending-jobs backlog when the cap
 	// goes up.
@@ -37,7 +38,41 @@ func NewRuntime(cfg config.Config, configPath string) *Runtime {
 		configPath:        configPath,
 		urlBase:           cfg.Server.URLBase,
 		maxConcurrentJobs: cfg.Server.MaxConcurrentJobs,
+		failHopelessRatio: cfg.Server.FailHopelessRatio,
 	}
+}
+
+// FailHopelessRatio returns the SAB fail_hopeless threshold (0-1).
+// 0 disables the check.
+func (rt *Runtime) FailHopelessRatio() float64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.failHopelessRatio
+}
+
+// SetFailHopelessRatio validates v ∈ [0,1), persists it, returns the
+// stored value. The orchestrator reads via the callback on every
+// dispatch so changes take effect on the next job.
+func (rt *Runtime) SetFailHopelessRatio(v float64) (float64, error) {
+	if v < 0 || v >= 1 {
+		return 0, fmt.Errorf("fail_hopeless_ratio %v must be in [0, 1)", v)
+	}
+	rt.mu.Lock()
+	if rt.configPath != "" {
+		cfg, err := config.LoadOrCreate(rt.configPath)
+		if err != nil {
+			rt.mu.Unlock()
+			return 0, fmt.Errorf("load config: %w", err)
+		}
+		cfg.Server.FailHopelessRatio = v
+		if err := config.Save(rt.configPath, cfg); err != nil {
+			rt.mu.Unlock()
+			return 0, fmt.Errorf("save config: %w", err)
+		}
+	}
+	rt.failHopelessRatio = v
+	rt.mu.Unlock()
+	return v, nil
 }
 
 // URLBase returns the current runtime URL base. Always safe to call

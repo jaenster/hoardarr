@@ -389,6 +389,43 @@ func (j *Job) MarkSegmentFailed(segID SegmentID, errMsg string, now time.Time) e
 	return nil
 }
 
+// AbortIfHopeless transitions the job to JobStateFailed when the
+// failed-bytes ratio exceeds `threshold` (0.0–1.0). SABnzbd's
+// fail_hopeless: stop burning bandwidth on a release that's already
+// beyond PAR2's ability to repair. Returns true if the transition
+// fired. Threshold ≤ 0 or ≥ 1 disables the check.
+//
+// Only fires during the download phase (queued / downloading /
+// waiting_for_server). Once download_complete is reached the verify
+// pipeline decides fate.
+func (j *Job) AbortIfHopeless(threshold float64, now time.Time) bool {
+	if threshold <= 0 || threshold >= 1 {
+		return false
+	}
+	switch j.state {
+	case JobStateQueued, JobStateDownloading, JobStateWaitingForServer:
+	default:
+		return false
+	}
+	if j.totalBytes <= 0 {
+		return false
+	}
+	ratio := float64(j.failedBytes) / float64(j.totalBytes)
+	if ratio < threshold {
+		return false
+	}
+	reason := fmt.Sprintf("download aborted: %d%% missing exceeds %d%% threshold",
+		int(ratio*100+0.5), int(threshold*100+0.5))
+	j.state = JobStateFailed
+	j.errorMsg = reason
+	j.finishedAt = now
+	j.events = append(j.events,
+		JobDownloadFailed{JobID: j.id, Err: reason, At: now},
+		JobFailed{JobID: j.id, Err: reason, At: now},
+	)
+	return true
+}
+
 // MarkSegmentDispatched flips a pending segment to inflight and records
 // the attempt. Returns an error if the segment is not pending.
 func (j *Job) MarkSegmentDispatched(segID SegmentID, now time.Time) error {

@@ -66,6 +66,13 @@ type Server struct {
 	// allow N jobs at once. Excess jobs sit in pending state until
 	// a slot frees up. Live-editable from Settings → General.
 	MaxConcurrentJobs int `toml:"max_concurrent_jobs"`
+
+	// FailHopelessRatio aborts a download mid-flight when failed
+	// bytes exceed this fraction of total bytes (SABnzbd's
+	// fail_hopeless). 0 disables; 0.05 = 5% threshold. Live-
+	// editable from Settings → General. Reasonable defaults sit
+	// in the 5–10% range for typical PAR2-protected releases.
+	FailHopelessRatio float64 `toml:"fail_hopeless_ratio"`
 }
 
 // Auth holds authentication configuration. Currently API-key only;

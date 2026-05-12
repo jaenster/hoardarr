@@ -241,7 +241,8 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 			logger: logger,
 			dialer: bo.nntpDialer,
 		},
-		ConcurrencyCap: runtime.MaxConcurrentJobs,
+		ConcurrencyCap:    runtime.MaxConcurrentJobs,
+		FailHopelessRatio: runtime.FailHopelessRatio,
 	})
 	// Drain pending when the operator raises the cap from Settings.
 	runtime.OnMaxConcurrentJobsChange(func(_ int) { orch.NudgePending() })

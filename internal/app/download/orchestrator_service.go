@@ -51,6 +51,7 @@ type OrchestratorService struct {
 	flushInterval time.Duration
 	maxAttempts   int
 	baseBackoff   time.Duration
+	failHopelessRatio func() float64
 	poolFactory   PoolFactory // optional; if set, server.usenet.added events hot-wire new pools
 	// concurrencyCap returns the current max concurrent runners.
 	// 0 means unlimited; nil means unlimited (no cap configured).
@@ -92,6 +93,9 @@ type OrchestratorServiceParams struct {
 	FlushInterval time.Duration // optional, default 100ms
 	MaxAttempts   int           // optional, default 3
 	BaseBackoff   time.Duration // optional, default 200ms
+	// FailHopelessRatio returns the SAB fail_hopeless threshold (0-1).
+	// Called on every dispatch so live edits propagate. Nil → 0.
+	FailHopelessRatio func() float64
 	// PoolFactory enables hot-wiring NNTP pools when the operator
 	// adds / enables / disables servers from the UI. Nil → static
 	// pool set (tests + the historical behaviour).
@@ -134,6 +138,7 @@ func NewOrchestratorService(p OrchestratorServiceParams) *OrchestratorService {
 		flushInterval:  p.FlushInterval,
 		maxAttempts:    p.MaxAttempts,
 		baseBackoff:    p.BaseBackoff,
+		failHopelessRatio: p.FailHopelessRatio,
 		poolFactory:    p.PoolFactory,
 		concurrencyCap: p.ConcurrencyCap,
 		runners:        make(map[download.JobID]*runnerHandle),
@@ -596,15 +601,20 @@ func (s *OrchestratorService) runJob(ctx context.Context, id download.JobID, han
 	fetcher := NewTieredFetcher(s.PoolsSnapshot, s.accounter, s.limiter, s.logger)
 	hintID, hintMax := s.dispatchHint()
 
+	hopeless := 0.0
+	if s.failHopelessRatio != nil {
+		hopeless = s.failHopelessRatio()
+	}
 	orch := NewOrchestrator(
 		s.repo, fetcher, s.bus, s.txm,
 		hintID, hintMax, s.incompleteDir,
 		OrchestratorOptions{
-			Logger:        s.logger,
-			Now:           s.now,
-			FlushInterval: s.flushInterval,
-			MaxAttempts:   s.maxAttempts,
-			BaseBackoff:   s.baseBackoff,
+			Logger:            s.logger,
+			Now:               s.now,
+			FlushInterval:     s.flushInterval,
+			MaxAttempts:       s.maxAttempts,
+			BaseBackoff:       s.baseBackoff,
+			FailHopelessRatio: hopeless,
 		},
 	)
 
