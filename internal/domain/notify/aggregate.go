@@ -200,6 +200,51 @@ func (s *Subscription) PullEvents() []event.Event {
 	return out
 }
 
+// UpdateParams carries the fields a Subscription.Update accepts.
+// Each pointer is treated as "leave alone" when nil; the caller
+// supplies only the keys it wants to change. Name is intentionally
+// excluded — names are immutable (used as PK in some paths) and
+// edits go through a delete + recreate cycle.
+type UpdateParams struct {
+	URL    *string
+	Topics *[]string
+	Secret *string  // empty string clears the secret
+	Enabled *bool
+}
+
+// Update mutates the subscription's editable fields and emits
+// SubscriptionUpdated. Returns an error if a supplied value fails
+// validation (bad URL, empty topics list, etc).
+func (s *Subscription) Update(p UpdateParams, now time.Time) error {
+	if p.URL != nil {
+		if err := validateURL(*p.URL); err != nil {
+			return err
+		}
+		s.url = *p.URL
+	}
+	if p.Topics != nil {
+		topics := append([]string(nil), (*p.Topics)...)
+		if len(topics) == 0 {
+			return errors.New("notify: at least one topic required")
+		}
+		s.topics = topics
+	}
+	if p.Secret != nil {
+		s.secret = *p.Secret
+	}
+	if p.Enabled != nil && s.enabled != *p.Enabled {
+		s.enabled = *p.Enabled
+		if *p.Enabled {
+			s.events = append(s.events, SubscriptionEnabled{ID: s.id, At: now})
+		} else {
+			s.events = append(s.events, SubscriptionDisabled{ID: s.id, At: now})
+		}
+	}
+	s.updatedAt = now
+	s.events = append(s.events, SubscriptionUpdated{ID: s.id, At: now})
+	return nil
+}
+
 // SetEnabled flips the active flag. Emits SubscriptionEnabled or
 // SubscriptionDisabled.
 func (s *Subscription) SetEnabled(enabled bool, now time.Time) {

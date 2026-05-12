@@ -81,6 +81,44 @@ func (a *Admin) Add(ctx context.Context, cmd AddCmd) (notify.SubscriptionID, err
 	return id, nil
 }
 
+// UpdateCmd is the input to Update. Each pointer is "leave alone"
+// when nil; only the supplied keys are applied. Mirrors the domain
+// UpdateParams shape but is the surface the REST handler talks to.
+type UpdateCmd struct {
+	URL     *string
+	Topics  *[]string
+	Secret  *string
+	Enabled *bool
+}
+
+// Update applies UpdateCmd to the subscription and emits the events
+// the aggregate generates (SubscriptionUpdated, plus Enabled /
+// Disabled if the flag flipped).
+func (a *Admin) Update(ctx context.Context, id notify.SubscriptionID, cmd UpdateCmd) error {
+	return a.txm.InTx(ctx, func(ctx context.Context) error {
+		sub, err := a.repo.ByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if err := sub.Update(notify.UpdateParams{
+			URL:     cmd.URL,
+			Topics:  cmd.Topics,
+			Secret:  cmd.Secret,
+			Enabled: cmd.Enabled,
+		}, a.now()); err != nil {
+			return err
+		}
+		evts := sub.PullEvents()
+		if len(evts) == 0 {
+			return nil
+		}
+		if err := a.repo.Save(ctx, sub); err != nil {
+			return fmt.Errorf("save: %w", err)
+		}
+		return a.bus.Publish(ctx, evts...)
+	})
+}
+
 // Remove deletes the subscription and emits SubscriptionRemoved.
 func (a *Admin) Remove(ctx context.Context, id notify.SubscriptionID) error {
 	return a.txm.InTx(ctx, func(ctx context.Context) error {

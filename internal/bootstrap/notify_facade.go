@@ -27,6 +27,13 @@ func (f *notifyFacade) Add(ctx context.Context, cmd appnotify.AddCmd) (notify.Su
 	}
 	return id, err
 }
+func (f *notifyFacade) Update(ctx context.Context, id notify.SubscriptionID, cmd appnotify.UpdateCmd) error {
+	err := f.admin.Update(ctx, id, cmd)
+	if err == nil {
+		_ = f.svc.RefreshCache(ctx)
+	}
+	return err
+}
 func (f *notifyFacade) Remove(ctx context.Context, id notify.SubscriptionID) error {
 	err := f.admin.Remove(ctx, id)
 	if err == nil {

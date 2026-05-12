@@ -230,6 +230,9 @@ export const api = {
   addSubscription(body: AddSubscriptionBody): Promise<{ id: number }> {
     return jsonReq("POST", "/api/v1/subscriptions", body);
   },
+  patchSubscription(id: number, body: PatchSubscriptionBody): Promise<void> {
+    return jsonReq("PATCH", `/api/v1/subscriptions/${id}`, body);
+  },
   removeSubscription(id: number): Promise<void> {
     return req("DELETE", `/api/v1/subscriptions/${id}`);
   },
@@ -247,6 +250,15 @@ export type AddSubscriptionBody = {
   topics: string[];
   secret?: string;
   kind?: "webhook" | "discord" | "slack";
+};
+
+// PatchSubscriptionBody — name is immutable, every other field optional.
+// Omit a key to leave it; pass empty-string secret to clear it.
+export type PatchSubscriptionBody = {
+  url?: string;
+  topics?: string[];
+  secret?: string;
+  enabled?: boolean;
 };
 
 export type HistoryOpts = {

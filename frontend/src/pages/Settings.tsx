@@ -1274,14 +1274,20 @@ const KNOWN_TOPICS = [
 function WebhooksSection() {
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState<Subscription | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   const refresh = async () => {
+    setLoading(true);
     try {
       const r = await api.listSubscriptions();
       setSubs(r.subscriptions ?? []);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -1289,28 +1295,9 @@ function WebhooksSection() {
     void refresh();
   }, []);
 
-  const remove = async (id: number) => {
-    if (!confirm("Remove this webhook?")) return;
-    try {
-      await api.removeSubscription(id);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const test = async (id: number) => {
-    try {
-      await api.testSubscription(id);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
   return (
     <Panel
-      title="Connect (Webhooks)"
+      title="Connect (Webhooks & Notifications)"
       meta={
         <StatusBadge tone="neutral">
           <Webhook size={12} />
@@ -1326,85 +1313,103 @@ function WebhooksSection() {
       </p>
 
       {error && <p className="text-err">{error}</p>}
-
-      {subs.length > 0 ? (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Type</th>
-              <th>URL</th>
-              <th>Topics</th>
-              <th>Signed</th>
-              <th>Last delivery</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {subs.map((s) => (
-              <tr key={s.id}>
-                <td>{s.name}</td>
-                <td>
-                  <StatusBadge tone="neutral">{s.kind}</StatusBadge>
-                </td>
-                <td className="muted kv-key-value">{s.url}</td>
-                <td className="muted">{s.topics.length} topics</td>
-                <td>
-                  <StatusBadge tone={s.has_secret ? "ok" : "neutral"} dot>
-                    {s.has_secret ? "HMAC" : "none"}
-                  </StatusBadge>
-                </td>
-                <td className="muted">
-                  {s.last_error ? (
-                    <span className="text-err" title={s.last_error}>
-                      failed
-                    </span>
-                  ) : s.last_success_at ? (
-                    <>ok @ {new Date(s.last_success_at).toLocaleTimeString()}</>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-                <td className="queue-row-actions">
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    aria-label="Send test event"
-                    title="Send test event"
-                    onClick={() => void test(s.id)}
-                  >
-                    <Send size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn icon-btn-danger"
-                    aria-label="Remove webhook"
-                    onClick={() => void remove(s.id)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : (
-        <p className="muted">No webhooks configured yet.</p>
+      {!loading && subs.length === 0 && (
+        <p className="muted">No webhooks configured yet — click the + tile to add one.</p>
       )}
 
-      <AddWebhookForm onAdded={() => void refresh()} />
+      <CardGrid onAdd={() => setAddOpen(true)} addLabel="Add webhook">
+        {subs.map((s) => (
+          <EntityCard
+            key={s.id}
+            title={s.name}
+            ariaLabel={`Edit ${s.name}`}
+            badge={
+              <>
+                <StatusBadge tone={s.enabled ? "ok" : "neutral"}>
+                  {s.enabled ? s.kind : "disabled"}
+                </StatusBadge>
+                <span className="muted entity-card-meta">
+                  {s.topics.length} topic{s.topics.length === 1 ? "" : "s"}
+                  {s.last_error
+                    ? " · failed"
+                    : s.last_success_at
+                      ? " · ok"
+                      : ""}
+                </span>
+              </>
+            }
+            onClick={() => setEditing(s)}
+          />
+        ))}
+      </CardGrid>
+
+      {editing && (
+        <Modal title={`Edit ${editing.name}`} onClose={() => setEditing(null)}>
+          <WebhookForm
+            sub={editing}
+            onClose={() => setEditing(null)}
+            onSaved={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+            onDeleted={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+          />
+        </Modal>
+      )}
+
+      {addOpen && (
+        <Modal title="Add webhook" onClose={() => setAddOpen(false)}>
+          <WebhookForm
+            sub={null}
+            onClose={() => setAddOpen(false)}
+            onSaved={async () => {
+              setAddOpen(false);
+              await refresh();
+            }}
+          />
+        </Modal>
+      )}
     </Panel>
   );
 }
 
-function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
-  const [name, setName] = useState("");
-  const [url, setUrl] = useState("");
+// WebhookForm is the unified add/edit form for notification subscriptions.
+// sub === null → add mode (Name + Kind editable, create). Otherwise edit
+// mode (Name + Kind immutable, PATCH editable fields, plus delete + test).
+//
+// Secret handling on edit: the existing secret value isn't returned by
+// the API (only has_secret). Blank field = leave alone. Toggling the
+// "Replace secret" checkbox reveals the input and PATCHes the new value;
+// clearing it within that toggle sends "" to remove the secret.
+function WebhookForm({
+  sub,
+  onClose,
+  onSaved,
+  onDeleted,
+}: {
+  sub: Subscription | null;
+  onClose: () => void;
+  onSaved: () => Promise<void> | void;
+  onDeleted?: () => Promise<void> | void;
+}) {
+  const editing = sub !== null;
+  const [name, setName] = useState(sub?.name ?? "");
+  const [url, setUrl] = useState(sub?.url ?? "");
+  const [kind, setKind] = useState<"webhook" | "discord" | "slack">(
+    sub?.kind ?? "webhook",
+  );
+  const [picked, setPicked] = useState<string[]>(
+    sub?.topics ?? ["deliver.complete"],
+  );
+  const [enabled, setEnabled] = useState<boolean>(sub?.enabled ?? true);
+  const [replaceSecret, setReplaceSecret] = useState(false);
   const [secret, setSecret] = useState("");
-  const [kind, setKind] = useState<"webhook" | "discord" | "slack">("webhook");
-  const [picked, setPicked] = useState<string[]>(["deliver.complete"]);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
 
   const toggle = (t: string) => {
     setPicked((cur) =>
@@ -1416,20 +1421,32 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
     e.preventDefault();
     setSubmitting(true);
     setErr(null);
+    setInfo(null);
     try {
-      await api.addSubscription({
-        name: name.trim(),
-        url: url.trim(),
-        topics: picked,
-        secret: secret || undefined,
-        kind,
-      });
-      setName("");
-      setUrl("");
-      setSecret("");
-      setKind("webhook");
-      setPicked(["deliver.complete"]);
-      onAdded();
+      if (editing && sub) {
+        const body: Parameters<typeof api.patchSubscription>[1] = {};
+        if (url.trim() !== sub.url) body.url = url.trim();
+        const sameTopics =
+          sub.topics.length === picked.length &&
+          sub.topics.every((t, i) => t === picked[i]);
+        if (!sameTopics) body.topics = picked;
+        if (enabled !== sub.enabled) body.enabled = enabled;
+        if (replaceSecret) body.secret = secret;
+        if (Object.keys(body).length === 0) {
+          onClose();
+          return;
+        }
+        await api.patchSubscription(sub.id, body);
+      } else {
+        await api.addSubscription({
+          name: name.trim(),
+          url: url.trim(),
+          topics: picked,
+          secret: kind === "webhook" && secret ? secret : undefined,
+          kind,
+        });
+      }
+      await onSaved();
     } catch (e) {
       if (e instanceof ApiError) {
         const body = e.body as { error?: string } | null;
@@ -1442,16 +1459,43 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
     }
   };
 
-  const valid = name.trim() && url.trim() && picked.length > 0;
+  const test = async () => {
+    if (!sub) return;
+    setErr(null);
+    setInfo(null);
+    try {
+      await api.testSubscription(sub.id);
+      setInfo("Test event sent.");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const remove = async () => {
+    if (!sub) return;
+    if (!confirm(`Remove ${sub.name}?`)) return;
+    setSubmitting(true);
+    setErr(null);
+    try {
+      await api.removeSubscription(sub.id);
+      if (onDeleted) await onDeleted();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setSubmitting(false);
+    }
+  };
+
+  const valid =
+    (editing || name.trim()) && url.trim() && picked.length > 0;
 
   return (
     <form className="settings-form" onSubmit={submit}>
-      <h3>Add webhook</h3>
       <div className="settings-row">
         <label className="settings-field settings-field-narrow">
           <span>Type</span>
           <select
             value={kind}
+            disabled={editing}
             onChange={(e) =>
               setKind(e.target.value as "webhook" | "discord" | "slack")
             }
@@ -1463,7 +1507,11 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
         </label>
         <label className="settings-field">
           <span>Name</span>
-          <input value={name} onChange={(e) => setName(e.target.value)} />
+          <input
+            value={name}
+            disabled={editing}
+            onChange={(e) => setName(e.target.value)}
+          />
         </label>
         <label className="settings-field">
           <span>URL</span>
@@ -1479,7 +1527,7 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
             }
           />
         </label>
-        {kind === "webhook" && (
+        {kind === "webhook" && !editing && (
           <label className="settings-field">
             <span>Secret (optional)</span>
             <input
@@ -1490,7 +1538,51 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
             />
           </label>
         )}
+        {kind === "webhook" && editing && (
+          <label className="settings-field">
+            <span>
+              Secret{" "}
+              <input
+                type="checkbox"
+                checked={replaceSecret}
+                onChange={(e) => {
+                  setReplaceSecret(e.target.checked);
+                  if (!e.target.checked) setSecret("");
+                }}
+              />{" "}
+              <span className="muted">replace</span>
+            </span>
+            <input
+              type="password"
+              value={secret}
+              disabled={!replaceSecret}
+              placeholder={
+                replaceSecret
+                  ? "(empty = remove secret)"
+                  : sub?.has_secret
+                    ? "•••••• (set)"
+                    : "(none)"
+              }
+              onChange={(e) => setSecret(e.target.value)}
+              autoComplete="off"
+            />
+          </label>
+        )}
       </div>
+
+      {editing && (
+        <div className="settings-row">
+          <label className="settings-checkbox">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+            />
+            <span>Enabled</span>
+          </label>
+        </div>
+      )}
+
       <div className="settings-row settings-topics">
         {KNOWN_TOPICS.map((t) => (
           <label key={t} className="settings-checkbox">
@@ -1503,15 +1595,45 @@ function AddWebhookForm({ onAdded }: { onAdded: () => void }) {
           </label>
         ))}
       </div>
+
       {err && <p className="text-err">{err}</p>}
-      <Button
-        variant="primary"
-        type="submit"
-        icon={<Plus size={14} />}
-        disabled={!valid || submitting}
-      >
-        {submitting ? "Adding…" : "Add webhook"}
-      </Button>
+      {info && <p className="muted">{info}</p>}
+
+      <div className="settings-row">
+        <Button
+          variant="primary"
+          type="submit"
+          icon={editing ? undefined : <Plus size={14} />}
+          disabled={!valid || submitting}
+        >
+          {submitting ? "Saving…" : editing ? "Save" : "Add webhook"}
+        </Button>
+        {editing && (
+          <Button
+            type="button"
+            variant="secondary"
+            icon={<Send size={14} />}
+            onClick={() => void test()}
+            disabled={submitting}
+          >
+            Send test
+          </Button>
+        )}
+        <Button type="button" variant="secondary" onClick={onClose}>
+          Cancel
+        </Button>
+        {editing && onDeleted && (
+          <Button
+            type="button"
+            variant="danger"
+            icon={<Trash2 size={14} />}
+            onClick={() => void remove()}
+            disabled={submitting}
+          >
+            Remove
+          </Button>
+        )}
+      </div>
     </form>
   );
 }

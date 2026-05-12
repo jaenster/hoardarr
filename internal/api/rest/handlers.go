@@ -99,6 +99,7 @@ type BandwidthAdmin interface {
 type Subscriptions interface {
 	List(ctx context.Context) ([]*notify.Subscription, error)
 	Add(ctx context.Context, cmd appnotify.AddCmd) (notify.SubscriptionID, error)
+	Update(ctx context.Context, id notify.SubscriptionID, cmd appnotify.UpdateCmd) error
 	Remove(ctx context.Context, id notify.SubscriptionID) error
 	SetEnabled(ctx context.Context, id notify.SubscriptionID, enabled bool) error
 	Test(ctx context.Context, id notify.SubscriptionID) error
@@ -217,6 +218,7 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	if h.Subscriptions != nil {
 		register("GET", "/api/v1/subscriptions", h.listSubscriptions)
 		register("POST", "/api/v1/subscriptions", h.addSubscription)
+		register("PATCH", "/api/v1/subscriptions/{id}", h.patchSubscription)
 		register("DELETE", "/api/v1/subscriptions/{id}", h.removeSubscription)
 		register("POST", "/api/v1/subscriptions/{id}/test", h.testSubscription)
 		register("POST", "/api/v1/subscriptions/{id}/enable", h.enableSubscription)
@@ -946,6 +948,40 @@ func (h *Handlers) addSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": int64(id)})
+}
+
+type patchSubscriptionReq struct {
+	URL     *string   `json:"url,omitempty"`
+	Topics  *[]string `json:"topics,omitempty"`
+	Secret  *string   `json:"secret,omitempty"`
+	Enabled *bool     `json:"enabled,omitempty"`
+}
+
+func (h *Handlers) patchSubscription(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var req patchSubscriptionReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("decode: %w", err))
+		return
+	}
+	if err := h.Subscriptions.Update(r.Context(), notify.SubscriptionID(id), appnotify.UpdateCmd{
+		URL:     req.URL,
+		Topics:  req.Topics,
+		Secret:  req.Secret,
+		Enabled: req.Enabled,
+	}); err != nil {
+		if errors.Is(err, notify.ErrNotFound) {
+			h.writeError(w, http.StatusNotFound, err)
+			return
+		}
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) removeSubscription(w http.ResponseWriter, r *http.Request) {

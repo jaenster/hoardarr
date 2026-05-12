@@ -52,3 +52,16 @@ type SubscriptionRemoved struct {
 func (e SubscriptionRemoved) Topic() string         { return TopicPrefix + "subscription.removed" }
 func (e SubscriptionRemoved) AggregateID() string   { return aggID(e.ID) }
 func (e SubscriptionRemoved) OccurredAt() time.Time { return e.At }
+
+// SubscriptionUpdated fires after Subscription.Update mutates one or
+// more editable fields. Payload is intentionally lean — listeners
+// that care about specific fields should re-read the subscription
+// via the repo.
+type SubscriptionUpdated struct {
+	ID SubscriptionID `json:"id"`
+	At time.Time      `json:"at"`
+}
+
+func (e SubscriptionUpdated) Topic() string         { return TopicPrefix + "subscription.updated" }
+func (e SubscriptionUpdated) AggregateID() string   { return aggID(e.ID) }
+func (e SubscriptionUpdated) OccurredAt() time.Time { return e.At }
