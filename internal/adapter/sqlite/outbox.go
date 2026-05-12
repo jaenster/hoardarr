@@ -189,15 +189,20 @@ func (b *OutboxBus) pruneLoop() {
 // don't lock SQLite for seconds on a huge first run.
 func (b *OutboxBus) prune() {
 	cutoff := b.now().Add(-b.pruneRetention).UnixMilli()
-	// Subs first — the outbox FK has ON DELETE CASCADE, so any outbox
-	// rows that lose all referencing subs would cascade; but in
-	// practice outbox is the parent. We use a separate orphan-sweep
-	// below to delete outbox rows that have NO outbox_subs left.
+	// modernc.org/sqlite is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT
+	// so we can't `DELETE ... LIMIT N` directly. The subquery pattern
+	// below is the canonical workaround: a non-correlated SELECT
+	// projects the rowids we want gone, the outer DELETE removes them.
+	// Each iteration drains up to 5000 rows so we don't lock SQLite
+	// for seconds on the first post-restart sweep.
 	for {
 		res, err := b.db.ExecContext(b.ctx, `
 			DELETE FROM outbox_subs
-			WHERE delivered_at IS NOT NULL AND delivered_at < ?
-			LIMIT 5000
+			WHERE rowid IN (
+				SELECT rowid FROM outbox_subs
+				WHERE delivered_at IS NOT NULL AND delivered_at < ?
+				LIMIT 5000
+			)
 		`, cutoff)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -216,8 +221,8 @@ func (b *OutboxBus) prune() {
 	for {
 		res, err := b.db.ExecContext(b.ctx, `
 			DELETE FROM outbox
-			WHERE id IN (
-				SELECT o.id FROM outbox o
+			WHERE rowid IN (
+				SELECT o.rowid FROM outbox o
 				LEFT JOIN outbox_subs s ON s.event_id = o.id
 				WHERE s.event_id IS NULL
 				LIMIT 5000
