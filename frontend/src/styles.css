@@ -1539,3 +1539,142 @@ a:hover {
 .topbar-account-item:hover {
   background: var(--bg-soft, rgba(255, 255, 255, 0.05));
 }
+
+/* settings card grid (Sonarr-style entity cards) */
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem;
+}
+
+.entity-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-start;
+  min-height: 110px;
+  padding: 0.9rem 1rem;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color 0.12s ease, transform 0.05s ease;
+}
+.entity-card:hover {
+  border-color: var(--accent, #4d8af0);
+}
+.entity-card:active {
+  transform: scale(0.99);
+}
+.entity-card-title {
+  font-size: 1.05rem;
+  font-weight: 500;
+  word-break: break-word;
+}
+.entity-card-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.6rem;
+}
+
+.card-grid-add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 110px;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+.card-grid-add:hover {
+  border-color: var(--accent, #4d8af0);
+  color: var(--text);
+}
+
+/* modal overlay (used by card-grid edit forms) */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 5vh 1rem 1rem;
+  z-index: 50;
+}
+.modal-dialog {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-1);
+  width: min(560px, 100%);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.modal-header h2 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+.modal-body {
+  padding: 1rem;
+  overflow-y: auto;
+}
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--border);
+}
+
+/* settings-form inside Modal — strips the panel-level top divider and
+   spreads the action row across the footer with destructive-left,
+   primary-right alignment. */
+.settings-form.is-modal {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+  gap: 0.8rem;
+}
+.settings-form-actions.is-modal-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  gap: 0.6rem;
+}
+.settings-form-actions-right {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.entity-card-meta {
+  font-size: 0.75rem;
+}
+.entity-card-badge {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}

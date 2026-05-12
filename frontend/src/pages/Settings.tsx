@@ -14,7 +14,6 @@ import {
   Webhook,
   Send,
   Gauge,
-  Pencil,
   PlugZap,
   X,
 } from "lucide-react";
@@ -22,6 +21,9 @@ import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
+import CardGrid from "../components/CardGrid";
+import EntityCard from "../components/EntityCard";
+import Modal from "../components/Modal";
 import { api, ApiError, type TestServerResult } from "../api/client";
 import type {
   BandwidthConfig,
@@ -57,9 +59,11 @@ function ServersSection() {
   const [servers, setServers] = useState<Server[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  // `editing` carries the entity to edit; `null` + `addOpen=true` means
+  // we render the form in add-mode. Two separate states (rather than
+  // editing | "new" | null) keeps the type narrow inside the modal body.
   const [editing, setEditing] = useState<Server | null>(null);
-  const [probeBusy, setProbeBusy] = useState<number | null>(null);
-  const [probeResult, setProbeResult] = useState<{ id: number; result: TestServerResult } | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   const refresh = async () => {
     setLoading(true);
@@ -78,29 +82,6 @@ function ServersSection() {
     void refresh();
   }, []);
 
-  const remove = async (id: number) => {
-    if (!confirm("Remove this server?")) return;
-    try {
-      await api.removeServer(id);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  const testExisting = async (id: number) => {
-    setProbeBusy(id);
-    setProbeResult(null);
-    try {
-      const result = await api.testExistingServer(id);
-      setProbeResult({ id, result });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setProbeBusy(null);
-    }
-  };
-
   return (
     <Panel
       title="Usenet Servers"
@@ -112,106 +93,60 @@ function ServersSection() {
       }
     >
       {error && <p className="text-err">{error}</p>}
-
-      {!loading && servers.length === 0 ? (
-        <p className="muted">No servers yet — add one below to start downloading.</p>
-      ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Endpoint</th>
-              <th>TLS</th>
-              <th>Conns</th>
-              <th>Priority</th>
-              <th>Type</th>
-              <th>Used</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {servers.map((s) => (
-              <tr key={s.id}>
-                <td>{s.name}</td>
-                <td className="muted">
-                  {s.host}:{s.port}
-                </td>
-                <td>
-                  <StatusBadge tone={s.tls ? "ok" : "warn"} dot>
-                    {s.tls ? "TLS" : "plain"}
-                  </StatusBadge>
-                </td>
-                <td className="muted">{s.max_conns}</td>
-                <td className="muted">
-                  {s.priority}
-                  {s.backup ? " (backup)" : ""}
-                </td>
-                <td>
-                  <StatusBadge tone={s.billing_mode === "metered" ? "warn" : "ok"} dot>
-                    {s.billing_mode === "metered" ? "metered" : "flat"}
-                  </StatusBadge>
-                </td>
-                <td className="muted">
-                  {s.billing_mode === "metered"
-                    ? `${formatBytesShort(s.used_bytes)} / ${
-                        s.quota_bytes ? formatBytesShort(s.quota_bytes) : "∞"
-                      }`
-                    : formatBytesShort(s.used_bytes)}
-                </td>
-                <td className="queue-row-actions">
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    aria-label="Test connection"
-                    title="Test connection"
-                    disabled={probeBusy === s.id}
-                    onClick={() => void testExisting(s.id)}
-                  >
-                    <PlugZap size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    aria-label="Edit server"
-                    title="Edit"
-                    onClick={() => setEditing(s)}
-                  >
-                    <Pencil size={14} />
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn icon-btn-danger"
-                    aria-label="Remove server"
-                    onClick={() => void remove(s.id)}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {!loading && servers.length === 0 && (
+        <p className="muted">No servers yet — click the + tile to add one.</p>
       )}
 
-      {probeResult && (
-        <ProbeBanner
-          result={probeResult.result}
-          onDismiss={() => setProbeResult(null)}
-        />
-      )}
+      <CardGrid onAdd={() => setAddOpen(true)} addLabel="Add server">
+        {servers.map((s) => (
+          <EntityCard
+            key={s.id}
+            title={s.name}
+            ariaLabel={`Edit ${s.name}`}
+            badge={
+              <>
+                <StatusBadge tone={s.enabled ? "ok" : "neutral"}>
+                  {s.enabled ? "Enabled" : "Disabled"}
+                </StatusBadge>
+                <span className="muted entity-card-meta">
+                  {s.host} · {formatBytesShort(s.used_bytes)}
+                </span>
+              </>
+            }
+            onClick={() => setEditing(s)}
+          />
+        ))}
+      </CardGrid>
 
       {editing && (
-        <EditServerForm
-          server={editing}
-          onClose={() => setEditing(null)}
-          onSaved={async () => {
-            setEditing(null);
-            await refresh();
-          }}
-        />
+        <Modal title={`Edit ${editing.name}`} onClose={() => setEditing(null)}>
+          <ServerForm
+            server={editing}
+            onClose={() => setEditing(null)}
+            onSaved={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+            onDeleted={async () => {
+              setEditing(null);
+              await refresh();
+            }}
+          />
+        </Modal>
       )}
 
-      <AddServerForm onAdded={() => void refresh()} />
+      {addOpen && (
+        <Modal title="Add server" onClose={() => setAddOpen(false)}>
+          <ServerForm
+            server={null}
+            onClose={() => setAddOpen(false)}
+            onSaved={async () => {
+              setAddOpen(false);
+              await refresh();
+            }}
+          />
+        </Modal>
+      )}
     </Panel>
   );
 }
@@ -266,31 +201,44 @@ function ProbeBanner({
 // and submitting via PATCH. We don't surface the existing password —
 // leaving the field blank means "don't change it"; typing a new value
 // replaces it.
-function EditServerForm({
+// ServerForm is the unified add/edit form for Usenet servers. When
+// `server` is null it renders in add mode (Name + create), otherwise
+// edit mode (Name immutable + patch + delete). Both modes share field
+// layout, validation, and the Test-connection button.
+//
+// Lives inside a Modal — onClose is wired to the parent modal's close
+// handler; onSaved / onDeleted refresh the card grid.
+function ServerForm({
   server,
   onClose,
   onSaved,
+  onDeleted,
 }: {
-  server: Server;
+  server: Server | null;
   onClose: () => void;
   onSaved: () => void | Promise<void>;
+  onDeleted?: () => void | Promise<void>;
 }) {
-  const [host, setHost] = useState(server.host);
-  const [port, setPort] = useState(server.port);
-  const [tls, setTls] = useState(server.tls);
-  const [username, setUsername] = useState(server.username ?? "");
+  const isEdit = server !== null;
+  const [name, setName] = useState(server?.name ?? "");
+  const [host, setHost] = useState(server?.host ?? "");
+  const [port, setPort] = useState(server?.port ?? 563);
+  const [tls, setTls] = useState(server?.tls ?? true);
+  const [username, setUsername] = useState(server?.username ?? "");
   const [password, setPassword] = useState("");
-  const [maxConns, setMaxConns] = useState(server.max_conns);
-  const [priority, setPriority] = useState(server.priority);
-  const [backup, setBackup] = useState(server.backup);
+  const [maxConns, setMaxConns] = useState(server?.max_conns ?? 8);
+  const [priority, setPriority] = useState(server?.priority ?? 0);
+  const [backup, setBackup] = useState(server?.backup ?? false);
   const [billingMode, setBillingMode] = useState<"flat" | "metered">(
-    server.billing_mode === "metered" ? "metered" : "flat",
+    server?.billing_mode === "metered" ? "metered" : "flat",
   );
   const [quotaGB, setQuotaGB] = useState(
-    server.quota_bytes ? Math.round(server.quota_bytes / 1024 / 1024 / 1024) : 0,
+    server?.quota_bytes
+      ? Math.round(server.quota_bytes / 1024 / 1024 / 1024)
+      : 0,
   );
   const [bandwidthMBPerSec, setBandwidthMBPerSec] = useState(
-    server.bandwidth_bytes_per_sec
+    server?.bandwidth_bytes_per_sec
       ? Math.round((server.bandwidth_bytes_per_sec / 1024 / 1024) * 10) / 10
       : 0,
   );
@@ -304,27 +252,50 @@ function EditServerForm({
     setSubmitting(true);
     setErr(null);
     try {
-      await api.patchServer(server.id, {
-        host: host.trim(),
-        port,
-        tls,
-        username: username.trim(),
-        // Empty password = don't change. The backend only mutates when
-        // the field is present, so we omit it entirely when blank.
-        ...(password ? { password } : {}),
-        max_conns: maxConns,
-        priority,
-        backup,
-        billing_mode: billingMode,
-        quota_bytes:
-          billingMode === "metered" && quotaGB > 0
-            ? Math.round(quotaGB * 1024 * 1024 * 1024)
-            : 0,
-        bandwidth_bytes_per_sec:
-          bandwidthMBPerSec > 0
-            ? Math.round(bandwidthMBPerSec * 1024 * 1024)
-            : 0,
-      });
+      if (isEdit && server) {
+        await api.patchServer(server.id, {
+          host: host.trim(),
+          port,
+          tls,
+          username: username.trim(),
+          // Empty password = don't change. The backend only mutates
+          // when the field is present.
+          ...(password ? { password } : {}),
+          max_conns: maxConns,
+          priority,
+          backup,
+          billing_mode: billingMode,
+          quota_bytes:
+            billingMode === "metered" && quotaGB > 0
+              ? Math.round(quotaGB * 1024 * 1024 * 1024)
+              : 0,
+          bandwidth_bytes_per_sec:
+            bandwidthMBPerSec > 0
+              ? Math.round(bandwidthMBPerSec * 1024 * 1024)
+              : 0,
+        });
+      } else {
+        await api.addServer({
+          name: name.trim(),
+          host: host.trim(),
+          port,
+          tls,
+          username: username.trim() || undefined,
+          password: password || undefined,
+          max_conns: maxConns,
+          priority,
+          backup,
+          billing_mode: billingMode,
+          quota_bytes:
+            billingMode === "metered" && quotaGB > 0
+              ? Math.round(quotaGB * 1024 * 1024 * 1024)
+              : 0,
+          bandwidth_bytes_per_sec:
+            bandwidthMBPerSec > 0
+              ? Math.round(bandwidthMBPerSec * 1024 * 1024)
+              : 0,
+        });
+      }
       await onSaved();
     } catch (e) {
       if (e instanceof ApiError) {
@@ -357,23 +328,47 @@ function EditServerForm({
     }
   };
 
+  const remove = async () => {
+    if (!server || !onDeleted) return;
+    if (!confirm(`Remove ${server.name}?`)) return;
+    try {
+      await api.removeServer(server.id);
+      await onDeleted();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const valid =
+    (isEdit || name.trim().length > 0) &&
+    host.trim().length > 0 &&
+    port > 0 &&
+    port <= 65535 &&
+    maxConns > 0;
+
   return (
-    <form className="settings-form" onSubmit={submit}>
-      <div className="settings-form-header">
-        <h3>Edit {server.name}</h3>
-        <button
-          type="button"
-          className="icon-btn"
-          aria-label="Close edit"
-          onClick={onClose}
-        >
-          <X size={14} />
-        </button>
-      </div>
+    <form className="settings-form is-modal" onSubmit={submit}>
+      {!isEdit && (
+        <div className="settings-row">
+          <label className="settings-field">
+            <span>Name</span>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              autoFocus
+              required
+            />
+          </label>
+        </div>
+      )}
       <div className="settings-row">
         <label className="settings-field">
           <span>Host</span>
-          <input value={host} onChange={(e) => setHost(e.target.value)} />
+          <input
+            value={host}
+            onChange={(e) => setHost(e.target.value)}
+            autoFocus={isEdit}
+          />
         </label>
         <label className="settings-field settings-field-narrow">
           <span>Port</span>
@@ -407,7 +402,7 @@ function EditServerForm({
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            placeholder="leave blank to keep current"
+            placeholder={isEdit ? "leave blank to keep current" : ""}
             autoComplete="new-password"
           />
         </label>
@@ -474,216 +469,45 @@ function EditServerForm({
       </div>
       {err && <p className="text-err">{err}</p>}
       {probe && <ProbeBanner result={probe} onDismiss={() => setProbe(null)} />}
-      <div className="settings-form-actions">
-        <Button
-          variant="ghost"
-          type="button"
-          icon={<PlugZap size={14} />}
-          disabled={probing || !host.trim() || port <= 0}
-          onClick={() => void runTest()}
-        >
-          {probing ? "Testing…" : "Test connection"}
-        </Button>
-        <Button variant="primary" type="submit" disabled={submitting}>
-          {submitting ? "Saving…" : "Save changes"}
-        </Button>
-      </div>
-    </form>
-  );
-}
-
-function AddServerForm({ onAdded }: { onAdded: () => void }) {
-  const [name, setName] = useState("");
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState(563);
-  const [tls, setTls] = useState(true);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [maxConns, setMaxConns] = useState(8);
-  const [priority, setPriority] = useState(0);
-  const [backup, setBackup] = useState(false);
-  const [billingMode, setBillingMode] = useState<"flat" | "metered">("flat");
-  const [quotaGB, setQuotaGB] = useState(0); // operator-friendly: GB; converted to bytes on submit
-  const [bandwidthMBPerSec, setBandwidthMBPerSec] = useState(0); // 0 = no per-server cap
-  const [submitting, setSubmitting] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setSubmitting(true);
-    setErr(null);
-    try {
-      await api.addServer({
-        name: name.trim(),
-        host: host.trim(),
-        port,
-        tls,
-        username: username.trim() || undefined,
-        password: password || undefined,
-        max_conns: maxConns,
-        priority,
-        backup,
-        billing_mode: billingMode,
-        quota_bytes:
-          billingMode === "metered" && quotaGB > 0
-            ? Math.round(quotaGB * 1024 * 1024 * 1024)
-            : 0,
-        bandwidth_bytes_per_sec:
-          bandwidthMBPerSec > 0
-            ? Math.round(bandwidthMBPerSec * 1024 * 1024)
-            : 0,
-      });
-      setName("");
-      setHost("");
-      setUsername("");
-      setPassword("");
-      setBackup(false);
-      setBillingMode("flat");
-      setQuotaGB(0);
-      setBandwidthMBPerSec(0);
-      onAdded();
-    } catch (e) {
-      if (e instanceof ApiError) {
-        const body = e.body as { error?: string } | null;
-        setErr(body?.error ?? e.message);
-      } else {
-        setErr(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const valid =
-    name.trim().length > 0 &&
-    host.trim().length > 0 &&
-    port > 0 &&
-    port <= 65535 &&
-    maxConns > 0;
-
-  return (
-    <form className="settings-form" onSubmit={submit}>
-      <h3>Add server</h3>
-      <div className="settings-row">
-        <label className="settings-field">
-          <span>Name</span>
-          <input value={name} onChange={(e) => setName(e.target.value)} />
-        </label>
-        <label className="settings-field">
-          <span>Host</span>
-          <input value={host} onChange={(e) => setHost(e.target.value)} />
-        </label>
-        <label className="settings-field settings-field-narrow">
-          <span>Port</span>
-          <input
-            type="number"
-            value={port}
-            onChange={(e) => setPort(Number(e.target.value))}
-          />
-        </label>
-        <label className="settings-checkbox">
-          <input
-            type="checkbox"
-            checked={tls}
-            onChange={(e) => setTls(e.target.checked)}
-          />
-          <span>TLS</span>
-        </label>
-      </div>
-      <div className="settings-row">
-        <label className="settings-field">
-          <span>Username</span>
-          <input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoComplete="off"
-          />
-        </label>
-        <label className="settings-field">
-          <span>Password</span>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="new-password"
-          />
-        </label>
-        <label className="settings-field settings-field-narrow">
-          <span>Max conns</span>
-          <input
-            type="number"
-            value={maxConns}
-            onChange={(e) => setMaxConns(Number(e.target.value))}
-          />
-        </label>
-        <label className="settings-field settings-field-narrow">
-          <span>Priority</span>
-          <input
-            type="number"
-            value={priority}
-            onChange={(e) => setPriority(Number(e.target.value))}
-          />
-        </label>
-        <label className="settings-checkbox">
-          <input
-            type="checkbox"
-            checked={backup}
-            onChange={(e) => setBackup(e.target.checked)}
-          />
-          <span>Backup</span>
-        </label>
-      </div>
-      <div className="settings-row">
-        <label className="settings-field">
-          <span>Billing</span>
-          <select
-            value={billingMode}
-            onChange={(e) => setBillingMode(e.target.value as "flat" | "metered")}
+      <div className="settings-form-actions is-modal-actions">
+        {isEdit && onDeleted ? (
+          <Button
+            variant="ghost"
+            type="button"
+            icon={<Trash2 size={14} />}
+            onClick={() => void remove()}
           >
-            <option value="flat">Flat (unlimited)</option>
-            <option value="metered">Metered (block / pay-per-byte)</option>
-          </select>
-        </label>
-        {billingMode === "metered" && (
-          <label className="settings-field settings-field-narrow">
-            <span>Quota (GB)</span>
-            <input
-              type="number"
-              min={0}
-              step={1}
-              value={quotaGB}
-              onChange={(e) => setQuotaGB(Number(e.target.value))}
-              placeholder="0 = unlimited"
-            />
-          </label>
+            Delete
+          </Button>
+        ) : (
+          <span />
         )}
-        <label className="settings-field settings-field-narrow">
-          <span>Speed cap (MB/s)</span>
-          <input
-            type="number"
-            min={0}
-            step={0.5}
-            value={bandwidthMBPerSec}
-            onChange={(e) => setBandwidthMBPerSec(Number(e.target.value))}
-            placeholder="0 = no cap"
-          />
-        </label>
+        <div className="settings-form-actions-right">
+          <Button
+            variant="ghost"
+            type="button"
+            icon={<PlugZap size={14} />}
+            disabled={probing || !host.trim() || port <= 0}
+            onClick={() => void runTest()}
+          >
+            {probing ? "Testing…" : "Test"}
+          </Button>
+          <Button variant="ghost" type="button" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" type="submit" disabled={submitting || !valid}>
+            {submitting ? "Saving…" : isEdit ? "Save changes" : "Add server"}
+          </Button>
+        </div>
       </div>
-      {err && <p className="text-err">{err}</p>}
-      <Button
-        variant="primary"
-        type="submit"
-        icon={<Plus size={14} />}
-        disabled={!valid || submitting}
-      >
-        {submitting ? "Adding…" : "Add server"}
-      </Button>
     </form>
   );
 }
+
 
 // --- shared helpers --------------------------------------------------
 
+// formatBytesShort renders byte counts as "12 GB" / "1.4 TB".
 function formatBytesShort(n: number): string {
   if (n <= 0) return "—";
   const units = ["B", "KB", "MB", "GB", "TB"];
