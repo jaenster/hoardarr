@@ -5,9 +5,19 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jaenster/hoardarr/internal/domain/tx"
 )
+
+// maxSnapshotRetries caps the number of times InTx will reopen on a
+// SQLITE_BUSY_SNAPSHOT (517). With MaxOpenConns > 1 it's possible for
+// a tx to open a read snapshot, then attempt a write after another
+// connection has already advanced the DB. busy_timeout doesn't help
+// here — the right answer is roll back, re-begin, replay the closure.
+// Five retries with a tiny stagger is plenty in practice.
+const maxSnapshotRetries = 5
 
 // txKey is the unexported context-key type used to attach an active
 // *sql.Tx to a context. Repos and the outbox bus extract via TxFromContext
@@ -47,6 +57,29 @@ func (m *TxManager) InTx(ctx context.Context, fn func(ctx context.Context) error
 	if existing := TxFromContext(ctx); existing != nil {
 		return fn(ctx)
 	}
+	var lastErr error
+	for attempt := 0; attempt < maxSnapshotRetries; attempt++ {
+		err := m.runTx(ctx, fn)
+		if err == nil {
+			return nil
+		}
+		if !isSnapshotConflict(err) {
+			return err
+		}
+		lastErr = err
+		// Tiny backoff so we don't spin if another writer is bursty.
+		select {
+		case <-time.After(time.Duration(attempt+1) * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return fmt.Errorf("intx: snapshot conflict after %d retries: %w", maxSnapshotRetries, lastErr)
+}
+
+// runTx is one transaction attempt. Separated so InTx can replay on
+// SQLITE_BUSY_SNAPSHOT.
+func (m *TxManager) runTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	sqlTx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -67,6 +100,18 @@ func (m *TxManager) InTx(ctx context.Context, fn func(ctx context.Context) error
 		return fmt.Errorf("commit: %w", err)
 	}
 	return nil
+}
+
+// isSnapshotConflict matches SQLITE_BUSY_SNAPSHOT (extended code 517).
+// modernc.org/sqlite surfaces the error code in the error string.
+func isSnapshotConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "SQLITE_BUSY_SNAPSHOT") ||
+		strings.Contains(s, "database is locked (517)") ||
+		strings.Contains(s, "(517)")
 }
 
 // TxFromContext returns the *sql.Tx attached to ctx, or nil if none.

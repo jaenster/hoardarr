@@ -57,16 +57,25 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.MaxOpenConns == 0 {
-		// SQLite + WAL allows concurrent readers but only one writer.
-		// Multiple Go connections each holding a snapshot trip
-		// SQLITE_BUSY_SNAPSHOT (517) when one writes mid-snapshot —
-		// busy_timeout doesn't fix snapshot conflicts. Pinning the
-		// pool at 1 connection serializes everything; for hoardarr's
-		// load (handful of goroutines, batched commits) this is
-		// strictly cheaper than the alternative (separate r/w pools)
-		// and trivially correct. Revisit when read latency becomes
-		// a measured bottleneck.
-		o.MaxOpenConns = 1
+		// SQLite + WAL allows many concurrent readers and exactly one
+		// writer. The original design pinned the pool to 1 conn to
+		// dodge SQLITE_BUSY_SNAPSHOT (517) on the SELECT-then-UPDATE
+		// pattern inside a transaction, but the cost is severe:
+		// under live load every HTTP handler queues behind whatever
+		// the orchestrator's segment drainer or outbox dispatcher
+		// happens to be doing, so /api/v1/queue and /system/status
+		// can take seconds even when their queries cost microseconds.
+		// pprof on the live container showed 70+ goroutines blocked
+		// in database/sql.(*DB).conn — the single conn was the
+		// bottleneck, not query cost.
+		//
+		// With WAL + busy_timeout the only path to a real
+		// SQLITE_BUSY_SNAPSHOT failure is a single tx that opens a
+		// read snapshot and then upgrades to a write *after* another
+		// tx has committed. We catch that case in tx_manager.go and
+		// retry the whole InTx closure. Reads stay autocommit and
+		// scale freely.
+		o.MaxOpenConns = 8
 	}
 	if o.MaxIdleConns == 0 {
 		o.MaxIdleConns = o.MaxOpenConns
