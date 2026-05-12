@@ -184,17 +184,31 @@ func (b *OutboxBus) pruneLoop() {
 	}
 }
 
-// prune deletes delivered outbox_subs rows older than the retention
-// window and orphaned outbox rows. Each DELETE is bounded so we
-// don't lock SQLite for seconds on a huge first run.
+// prune deletes outbox_subs rows in two cases:
+//
+//   1. delivered_at IS NOT NULL AND delivered_at < cutoff — they've
+//      been delivered and are past retention.
+//
+//   2. delivered_at IS NULL AND occurred_at < stale-cutoff — they've
+//      been pending for so long they're effectively garbage. This is
+//      what reaps the orphan rows from a prior bug where Publish
+//      created sub rows for subscriptions that didn't match the
+//      event's topic; without this, those rows live forever and
+//      bloat every dispatcher's scan.
+//
+// Each DELETE is bounded so the first post-restart sweep doesn't lock
+// SQLite for seconds. modernc.org/sqlite is built without
+// SQLITE_ENABLE_UPDATE_DELETE_LIMIT so we use the rowid-subquery
+// workaround.
 func (b *OutboxBus) prune() {
 	cutoff := b.now().Add(-b.pruneRetention).UnixMilli()
-	// modernc.org/sqlite is built without SQLITE_ENABLE_UPDATE_DELETE_LIMIT
-	// so we can't `DELETE ... LIMIT N` directly. The subquery pattern
-	// below is the canonical workaround: a non-correlated SELECT
-	// projects the rowids we want gone, the outer DELETE removes them.
-	// Each iteration drains up to 5000 rows so we don't lock SQLite
-	// for seconds on the first post-restart sweep.
+	// Stale-undelivered cutoff is 24x retention by default — generous
+	// so we never reap something a slow subscriber could still
+	// deliver, tight enough that misrouted rows from a prior buggy
+	// publish path don't accumulate forever.
+	staleCutoff := b.now().Add(-24 * b.pruneRetention).UnixMilli()
+
+	// Phase 1: delivered rows past retention.
 	for {
 		res, err := b.db.ExecContext(b.ctx, `
 			DELETE FROM outbox_subs
@@ -208,7 +222,33 @@ func (b *OutboxBus) prune() {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			b.logger.Warn("outbox prune subs", "err", err)
+			b.logger.Warn("outbox prune delivered", "err", err)
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			break
+		}
+	}
+
+	// Phase 2: stale-undelivered. Joins outbox to get occurred_at; the
+	// outbox_subs.event_id index from migration 015 makes the join
+	// O(matched rows) instead of a scan.
+	for {
+		res, err := b.db.ExecContext(b.ctx, `
+			DELETE FROM outbox_subs
+			WHERE rowid IN (
+				SELECT s.rowid FROM outbox_subs s
+				JOIN outbox o ON o.id = s.event_id
+				WHERE s.delivered_at IS NULL AND o.occurred_at < ?
+				LIMIT 5000
+			)
+		`, staleCutoff)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			b.logger.Warn("outbox prune stale-undelivered", "err", err)
 			return
 		}
 		n, _ := res.RowsAffected()

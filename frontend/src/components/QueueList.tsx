@@ -145,15 +145,32 @@ function QueueRow({
   onResume: QueueAction;
   onRemove: QueueAction;
 }) {
-  // Progress bar shows two stacked fills: green = bytes successfully
-  // downloaded, red = bytes accounted for but missing / failed (PAR2
-  // will deal with them, if it can). Together they reflect "bytes
-  // resolved" so the bar fills to 100% the moment every segment has
-  // a verdict — matching how SABnzbd shows it. The numeric label
-  // shows done / total so the operator still sees raw progress.
-  const donePct = job.total_bytes > 0 ? (job.done_bytes / job.total_bytes) * 100 : 0;
-  const failedPct = job.total_bytes > 0 ? (job.failed_bytes / job.total_bytes) * 100 : 0;
-  const resolvedPct = Math.min(100, donePct + failedPct);
+  // Progress bar stacks green (downloaded) + red (missing) inside one
+  // bar. The bar reflects the *download phase* progress, not raw byte
+  // ratios — total_bytes is yEnc envelope size, done_bytes is decoded
+  // payload, so a perfect download reads as ~97% by bytes alone. Once
+  // state has advanced past downloading the phase is done by
+  // definition, so we pin the bar to 100% and let the failed sliver
+  // represent whatever bytes are damaged + PAR2's problem.
+  const isDownloading =
+    job.state === "queued" ||
+    job.state === "downloading" ||
+    job.state === "paused" ||
+    job.state === "waiting_for_server";
+  const rawDonePct = job.total_bytes > 0 ? (job.done_bytes / job.total_bytes) * 100 : 0;
+  const rawFailedPct = job.total_bytes > 0 ? (job.failed_bytes / job.total_bytes) * 100 : 0;
+  // Pin to 100% once we leave the downloading phase. The split between
+  // green/red is preserved so the bar still shows "X% damaged, PAR2
+  // working on it" for stuck jobs.
+  const totalPct = isDownloading
+    ? Math.min(100, rawDonePct + rawFailedPct)
+    : 100;
+  const scale = isDownloading || rawDonePct + rawFailedPct === 0
+    ? 1
+    : 100 / (rawDonePct + rawFailedPct);
+  const donePct = rawDonePct * scale;
+  const failedPct = totalPct - donePct;
+  const resolvedPct = totalPct;
   const isPaused = job.state === "paused";
   const isTerminal =
     job.state === "completed" || job.state === "failed" || job.state === "aborted";
