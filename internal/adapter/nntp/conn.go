@@ -133,7 +133,7 @@ func Dial(ctx context.Context, s *server.UsenetServer, opts ...DialOption) (*Con
 	}
 	if code != 200 && code != 201 {
 		_ = c.Close()
-		return nil, fmt.Errorf("%w: %d %s", ErrUnexpectedGreeting, code, msg)
+		return nil, classifyGreeting(code, msg)
 	}
 	return c, nil
 }

@@ -37,9 +37,22 @@ type Pool struct {
 	idle   []*Conn
 	closed atomic.Bool
 
+	// throttledUntil is the wall-clock time before which checkout()
+	// refuses to dial new conns. Set when the server's greeting comes
+	// back as ErrTooManyConnections; existing idle conns still serve.
+	// Held under mu.
+	throttledUntil time.Time
+
 	stop chan struct{}
 	wg   sync.WaitGroup
 }
+
+// ThrottleBackoff is how long the pool refuses new dials after a
+// "too many connections" greeting from the server. Existing idle conns
+// keep serving so we don't stall a job that already has bandwidth on
+// the wire — we just stop adding pressure to a provider that's saying
+// "stop".
+var ThrottleBackoff = 10 * time.Second
 
 // PoolOptions tunes Pool behaviour. Zero values are sensible.
 type PoolOptions struct {
@@ -168,9 +181,29 @@ func (p *Pool) checkout(ctx context.Context) (*Conn, error) {
 		return c, nil
 	}
 
-	// No idle conn — dial new.
+	// No idle conn. Before we dial, check whether the server has
+	// recently told us to back off — if so, fail fast so the caller
+	// (TieredFetcher) can move to a different pool or sleep without
+	// adding more failed dials to the provider.
+	p.mu.Lock()
+	throttledUntil := p.throttledUntil
+	p.mu.Unlock()
+	if !throttledUntil.IsZero() && time.Now().Before(throttledUntil) {
+		return nil, ErrTooManyConnections
+	}
+
 	c, err := Dial(ctx, p.srv, WithDialer(p.dialer))
 	if err != nil {
+		if errors.Is(err, ErrTooManyConnections) {
+			// Latch the back-off so concurrent Acquires also short-
+			// circuit immediately rather than each pile a fresh dial
+			// onto the over-capacity server.
+			p.mu.Lock()
+			p.throttledUntil = time.Now().Add(ThrottleBackoff)
+			p.mu.Unlock()
+			p.logger.Warn("nntp pool: server reports too many connections; throttling",
+				"server", p.srv.Name(), "backoff", ThrottleBackoff)
+		}
 		return nil, err
 	}
 	if err := c.Authenticate(ctx); err != nil {

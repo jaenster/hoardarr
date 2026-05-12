@@ -104,6 +104,18 @@ func (f *TieredFetcher) Fetch(ctx context.Context, _ server.ServerID, messageID 
 			sawMissing = true
 			continue
 		}
+		if errors.Is(err, nntp.ErrTooManyConnections) {
+			// The provider is over-capacity. Treat this pool as
+			// temporarily unavailable for this fetch and fall through
+			// to the next tier candidate. Pool.Acquire has already
+			// latched a back-off, so subsequent fetches won't pile on
+			// fresh dials.
+			f.logger.Info("nntp: server over-capacity, trying next pool",
+				"server", p.Server().Name(),
+				"server_id", int64(p.Server().ID()),
+			)
+			continue
+		}
 		f.logger.Warn("article fetch failed",
 			"msg_id", messageID,
 			"server", p.Server().Name(),
