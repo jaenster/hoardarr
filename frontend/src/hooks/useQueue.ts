@@ -116,37 +116,21 @@ export function useQueue() {
   useEffect(() => {
     void refresh();
 
-    // Poll throughput once per second so the ETA stays responsive
-    // without hammering the server. Window is 300s rolling; this
-    // is a cheap snapshot read.
-    let stopped = false;
-    const pollThroughput = async () => {
-      try {
-        const tp = await api.throughput();
-        if (!stopped) {
-          // Prefer the 10-second rolling average so the displayed
-          // speed doesn't jitter with every fetched article. Falls
-          // back to current-second value while the window fills up.
-          const rate = tp.avg10s_bytes_per_sec || tp.current_bytes_per_sec;
-          setBytesPerSec(rate);
-        }
-      } catch {
-        /* non-fatal — ETA just won't render */
-      }
-    };
-    const pollPools = async () => {
-      try {
-        const st = await api.systemStatus();
-        if (!stopped) setPools(st.pools ?? []);
-      } catch {
-        /* non-fatal */
-      }
-    };
-    void pollThroughput();
-    void pollPools();
-    const tpTimer = window.setInterval(() => void pollThroughput(), 1000);
-    // Pool stats change much more slowly than speed — every 2s is plenty.
-    const poolTimer = window.setInterval(() => void pollPools(), 2000);
+    // One-shot warm-up for throughput + pools so the UI isn't blank
+    // for the first second while we wait for the first SSE tick.
+    // From then on the server pushes both on a timer (system.throughput
+    // every 1s, system.pools every 5s) and the EventSource handlers
+    // below keep state in sync — no HTTP polling.
+    void api
+      .throughput()
+      .then((tp) =>
+        setBytesPerSec(tp.avg10s_bytes_per_sec || tp.current_bytes_per_sec),
+      )
+      .catch(() => {});
+    void api
+      .systemStatus()
+      .then((st) => setPools(st.pools ?? []))
+      .catch(() => {});
 
     const es = new EventSource(streamURL());
 
@@ -158,6 +142,27 @@ export function useQueue() {
       if (payload?.job_id && typeof payload.bytes === "number") {
         patchJobBytes(payload.job_id, payload.bytes, 0);
       }
+    });
+
+    // System.throughput → push every second from the server. Replaces
+    // the per-second poll of /api/v1/system/throughput.
+    es.addEventListener("system.throughput", (ev) => {
+      const env = parseEnvelope(ev);
+      const payload = env?.Payload as
+        | { current_bytes_per_sec?: number; avg10s_bytes_per_sec?: number }
+        | undefined;
+      if (!payload) return;
+      setBytesPerSec(
+        payload.avg10s_bytes_per_sec || payload.current_bytes_per_sec || 0,
+      );
+    });
+
+    // System.pools → pushed every 5 seconds. Replaces the
+    // /api/v1/system/status poll.
+    es.addEventListener("system.pools", (ev) => {
+      const env = parseEnvelope(ev);
+      const payload = env?.Payload as { pools?: PoolStatus[] } | undefined;
+      if (payload?.pools) setPools(payload.pools);
     });
 
     // Segment-dispatched → "currently fetching X" UI hint. Payload
@@ -219,9 +224,6 @@ export function useQueue() {
     };
 
     return () => {
-      stopped = true;
-      window.clearInterval(tpTimer);
-      window.clearInterval(poolTimer);
       if (debounceTimer.current != null) {
         window.clearTimeout(debounceTimer.current);
       }

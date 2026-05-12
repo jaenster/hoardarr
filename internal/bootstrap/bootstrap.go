@@ -342,6 +342,10 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		PoolsSource: orch.PoolsSnapshot,
 		Servers:     serverRepo,
 		Throughput:  throughput,
+		// Bus drives the periodic system.throughput + system.pools
+		// SSE pushes so the frontend doesn't poll those endpoints.
+		Bus:    bus,
+		Logger: logger,
 	})
 
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
@@ -484,6 +488,9 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.Notify.Start(ctx); err != nil {
 		return fmt.Errorf("start notify: %w", err)
 	}
+	if err := a.SystemService.Start(ctx); err != nil {
+		return fmt.Errorf("start system: %w", err)
+	}
 	a.ByteFlusher.Start(ctx)
 
 	errCh := make(chan error, 1)
@@ -523,6 +530,9 @@ func (a *App) Shutdown() error {
 			}
 		}
 		a.ByteFlusher.Stop()
+		if err := a.SystemService.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("stop system: %w", err)
+		}
 		if err := a.Notify.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("notify stop: %w", err)
 		}
