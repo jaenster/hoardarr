@@ -216,30 +216,15 @@ func (b *OutboxBus) prune() {
 			break
 		}
 	}
-	// Orphan outbox rows — events with no subscribers left to deliver.
-	// Same bounded-loop pattern.
-	for {
-		res, err := b.db.ExecContext(b.ctx, `
-			DELETE FROM outbox
-			WHERE rowid IN (
-				SELECT o.rowid FROM outbox o
-				LEFT JOIN outbox_subs s ON s.event_id = o.id
-				WHERE s.event_id IS NULL
-				LIMIT 5000
-			)
-		`)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			b.logger.Warn("outbox prune orphans", "err", err)
-			return
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			break
-		}
-	}
+	// Note: we deliberately don't sweep orphan outbox rows here.
+	// The LEFT JOIN-style query is O(outbox × outbox_subs) without
+	// a covering index — on the live container that took the writer
+	// lock long enough to wedge every other transaction with
+	// SQLITE_BUSY. Subs-only prune is what keeps the dispatcher's
+	// working set lean; outbox rows are tiny and accumulate slowly,
+	// and the upcoming durable-scheduler task can age them out on
+	// a much cheaper "id <= cutoff" query (UUID v7 ids are time-
+	// ordered, so a single index lookup answers it).
 }
 
 // Publish persists each event to the outbox along with a per-subscriber
