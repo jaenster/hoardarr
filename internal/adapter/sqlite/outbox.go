@@ -242,10 +242,15 @@ func (b *OutboxBus) Publish(ctx context.Context, evts ...event.Event) error {
 		return errors.New("outbox bus: closed")
 	}
 
-	// Snapshot subscriber names. We hold the read lock long enough to
-	// take the snapshot, then release; sub set is "as of now" which is
-	// an accepted from-now-forward semantics.
-	subs := b.snapshotSubNames()
+	// Snapshot the topic→subs map under the read lock so the lookup
+	// inside `publish` is a plain map read. The dispatch query filters
+	// by o.topic = sub.topic anyway, so creating outbox_subs rows for
+	// subscriptions that don't match the event's topic is pure waste —
+	// they sit undelivered forever (no match in dispatcher's SELECT)
+	// and bloat the table by 50-100×. The old code created one row per
+	// sub-per-event regardless of topic; on the live container that
+	// turned every published event into ~70 garbage rows.
+	subsByTopic := b.snapshotSubsByTopic()
 
 	publish := func(ctx context.Context) error {
 		now := b.now().UnixMilli()
@@ -268,7 +273,11 @@ func (b *OutboxBus) Publish(ctx context.Context, evts ...event.Event) error {
 			); err != nil {
 				return fmt.Errorf("insert outbox: %w", err)
 			}
-			for _, name := range subs {
+			// Only create sub rows for subscriptions that subscribed to
+			// this event's topic. If no one is listening the event still
+			// lands in outbox (for EventsByJob replay queries) but skips
+			// the per-sub fan-out entirely.
+			for name := range subsByTopic[e.Topic()] {
 				if _, err := b.db.ExecCtx(ctx,
 					`INSERT INTO outbox_subs(subscription, event_id, attempts) VALUES (?, ?, 0)`,
 					name, id[:],
@@ -412,6 +421,25 @@ func (b *OutboxBus) Close() error {
 	b.cancel()
 	b.wg.Wait()
 	return nil
+}
+
+// snapshotSubsByTopic returns a deep-enough copy of the topic→subs map
+// so Publish can iterate it without holding the lock. The inner map is
+// keyed by subscription name; the values aren't used (the dispatcher
+// already has the *outboxSub via b.byName). Returned map is safe to
+// keep — it's a copy.
+func (b *OutboxBus) snapshotSubsByTopic() map[string]map[string]struct{} {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make(map[string]map[string]struct{}, len(b.byTopic))
+	for topic, subs := range b.byTopic {
+		inner := make(map[string]struct{}, len(subs))
+		for name := range subs {
+			inner[name] = struct{}{}
+		}
+		out[topic] = inner
+	}
+	return out
 }
 
 func (b *OutboxBus) snapshotSubNames() []string {
