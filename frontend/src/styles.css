@@ -763,6 +763,9 @@ a:hover {
   overflow: hidden;
 }
 .progress-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
   height: 100%;
   background: linear-gradient(
     90deg,
@@ -770,6 +773,12 @@ a:hover {
     var(--accent-hover) 100%
   );
   transition: width 200ms ease;
+}
+.progress-fill.is-failed {
+  /* Stacks to the right of the green fill via inline `left` style.
+     Red gradient signals "missing — PAR2's problem now" without
+     screaming damage if the data turns out to be fully repairable. */
+  background: linear-gradient(90deg, #d9534f 0%, #c9302c 100%);
 }
 .progress-label {
   position: absolute;

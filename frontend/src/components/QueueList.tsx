@@ -145,7 +145,15 @@ function QueueRow({
   onResume: QueueAction;
   onRemove: QueueAction;
 }) {
-  const pct = job.total_bytes > 0 ? (job.done_bytes / job.total_bytes) * 100 : 0;
+  // Progress bar shows two stacked fills: green = bytes successfully
+  // downloaded, red = bytes accounted for but missing / failed (PAR2
+  // will deal with them, if it can). Together they reflect "bytes
+  // resolved" so the bar fills to 100% the moment every segment has
+  // a verdict — matching how SABnzbd shows it. The numeric label
+  // shows done / total so the operator still sees raw progress.
+  const donePct = job.total_bytes > 0 ? (job.done_bytes / job.total_bytes) * 100 : 0;
+  const failedPct = job.total_bytes > 0 ? (job.failed_bytes / job.total_bytes) * 100 : 0;
+  const resolvedPct = Math.min(100, donePct + failedPct);
   const isPaused = job.state === "paused";
   const isTerminal =
     job.state === "completed" || job.state === "failed" || job.state === "aborted";
@@ -229,20 +237,30 @@ function QueueRow({
           </button>
         </div>
       </div>
-      <div className="progress" role="progressbar" aria-valuenow={pct}>
+      <div className="progress" role="progressbar" aria-valuenow={resolvedPct}>
         <div
           className={"progress-fill " + (isPaused ? "is-paused" : "")}
-          style={{ width: pct + "%" }}
+          style={{ width: donePct + "%" }}
         />
+        {failedPct > 0 && (
+          <div
+            className="progress-fill is-failed"
+            style={{ left: donePct + "%", width: failedPct + "%" }}
+            title={`${formatBytes(job.failed_bytes)} missing — PAR2 will try to repair`}
+          />
+        )}
         <span className="progress-label">
           {formatBytes(job.done_bytes)} / {formatBytes(job.total_bytes)}{" "}
-          ({pct.toFixed(1)}%)
+          ({resolvedPct.toFixed(1)}%)
           {job.state === "downloading" && bytesPerSec && bytesPerSec > 0 && (
             <>
               {" · "}
               <span className="muted">
                 {formatBytes(bytesPerSec)}/s · ETA{" "}
-                {formatETA((job.total_bytes - job.done_bytes) / bytesPerSec)}
+                {formatETA(
+                  (job.total_bytes - job.done_bytes - job.failed_bytes) /
+                    bytesPerSec,
+                )}
               </span>
             </>
           )}
