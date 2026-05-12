@@ -32,6 +32,7 @@ import (
 	appextract "github.com/jaenster/hoardarr/internal/app/extract"
 	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
 	apprepair "github.com/jaenster/hoardarr/internal/app/repair"
+	appschedule "github.com/jaenster/hoardarr/internal/app/schedule"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
 	appverify "github.com/jaenster/hoardarr/internal/app/verify"
@@ -46,6 +47,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/domain/notify"
 	"github.com/jaenster/hoardarr/internal/loghub"
 	"github.com/jaenster/hoardarr/internal/config"
+	domainschedule "github.com/jaenster/hoardarr/internal/domain/schedule"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
 )
@@ -101,6 +103,7 @@ type App struct {
 	Deliver      *appdeliver.Service
 	Extract      *appextract.Service
 	Notify       *appnotify.Service
+	Scheduler    *appschedule.Scheduler
 	ByteFlusher  *appdownload.ByteFlusher
 	LogHub       *loghub.Hub
 
@@ -332,6 +335,28 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	})
 	notifyFacade := &notifyFacade{admin: notifyAdmin, svc: notifySvc}
 
+	scheduleRepo := sqlite.NewScheduleRepo(db)
+	scheduler := appschedule.New(scheduleRepo, appschedule.Config{
+		Tick:    5 * time.Second,
+		Workers: 4,
+		Log:     logger,
+	})
+	// Built-in maintenance task: nudge SQLite's query planner with
+	// PRAGMA optimize on a slow cadence. Hourly is more than enough —
+	// optimize is incremental + cheap.
+	scheduler.Register("sqlite.optimize", func(ctx context.Context, _ []byte) error {
+		_, err := db.ExecCtx(ctx, "PRAGMA optimize")
+		return err
+	})
+	if _, err := scheduler.EnsureTask(ctx, domainschedule.NewParams{
+		Name:     "sqlite.optimize",
+		Kind:     domainschedule.KindRecurring,
+		Cadence:  time.Hour,
+		FirstRun: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		logger.Warn("schedule: ensure sqlite.optimize", "err", err)
+	}
+
 	startedAt := time.Now().UTC()
 	systemSvc := appsystem.New(appsystem.Params{
 		Version:   buildVersion,
@@ -439,6 +464,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Deliver:       deliverSvc,
 		Extract:       extractSvc,
 		Notify:        notifySvc,
+		Scheduler:     scheduler,
 		ByteFlusher:   byteFlusher,
 		LogHub:        bo.logHub,
 		AuthService:   authSvc,
@@ -492,6 +518,9 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.SystemService.Start(ctx); err != nil {
 		return fmt.Errorf("start system: %w", err)
 	}
+	if err := a.Scheduler.Start(ctx); err != nil {
+		return fmt.Errorf("start scheduler: %w", err)
+	}
 	a.ByteFlusher.Start(ctx)
 
 	errCh := make(chan error, 1)
@@ -531,6 +560,9 @@ func (a *App) Shutdown() error {
 			}
 		}
 		a.ByteFlusher.Stop()
+		if err := a.Scheduler.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("stop scheduler: %w", err)
+		}
 		if err := a.SystemService.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("stop system: %w", err)
 		}
