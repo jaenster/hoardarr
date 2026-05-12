@@ -93,6 +93,12 @@ func Repair(_ context.Context, in RepairInput) (RepairResult, error) {
 		ordered = append(ordered, f)
 	}
 
+	// Build an MD5-of-first-16KB index over DataPaths so we can match
+	// obfuscated releases where the NZB filename and the PAR2-recorded
+	// filename are different (two independent obfuscation layers).
+	// PAR2's FileDesc stores MD516k for exactly this purpose.
+	md5Index := buildMD516kIndex(in.DataPaths)
+
 	// Diagnostic: emit the PAR2 set vs DataPaths mapping so we can see
 	// which way the filenames diverge when repair fails. One line per
 	// repair invocation; not in the hot path.
@@ -105,11 +111,23 @@ func Repair(_ context.Context, in RepairInput) (RepairResult, error) {
 		st := &fileState{f: f}
 		path, ok := in.DataPaths[f.Name]
 		if !ok {
+			// Filename miss — try matching by MD5 of the first 16 KB
+			// (PAR2 records this as FileDesc.MD516k specifically so
+			// repair can survive renames). Obfuscated releases routinely
+			// ship with NZB-level filenames different from the PAR2-
+			// recorded ones (two independent obfuscation layers), and
+			// SABnzbd handles them the same way.
+			if p, ok2 := md5Index[f.MD516k]; ok2 {
+				slog.Info("par2: filename mismatch resolved by MD5",
+					"par2_name", f.Name,
+					"matched_path", p,
+				)
+				path = p
+				ok = true
+			}
+		}
+		if !ok {
 			// File completely absent on disk — every slice missing.
-			// This is the most common cause of "insufficient recovery
-			// slices": one filename mismatch and EVERY slice for that
-			// file is added to globalMissing. Log loudly so we can see
-			// the mismatch without setting log_level=debug.
 			slog.Warn("par2: file in recovery set not in DataPaths; treating all slices as missing",
 				"par2_name", f.Name,
 				"par2_name_bytes", []byte(f.Name),
@@ -221,8 +239,11 @@ func Repair(_ context.Context, in RepairInput) (RepairResult, error) {
 			result.AlreadyOK = append(result.AlreadyOK, st.f.Name)
 			continue
 		}
-		path, ok := in.DataPaths[st.f.Name]
-		if !ok {
+		path := st.path
+		if path == "" {
+			path = in.DataPaths[st.f.Name]
+		}
+		if path == "" {
 			result.Failed = append(result.Failed, FailedFile{
 				Filename: st.f.Name,
 				Reason:   "no destination path for file",
@@ -315,7 +336,13 @@ func applyReconstructed(states []*fileState, missingGlobal []int, recon [][]byte
 		if len(st.missing) == 0 {
 			continue
 		}
-		path := paths[st.f.Name]
+		// Prefer st.path (resolved during analysis — may have come
+		// from the MD5-fallback when filenames don't match) over the
+		// raw paths[f.Name] lookup that only knows literal names.
+		path := st.path
+		if path == "" {
+			path = paths[st.f.Name]
+		}
 		if path == "" {
 			return fmt.Errorf("no path for damaged file %q", st.f.Name)
 		}
@@ -411,4 +438,51 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// buildMD516kIndex computes MD5 of the first 16 KB of every file in
+// dataPaths and returns a map keyed by that digest. Used as a
+// content-addressed fallback when PAR2 FileDesc names don't match
+// our NZB-derived filenames (obfuscated releases — see logs in repair.go
+// for the canonical "filename mismatch resolved by MD5" line).
+//
+// Files that fail to read or are smaller than 16 KB use the available
+// bytes (matching the PAR2 spec — MD516k = MD5 of first 16384 bytes OR
+// the entire file if smaller). Unreadable files are skipped silently:
+// they'll just stay unmatched and get flagged elsewhere.
+//
+// Hashing every data file up-front sounds expensive but 16 KB per file
+// is trivial next to PAR2 verification + Reed-Solomon reconstruction.
+func buildMD516kIndex(dataPaths map[string]string) map[[16]byte]string {
+	out := make(map[[16]byte]string, len(dataPaths))
+	for _, p := range dataPaths {
+		h, err := md5First16k(p)
+		if err != nil {
+			continue
+		}
+		// First-wins on collisions: vanishingly unlikely for unrelated
+		// files, possible for byte-identical duplicates. Either way one
+		// path is enough.
+		if _, exists := out[h]; !exists {
+			out[h] = p
+		}
+	}
+	return out
+}
+
+// md5First16k computes MD5 of the first 16 KB of path (or the entire
+// file if smaller).
+func md5First16k(path string) ([16]byte, error) {
+	var zero [16]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return zero, err
+	}
+	defer f.Close()
+	buf := make([]byte, 16384)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return zero, err
+	}
+	return md5.Sum(buf[:n]), nil
 }

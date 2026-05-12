@@ -36,10 +36,22 @@ func (Verifier) Verify(_ context.Context, par2Paths []string, dataPaths map[stri
 		return verify.Result{}, fmt.Errorf("parse par2: %w", err)
 	}
 
+	// Build a content-addressed index of the data files. Obfuscated
+	// releases routinely ship with NZB-level filenames different from
+	// the PAR2-recorded ones, and PAR2's FileDesc.MD516k exists
+	// specifically so verify/repair can survive that. SAB does the same.
+	md5Index := buildMD516kIndex(dataPaths)
+
 	out := verify.Result{}
 	for _, pf := range set.Files {
 		fr := verify.FileResult{Filename: pf.Name}
 		path, ok := dataPaths[pf.Name]
+		if !ok {
+			if p, ok2 := md5Index[pf.MD516k]; ok2 {
+				path = p
+				ok = true
+			}
+		}
 		if !ok {
 			fr.Reason = "not in NZB"
 			out.Files = append(out.Files, fr)
