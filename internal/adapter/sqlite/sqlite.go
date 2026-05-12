@@ -186,6 +186,16 @@ func (db *DB) applyPragmas(ctx context.Context, opts Options) error {
 			return fmt.Errorf("%s: %w", p, err)
 		}
 	}
+	// PRAGMA optimize runs ANALYZE on tables whose stats look stale
+	// since the last run. Without good stats the query planner can
+	// pick a worse index — we saw this on the live container where
+	// the outbox dispatcher's WHERE+JOIN+ORDER mix made SQLite use
+	// the PK index instead of the partial outbox_subs_pending,
+	// pinning a core at 250% for queries that should have been free.
+	// Cheap on small DBs, idempotent, safe to run on every startup.
+	if _, err := db.ExecContext(ctx, "PRAGMA optimize"); err != nil {
+		return fmt.Errorf("PRAGMA optimize: %w", err)
+	}
 	return nil
 }
 
