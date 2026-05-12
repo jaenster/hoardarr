@@ -202,11 +202,15 @@ func (b *OutboxBus) pruneLoop() {
 // workaround.
 func (b *OutboxBus) prune() {
 	cutoff := b.now().Add(-b.pruneRetention).UnixMilli()
-	// Stale-undelivered cutoff is 24x retention by default — generous
-	// so we never reap something a slow subscriber could still
-	// deliver, tight enough that misrouted rows from a prior buggy
-	// publish path don't accumulate forever.
-	staleCutoff := b.now().Add(-24 * b.pruneRetention).UnixMilli()
+	// Stale-undelivered cutoff is fixed at 10 minutes — legitimate
+	// dispatches complete in seconds (handler invoke + UPDATE), so any
+	// row still pending after 10 min is almost certainly orphaned (a
+	// past bug created sub rows whose topic didn't match the
+	// subscription, or a subscription was removed mid-flight). We pick
+	// a constant rather than scaling with pruneRetention because
+	// retention is about "how long to remember delivered events for
+	// debug"; stale undelivered is a different signal.
+	staleCutoff := b.now().Add(-10 * time.Minute).UnixMilli()
 
 	// Phase 1: delivered rows past retention.
 	for {
