@@ -144,8 +144,34 @@ export default function Activity() {
     }
   };
 
+  // Split the queue into two visual groups, mirroring how the *arr
+  // family separates "things actively being downloaded" from "things
+  // being processed after download". Jobs stuck at download_complete
+  // (verify in flight, post-repair, etc.) move out of the way of the
+  // active queue so the operator immediately sees what's downloading
+  // right now vs what's stalled in a later stage.
+  const activeStates = new Set([
+    "queued",
+    "downloading",
+    "paused",
+    "waiting_for_server",
+  ]);
+  const processingStates = new Set([
+    "download_complete",
+    "verifying",
+    "repairing",
+    "unpacking",
+  ]);
+  const activeJobs = (jobs ?? []).filter((j) => activeStates.has(j.state));
+  const processingJobs = (jobs ?? []).filter((j) =>
+    processingStates.has(j.state),
+  );
   const queueLabel =
-    jobs == null ? "—" : jobs.length === 1 ? "1 item" : `${jobs.length} items`;
+    jobs == null
+      ? "—"
+      : activeJobs.length === 1
+        ? "1 item"
+        : `${activeJobs.length} items`;
   const dragActive = dragDepth > 0;
 
   return (
@@ -230,7 +256,7 @@ export default function Activity() {
               <p className="muted">Loading…</p>
             </div>
           )}
-          {jobs != null && jobs.length === 0 && (
+          {jobs != null && activeJobs.length === 0 && (
             <div className="empty-state">
               <Inbox size={28} className="empty-icon" aria-hidden="true" />
               <p className="empty-title">Queue is empty</p>
@@ -239,9 +265,9 @@ export default function Activity() {
               </p>
             </div>
           )}
-          {jobs != null && jobs.length > 0 && (
+          {jobs != null && activeJobs.length > 0 && (
             <QueueList
-              jobs={jobs}
+              jobs={activeJobs}
               activity={activity}
               bytesPerSec={bytesPerSec}
               onPause={onPause}
@@ -251,6 +277,31 @@ export default function Activity() {
             />
           )}
         </Panel>
+
+        {processingJobs.length > 0 && (
+          <Panel
+            title="Processing"
+            meta={
+              <StatusBadge tone="neutral">
+                {processingJobs.length === 1
+                  ? "1 item"
+                  : `${processingJobs.length} items`}
+              </StatusBadge>
+            }
+            flush
+          >
+            <QueueList
+              jobs={processingJobs}
+              activity={activity}
+              bytesPerSec={bytesPerSec}
+              onPause={onPause}
+              onResume={onResume}
+              onRemove={onRemove}
+              // No reorder for processing — sequence is fixed by the
+              // post-download state machine, not operator preference.
+            />
+          </Panel>
+        )}
       </Page>
 
       {dragActive && (
