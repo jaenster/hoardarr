@@ -16,7 +16,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"sort"
 )
 
 // RepairInput is what Repair needs to do its job.
@@ -91,6 +93,11 @@ func Repair(_ context.Context, in RepairInput) (RepairResult, error) {
 		ordered = append(ordered, f)
 	}
 
+	// Diagnostic: emit the PAR2 set vs DataPaths mapping so we can see
+	// which way the filenames diverge when repair fails. One line per
+	// repair invocation; not in the hot path.
+	logRepairFilenames(set, ordered, in.DataPaths)
+
 	// Per-file analysis.
 	states := make([]*fileState, 0, len(ordered))
 	totalSlices := 0
@@ -99,6 +106,16 @@ func Repair(_ context.Context, in RepairInput) (RepairResult, error) {
 		path, ok := in.DataPaths[f.Name]
 		if !ok {
 			// File completely absent on disk — every slice missing.
+			// This is the most common cause of "insufficient recovery
+			// slices": one filename mismatch and EVERY slice for that
+			// file is added to globalMissing. Log loudly so we can see
+			// the mismatch without setting log_level=debug.
+			slog.Warn("par2: file in recovery set not in DataPaths; treating all slices as missing",
+				"par2_name", f.Name,
+				"par2_name_bytes", []byte(f.Name),
+				"slices", len(f.Slices),
+				"datapath_keys", sortedKeys(in.DataPaths),
+			)
 			st.slices = make([][]byte, len(f.Slices))
 			for i := range f.Slices {
 				st.missing = append(st.missing, i)
@@ -112,6 +129,11 @@ func Repair(_ context.Context, in RepairInput) (RepairResult, error) {
 		slicesData, missing, err := analyseFileSlices(path, f, sliceSize)
 		if err != nil {
 			// I/O error: treat the whole file as missing.
+			slog.Warn("par2: file slice analysis failed; treating all slices as missing",
+				"par2_name", f.Name,
+				"path", path,
+				"err", err.Error(),
+			)
 			st.onDisk = false
 			st.slices = make([][]byte, len(f.Slices))
 			for i := range f.Slices {
@@ -349,4 +371,44 @@ func dirOf(p string) string {
 		}
 	}
 	return "."
+}
+
+// logRepairFilenames emits a single INFO line summarising the PAR2
+// recovery set and the on-disk DataPaths so operators can spot
+// filename divergence at a glance. Skipped FileDesc rows (id with no
+// name) are reported separately — they usually mean a .vol* file we
+// didn't fully parse.
+func logRepairFilenames(set *RecoverySet, ordered []*ParFile, dataPaths map[string]string) {
+	names := make([]string, 0, len(ordered))
+	for _, f := range ordered {
+		names = append(names, f.Name)
+	}
+	sort.Strings(names)
+
+	missingFromData := make([]string, 0)
+	for _, n := range names {
+		if _, ok := dataPaths[n]; !ok {
+			missingFromData = append(missingFromData, n)
+		}
+	}
+
+	slog.Info("par2: repair set vs disk",
+		"recovery_files", len(set.RecoveryFiles),
+		"par_names", names,
+		"datapath_keys", sortedKeys(dataPaths),
+		"par_names_missing_from_disk", missingFromData,
+		"slice_size", set.SliceSize,
+		"recovery_slices", len(set.RecoverySlices),
+	)
+}
+
+// sortedKeys returns the map keys in sorted order so log output is
+// reproducible.
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
