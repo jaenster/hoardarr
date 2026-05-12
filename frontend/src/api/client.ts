@@ -291,11 +291,18 @@ export type TestServerResult = {
 
 // streamURL returns the URL for the SSE endpoint. The session cookie
 // is sent automatically; no apikey query param needed.
+//
+// Path note: /api/v1/events (not /queue/stream) — adblock filter
+// lists often match any URL containing "stream" and silently kill
+// the EventSource before it leaves the browser. The server still
+// mounts the old /queue/stream path as an alias for back-compat.
 export function streamURL(): string {
-  return withBase("/api/v1/queue/stream");
+  return withBase("/api/v1/events");
 }
 
 // logStreamURL is the SSE endpoint that pushes new log entries.
+// Uses /tail (not /stream) for the same adblock reason as streamURL —
+// the server mounts both for back-compat.
 export function logStreamURL(): string {
-  return withBase("/api/v1/system/logs/stream");
+  return withBase("/api/v1/system/logs/tail");
 }

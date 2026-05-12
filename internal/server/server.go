@@ -141,13 +141,22 @@ func (s *Server) MountSAB(h *sab.Handler) {
 	s.mux.Handle("/sabnzbd/", h)
 }
 
-// MountSSE registers /api/v1/queue/stream backed by the live event hub.
+// MountSSE registers the live event stream backed by the bus hub.
 // Same hybrid auth as REST. EventSource clients without a session
 // cookie pass the API key via ?apikey= query param (browsers can't
 // set custom headers on EventSource).
+//
+// Two paths are registered for the same handler:
+//
+//   - /api/v1/events — preferred. Some adblock filter lists block any
+//     URL containing "stream", which silently kills the connection
+//     before it reaches the server.
+//   - /api/v1/queue/stream — back-compat alias for older clients.
 func (s *Server) MountSSE(hub *sse.Hub) {
 	protect := authMiddleware(s.cfg.Auth.APIKey, s.session)
-	s.mux.Handle("GET /api/v1/queue/stream", protect(sse.Handler(hub)))
+	handler := protect(sse.Handler(hub))
+	s.mux.Handle("GET /api/v1/events", handler)
+	s.mux.Handle("GET /api/v1/queue/stream", handler)
 }
 
 // routes mounts the request handlers.

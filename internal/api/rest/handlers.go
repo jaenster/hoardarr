@@ -184,6 +184,9 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	}
 	if h.LogHub != nil {
 		register("GET", "/api/v1/system/logs", h.systemLogsSnapshot)
+		// /tail (preferred) and /stream (back-compat). Adblock filter
+		// lists frequently match "stream"; the SSE handler is the same.
+		register("GET", "/api/v1/system/logs/tail", h.systemLogsStream)
 		register("GET", "/api/v1/system/logs/stream", h.systemLogsStream)
 	}
 
