@@ -250,13 +250,27 @@ func listQueue(t *testing.T, base, apiKey string, includeAll bool) []apiJob {
 
 func jobFiles(t *testing.T, base, apiKey string, jobID int64) []apiFile {
 	t.Helper()
-	for _, j := range listQueue(t, base, apiKey, true) {
-		if int64(j.ID) == jobID {
-			return j.Files
-		}
+	// The list endpoint strips files (N+1 perf fix in commit f7750ef).
+	// Use the per-job endpoint which returns full hydration.
+	url := base + "/api/v1/queue/" + strconv.FormatInt(jobID, 10)
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("X-Api-Key", apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET job %d: %v", jobID, err)
 	}
-	t.Fatalf("job %d not found", jobID)
-	return nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET job %d status %d body=%s", jobID, resp.StatusCode, body)
+	}
+	var out struct {
+		Job apiJob `json:"job"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode job %d: %v", jobID, err)
+	}
+	return out.Job.Files
 }
 
 func mustReadFile(t *testing.T, path string) []byte {
