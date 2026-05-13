@@ -223,9 +223,12 @@ func (s *OrchestratorService) RemovePool(id server.ServerID) {
 // (re)creates the internal rootCtx so a previously-cancelled service
 // can be revived (the crash-recovery flow exercises this).
 func (s *OrchestratorService) Start(ctx context.Context) error {
+	s.mu.Lock()
 	if s.started {
+		s.mu.Unlock()
 		return nil
 	}
+	s.mu.Unlock()
 	// Reset rootCtx — Stop cancelled the previous one, but a Start
 	// after Stop must hand fresh contexts to new runners.
 	s.rootCtx, s.cancel = context.WithCancel(context.Background())
@@ -273,7 +276,9 @@ func (s *OrchestratorService) Start(ctx context.Context) error {
 		s.startRunner(j.ID())
 	}
 
+	s.mu.Lock()
 	s.started = true
+	s.mu.Unlock()
 	s.logger.Info("orchestrator service started",
 		"active_jobs", len(s.runners),
 		"pools", poolCount)
@@ -282,16 +287,25 @@ func (s *OrchestratorService) Start(ctx context.Context) error {
 
 // Stop closes subscriptions and cancels all runners, blocking until
 // they exit. Idempotent.
+//
+// Locking dance: started + subs mutate under s.mu so concurrent calls
+// from NudgePending / runJob see a consistent state, but s.cancel +
+// s.wg.Wait run unlocked. Holding the lock through wg.Wait would
+// deadlock if any runner takes s.mu on its way out.
 func (s *OrchestratorService) Stop() error {
+	s.mu.Lock()
 	if !s.started {
+		s.mu.Unlock()
 		return nil
 	}
 	s.started = false
+	subs := s.subs
+	s.subs = nil
+	s.mu.Unlock()
 
-	for _, sub := range s.subs {
+	for _, sub := range subs {
 		_ = sub.Close()
 	}
-	s.subs = nil
 
 	s.cancel()
 	s.wg.Wait()
