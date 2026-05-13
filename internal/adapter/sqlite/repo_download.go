@@ -672,8 +672,13 @@ const jobColumns = `id, nzb_hash, name, category, priority, queue_order, source,
 const selectJobByID = `SELECT ` + jobColumns + ` FROM jobs WHERE id = ?`
 const selectJobByHash = `SELECT ` + jobColumns + ` FROM jobs WHERE nzb_hash = ?`
 const selectAllJobs = `SELECT ` + jobColumns + ` FROM jobs ORDER BY priority ASC, queue_order ASC`
+// `waiting_for_server` is included so jobs parked because no NNTP pool
+// is registered yet still surface in the SAB queue (the *arr suite
+// polls the queue right after addurl/addfile; missing waiting jobs
+// here makes Sonarr think the job vanished). CountActive at line 238
+// has the same set; keep these in sync.
 const selectActiveJobs = `SELECT ` + jobColumns + ` FROM jobs
-	WHERE state IN ('queued','downloading','paused','download_complete','verifying','repairing','unpacking')
+	WHERE state IN ('queued','downloading','paused','download_complete','verifying','repairing','unpacking','waiting_for_server')
 	ORDER BY priority ASC, queue_order ASC`
 
 const selectFilesForJob = `SELECT id, job_id, filename, poster, groups, size_bytes, state,
