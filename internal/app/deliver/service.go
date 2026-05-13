@@ -128,26 +128,39 @@ func (s *Service) Start(_ context.Context) error {
 // but aren't because their trigger event was already consumed. Safe
 // to re-run — runDelivery is idempotent (StateComplete/Skipped fast-
 // paths the work).
+//
+// Sequential by design: each runDelivery wants to UPDATE jobs in its
+// markJobCompleted tx, and modernc.org/sqlite serialises writes. The
+// first attempt at this fan-out used a goroutine per job, which
+// produced SQLITE_BUSY / snapshot-conflict storms when more than a
+// couple of jobs needed recovery at the same time (seen during the
+// 2026-05-13 production deploy — needed three restarts before all
+// orphaned jobs cleared). Looping serially in a single goroutine is
+// strictly faster than retry-loops at higher contention.
 func (s *Service) recoverStuck(ctx context.Context) {
 	active, err := s.jobs.Active(ctx)
 	if err != nil {
 		s.logger.Warn("deliver: recover sweep failed", "err", err)
 		return
 	}
+	var swept int
 	for _, j := range active {
+		if ctx.Err() != nil {
+			return
+		}
 		switch j.State() {
 		case download.JobStateDownloadComplete, download.JobStateRepairing, download.JobStateUnpacking:
 		default:
 			continue
 		}
 		jobID := j.ID()
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			if err := s.runDelivery(ctx, jobID); err != nil {
-				s.logger.Warn("deliver: recovery run failed", "job_id", jobID, "err", err)
-			}
-		}()
+		if err := s.runDelivery(ctx, jobID); err != nil {
+			s.logger.Warn("deliver: recovery run failed", "job_id", jobID, "err", err)
+		}
+		swept++
+	}
+	if swept > 0 {
+		s.logger.Info("deliver: startup recovery swept jobs", "count", swept)
 	}
 }
 
