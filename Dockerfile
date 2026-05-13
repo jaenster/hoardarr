@@ -18,16 +18,30 @@ RUN npm install --no-fund --no-audit
 COPY frontend/ ./
 RUN npm run build
 
-FROM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 WORKDIR /src
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 COPY --from=frontend /src/frontend/dist ./frontend/dist
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+
+# Build args injected by `docker buildx build` for multi-arch builds.
+# TARGETOS / TARGETARCH come from the buildx platform list (linux/amd64,
+# linux/arm64, ...). VERSION / COMMIT / BUILD_DATE land in -ldflags so
+# `hoardarr version` reports correct identification per-image.
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -tags embed \
-        -trimpath -ldflags='-s -w' \
+        -trimpath \
+        -ldflags="-s -w \
+          -X main.version=${VERSION} \
+          -X main.commit=${COMMIT} \
+          -X main.buildDate=${BUILD_DATE}" \
         -o /out/hoardarr ./cmd/hoardarr
 
 FROM gcr.io/distroless/static-debian12:nonroot
@@ -52,5 +66,12 @@ ENV HOARDARR_DATA_DIR=/data
 COPY --from=builder /out/hoardarr /usr/local/bin/hoardarr
 
 EXPOSE 8085
+
+# Distroless has no shell or curl, so the only way to self-probe is
+# to invoke the binary's own `healthcheck` subcommand. It reads the
+# HOARDARR_LISTEN env above to find the port and GETs /healthz.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["/usr/local/bin/hoardarr", "healthcheck"]
+
 ENTRYPOINT ["/usr/local/bin/hoardarr"]
 CMD ["serve"]

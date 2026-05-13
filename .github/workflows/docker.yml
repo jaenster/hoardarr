@@ -44,6 +44,13 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: compute build metadata
+        id: build_meta
+        run: |
+          echo "version=$(git describe --tags --always --dirty 2>/dev/null || echo dev)" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: build + push
         uses: docker/build-push-action@v6
         with:
@@ -53,5 +60,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.build_meta.outputs.version }}
+            COMMIT=${{ steps.build_meta.outputs.commit }}
+            BUILD_DATE=${{ steps.build_meta.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

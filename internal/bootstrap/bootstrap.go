@@ -68,12 +68,11 @@ func buildSABBase(listen string) string {
 	return "http://" + host + "/sabnzbd/api"
 }
 
-// buildVersion identifies the running binary in /api/v1/system/status
-// and (eventually) in the SAB-compat version mode. Bumped per release;
-// dev builds use the -dev suffix so consumers can detect "not a tagged
-// build". A future link-time -ldflags override could replace this with
-// a git sha at build time.
-const buildVersion = "0.0.1-dev"
+// defaultBuildVersion is the fallback version string used when the
+// caller doesn't pass build metadata via WithBuildInfo. Real binaries
+// are built with -ldflags injecting main.version, which cmd/hoardarr
+// forwards via WithBuildInfo. Tests and `go run` end up here.
+const defaultBuildVersion = "dev"
 
 // App is the wired-together hoardarr runtime. Construct via Build, run
 // via Run, tear down via Shutdown.
@@ -127,6 +126,9 @@ type buildOptions struct {
 	extractor  extract.Extractor
 	logHub     *loghub.Hub
 	configPath string
+	version    string
+	commit     string
+	buildDate  string
 }
 
 // WithNNTPDialer overrides the default network dialer used by all
@@ -156,6 +158,19 @@ func WithConfigPath(path string) BuildOption {
 	return func(o *buildOptions) { o.configPath = path }
 }
 
+// WithBuildInfo plumbs the binary's identification (version, commit,
+// build date) through to the System status endpoint and the eventual
+// /metrics build_info gauge. cmd/hoardarr passes the values injected
+// via -ldflags; tests can leave these empty (they default to "dev" /
+// "unknown" / "unknown").
+func WithBuildInfo(version, commit, buildDate string) BuildOption {
+	return func(o *buildOptions) {
+		o.version = version
+		o.commit = commit
+		o.buildDate = buildDate
+	}
+}
+
 // Build wires the runtime: ensures data directories exist, opens the
 // SQLite database, applies migrations, constructs the transaction
 // manager and outbox event bus, builds NNTP pools for enabled servers,
@@ -170,6 +185,9 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	bo := buildOptions{}
 	for _, o := range opts {
 		o(&bo)
+	}
+	if bo.version == "" {
+		bo.version = defaultBuildVersion
 	}
 
 	if err := ensureDirs(cfg); err != nil {
@@ -377,7 +395,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 
 	startedAt := time.Now().UTC()
 	systemSvc := appsystem.New(appsystem.Params{
-		Version:   buildVersion,
+		Version:   bo.version,
 		StartedAt: startedAt,
 		Jobs:      jobRepo,
 		// Read the live pool map every time — captures hot-wired

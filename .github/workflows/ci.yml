@@ -75,10 +75,24 @@ jobs:
         run: cd frontend && npm run build
 
       - name: go build (embedded)
-        run: go build -tags embed -trimpath -ldflags='-s -w' -o ./hoardarr ./cmd/hoardarr
+        # Mirror the Makefile ldflags so the smoke run reports the
+        # same identification a release build would. CI builds aren't
+        # tagged, so VERSION falls through to the "dev-<sha>" form.
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+          COMMIT=$(git rev-parse --short=12 HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          go build -tags embed -trimpath \
+            -ldflags="-s -w \
+              -X main.version=${VERSION} \
+              -X main.commit=${COMMIT} \
+              -X main.buildDate=${BUILD_DATE}" \
+            -o ./hoardarr ./cmd/hoardarr
 
-      - name: smoke run --help
-        run: ./hoardarr serve -h 2>&1 || true
+      - name: smoke run version + --help
+        run: |
+          ./hoardarr version
+          ./hoardarr serve -h 2>&1 || true
 
   playwright:
     name: playwright e2e

@@ -187,6 +187,9 @@ func (s *Server) routes() {
 
 	// Public.
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+	// /healthz — kubernetes-convention alias of /api/v1/health. Used
+	// by the Dockerfile HEALTHCHECK; orchestrators expect this path.
+	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 
 	// Protected. Mounted per-route so the public health endpoint is not
 	// accidentally guarded.

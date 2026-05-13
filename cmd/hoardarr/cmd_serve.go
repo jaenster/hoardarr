@@ -42,12 +42,15 @@ func cmdServe(args []string, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	v, c, d := buildInfo()
 	app, err := bootstrap.Build(ctx, cfg, hoardarr.FrontendFS, logger,
 		bootstrap.WithLogHub(logHub),
 		bootstrap.WithConfigPath(*configPath),
+		bootstrap.WithBuildInfo(v, c, d),
 	)
 	if err != nil {
 		return err
 	}
+	logger.Info("hoardarr", "version", v, "commit", c, "build_date", d)
 	return app.Run(ctx)
 }

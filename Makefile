@@ -18,6 +18,19 @@ GOFLAGS ?=
 NPM ?= npm
 GO ?= go
 
+# Version metadata baked into the binary via -ldflags. VERSION is the
+# closest git tag or "dev" outside a tagged commit; COMMIT is the short
+# SHA; BUILD_DATE is RFC3339 UTC. Override any of them on the command
+# line; CI / Dockerfile builds set them explicitly.
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT     ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+LDFLAGS := -s -w \
+  -X main.version=$(VERSION) \
+  -X main.commit=$(COMMIT) \
+  -X main.buildDate=$(BUILD_DATE)
+
 # Source-listing helpers used as Make dependency targets so we only
 # re-run the corresponding step when the inputs actually change.
 FRONTEND_SRC := $(shell find frontend/src frontend/public 2>/dev/null) \
@@ -35,8 +48,8 @@ all: build
 build: $(BIN)
 
 $(BIN): frontend/dist/index.html $(GO_SRC)
-	@echo "==> go build (embedded) → $(BIN)"
-	@$(GO) build $(GOFLAGS) -tags embed -o $(BIN) ./cmd/hoardarr
+	@echo "==> go build (embedded) → $(BIN) ($(VERSION) $(COMMIT))"
+	@$(GO) build $(GOFLAGS) -tags embed -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/hoardarr
 
 frontend/dist/index.html: $(FRONTEND_SRC)
 	@echo "==> npm install (if needed)"

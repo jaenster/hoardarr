@@ -52,6 +52,10 @@ func main() {
 		err = cmdServer(args[1:], logger)
 	case "download":
 		err = cmdDownload(args[1:], logger)
+	case "version", "--version", "-v":
+		err = cmdVersion(args[1:])
+	case "healthcheck":
+		err = cmdHealthcheck(args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return
@@ -76,6 +80,7 @@ Usage:
   hoardarr server list
   hoardarr server rm <id>
   hoardarr download <nzb-path>
+  hoardarr version
 
 Run 'hoardarr <subcommand> --help' for subcommand-specific flags.`)
 }
