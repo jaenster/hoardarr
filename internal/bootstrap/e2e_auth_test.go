@@ -100,7 +100,8 @@ func TestAuth_E2E_FullFlow(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		resp := mustDo(t, cookieClient, req)
 		if resp.StatusCode != http.StatusCreated {
-			t.Fatalf("/auth/setup = %d; want 201", resp.StatusCode)
+			respBody, _ := io.ReadAll(resp.Body)
+			t.Fatalf("/auth/setup = %d body=%s; want 201", resp.StatusCode, string(respBody))
 		}
 		_ = resp.Body.Close()
 		if !hasSessionCookie(cookieClient, base) {
