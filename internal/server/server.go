@@ -139,7 +139,7 @@ func (s *Server) SetSessionAuthenticator(sa SessionAuthenticator) {
 // /api/v1/health and the unauthenticated auth endpoints
 // (/auth/setup, /auth/login, /auth/whoami) bypass the middleware.
 func (s *Server) MountREST(h *rest.Handlers) {
-	h.Mount(s.mux, authMiddleware(s.cfg.Auth.APIKey, s.session))
+	h.Mount(s.mux, authMiddleware(s.runtime.APIKey, s.session))
 }
 
 // MountSAB registers /sabnzbd/api with its own auth scheme: the SAB
@@ -165,7 +165,7 @@ func (s *Server) MountSAB(h *sab.Handler) {
 //     before it reaches the server.
 //   - /api/v1/queue/stream — back-compat alias for older clients.
 func (s *Server) MountSSE(hub *sse.Hub) {
-	protect := authMiddleware(s.cfg.Auth.APIKey, s.session)
+	protect := authMiddleware(s.runtime.APIKey, s.session)
 	handler := protect(sse.Handler(hub))
 	s.mux.Handle("GET /api/v1/events", handler)
 	s.mux.Handle("GET /api/v1/queue/stream", handler)
@@ -186,7 +186,7 @@ func (s *Server) MountSSE(hub *sse.Hub) {
 // Each protected route is wrapped individually so the public endpoints
 // can co-exist under /api/v1/ without subverting auth.
 func (s *Server) routes() {
-	protect := authMiddleware(s.cfg.Auth.APIKey, s.session)
+	protect := authMiddleware(s.runtime.APIKey, s.session)
 
 	// Public.
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)

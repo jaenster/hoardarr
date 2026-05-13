@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -35,6 +37,7 @@ const (
 	SettingBandwidthGlobalBPS   = "bandwidth.global_bytes_per_sec"
 	SettingDeleteSamples        = "deliver.delete_samples"
 	SettingCollapseSingleFolder = "deliver.collapse_single_folder"
+	SettingAPIKey               = "auth.api_key"
 )
 
 // Runtime holds runtime-mutable config that the UI can edit at any
@@ -54,6 +57,7 @@ type Runtime struct {
 	bandwidthGlobalBPS   int64
 	deleteSamples        bool
 	collapseSingleFolder bool
+	apiKey               string
 	listeners            []func(maxConcurrent int)
 	bandwidthListeners   []func(bytesPerSec int64)
 }
@@ -103,6 +107,10 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	if err != nil {
 		return nil, err
 	}
+	apiKey, err := store.GetStringOr(ctx, SettingAPIKey, cfg.Auth.APIKey)
+	if err != nil {
+		return nil, err
+	}
 
 	// Idempotent backfill: writing what we just read is a no-op for
 	// existing rows and seeds the row for missing keys. Cheap on every
@@ -128,6 +136,9 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	if err := store.SetBool(ctx, SettingCollapseSingleFolder, collapse); err != nil {
 		logger.Warn("runtime: seed collapse_single_folder", "err", err)
 	}
+	if err := store.Set(ctx, SettingAPIKey, apiKey); err != nil {
+		logger.Warn("runtime: seed api_key", "err", err)
+	}
 
 	rt.urlBase = urlBase
 	rt.maxConcurrentJobs = maxConc
@@ -136,6 +147,7 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	rt.bandwidthGlobalBPS = int64(bwGlobal)
 	rt.deleteSamples = delSamples
 	rt.collapseSingleFolder = collapse
+	rt.apiKey = apiKey
 	return rt, nil
 }
 
@@ -240,6 +252,34 @@ func (rt *Runtime) SetDeleteSamples(v bool) (bool, error) {
 	rt.deleteSamples = v
 	rt.mu.Unlock()
 	return v, nil
+}
+
+// APIKey returns the currently-active API key. Read by the auth
+// middleware on every request so a rotation takes effect immediately
+// for the next inbound call.
+func (rt *Runtime) APIKey() string {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.apiKey
+}
+
+// RotateAPIKey generates a fresh 32-byte hex key, persists it, and
+// returns it. Callers MUST display the returned key once and let the
+// operator copy it into their *arr clients before navigating away —
+// the old key stops working as soon as this returns.
+func (rt *Runtime) RotateAPIKey() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate api key: %w", err)
+	}
+	key := hex.EncodeToString(buf)
+	if err := rt.store.Set(context.Background(), SettingAPIKey, key); err != nil {
+		return "", fmt.Errorf("persist api_key: %w", err)
+	}
+	rt.mu.Lock()
+	rt.apiKey = key
+	rt.mu.Unlock()
+	return key, nil
 }
 
 // CollapseSingleFolder reports whether deliver should flatten a release

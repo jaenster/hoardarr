@@ -439,7 +439,6 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		},
 		General: &rest.GeneralView{
 			Listen:   cfg.Server.Listen,
-			APIKey:   cfg.Auth.APIKey,
 			LogLevel: cfg.Server.LogLevel,
 			SABBase:  buildSABBase(cfg.Server.Listen),
 			URLBase:  cfg.Server.URLBase,
@@ -450,12 +449,12 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Runtime:   runtime,
 	})
 	srv.MountSAB(&sab.Handler{
-		APIKey:      cfg.Auth.APIKey,
-		Queue:       queueService,
-		AddJob:      addJobService,
-		Categories:  categoryRepo,
-		Logger:      logger,
-		CompleteDir: cfg.Paths.CompleteDir,
+		APIKeyProvider: runtime.APIKey,
+		Queue:          queueService,
+		AddJob:         addJobService,
+		Categories:     categoryRepo,
+		Logger:         logger,
+		CompleteDir:    cfg.Paths.CompleteDir,
 		// Wire the throughput tracker so SAB queue responses surface
 		// kbpersec / timeleft / per-slot eta. *arr suites import jobs
 		// faster when they get a real ETA instead of "unknown".

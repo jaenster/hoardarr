@@ -49,12 +49,16 @@ const reportedVersion = "3.7.2"
 // Handler is the SAB API entry point. Mount at /sabnzbd/api (and
 // /sabnzbd/ for the few clients that path-prefix without /api).
 type Handler struct {
-	APIKey      string
-	Queue       *appdownload.QueueService
-	AddJob      *appdownload.AddJobService
-	Categories  *sqlite.CategoryRepo
-	Logger      *slog.Logger
-	CompleteDir string
+	// APIKeyProvider returns the currently-active API key. Reading it
+	// per-request means a Settings -> Rotate API key flip takes effect
+	// instantly for *arr clients too — they'll just start 401-ing
+	// until reconfigured with the new key.
+	APIKeyProvider func() string
+	Queue          *appdownload.QueueService
+	AddJob         *appdownload.AddJobService
+	Categories     *sqlite.CategoryRepo
+	Logger         *slog.Logger
+	CompleteDir    string
 	// Throughput returns current overall download rate in bytes/sec.
 	// Used to populate queue.kbpersec / queue.timeleft and per-slot
 	// eta/timeleft. May be nil; the SAB API then reports 0 / unknown
@@ -86,7 +90,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !constantTimeStringEq(formGet(r, "apikey"), h.APIKey) {
+	expected := ""
+	if h.APIKeyProvider != nil {
+		expected = h.APIKeyProvider()
+	}
+	if !constantTimeStringEq(formGet(r, "apikey"), expected) {
 		h.writeError(w, http.StatusUnauthorized, errors.New("invalid apikey"))
 		return
 	}

@@ -93,7 +93,7 @@ func TestConstantTimeStringEq(t *testing.T) {
 		{"abcdef0123", "abcdef0123", true}, // long match
 	}
 	for _, c := range cases {
-		got := constantTimeStringEq(c.provided, []byte(c.expected))
+		got := constantTimeStringEq(c.provided, c.expected)
 		if got != c.want {
 			t.Errorf("constantTimeStringEq(%q, %q) = %v; want %v", c.provided, c.expected, got, c.want)
 		}

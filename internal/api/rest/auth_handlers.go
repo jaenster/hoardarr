@@ -31,12 +31,45 @@ type Auther interface {
 // Mount registers /api/v1/auth/* routes. setup and login are public;
 // whoami and logout require any of: session cookie OR API key
 // (the protected wrapper handles both).
+//
+// Login + setup are wrapped with a per-IP sliding-window rate limit
+// (10 attempts per minute by default). The bcrypt verification in
+// handleLogin would otherwise let a single attacker pin a goroutine
+// per attempt for ~250ms each; this caps the damage they can do
+// without coordinating an IP rotation. Setup gets the same treatment
+// because it's the only state-mutating public endpoint and the cost
+// of an early hit is permanent (admin password set in concrete).
 func (h *Handlers) mountAuth(mux *http.ServeMux, protect func(http.Handler) http.Handler) {
+	loginLimiter := NewIPRateLimiter(10, time.Minute)
 	mux.HandleFunc("GET /api/v1/auth/whoami", h.handleWhoami)
-	mux.HandleFunc("POST /api/v1/auth/setup", h.handleSetup)
-	mux.HandleFunc("POST /api/v1/auth/login", h.handleLogin)
+	mux.HandleFunc("POST /api/v1/auth/setup", rateLimitedHandler(loginLimiter, h.handleSetup))
+	mux.HandleFunc("POST /api/v1/auth/login", rateLimitedHandler(loginLimiter, h.handleLogin))
 	mux.Handle("POST /api/v1/auth/logout", protect(http.HandlerFunc(h.handleLogout)))
 	mux.Handle("POST /api/v1/auth/change-password", protect(http.HandlerFunc(h.handleChangePassword)))
+	mux.Handle("POST /api/v1/auth/rotate-api-key", protect(http.HandlerFunc(h.handleRotateAPIKey)))
+}
+
+// handleRotateAPIKey regenerates the server-wide API key. Returns the
+// new key once in the response body — the caller MUST copy it into
+// every *arr client before the next request, because the old key
+// stops working immediately. Session-cookie auth is unaffected; the
+// browser keeps its session.
+func (h *Handlers) handleRotateAPIKey(w http.ResponseWriter, _ *http.Request) {
+	if h.Runtime == nil {
+		h.writeError(w, http.StatusServiceUnavailable, errors.New("runtime config unavailable"))
+		return
+	}
+	writer, ok := h.Runtime.(URLBaseWriter)
+	if !ok {
+		h.writeError(w, http.StatusServiceUnavailable, errors.New("runtime config is read-only"))
+		return
+	}
+	key, err := writer.RotateAPIKey()
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"api_key": key})
 }
 
 // handleWhoami returns the auth state. The frontend probes this on

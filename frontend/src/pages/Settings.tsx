@@ -1002,6 +1002,42 @@ function GeneralSection() {
               >
                 <Copy size={14} />
               </button>
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={async () => {
+                  if (
+                    !confirm(
+                      "Rotate the API key now?\n\n" +
+                        "Every *arr client and any external integration " +
+                        "using the current key will stop working until you " +
+                        "paste the new key into their settings. There is no " +
+                        "grace period — the old key dies the moment you " +
+                        "confirm.",
+                    )
+                  ) {
+                    return;
+                  }
+                  try {
+                    const { api_key } = await api.rotateAPIKey();
+                    await refresh();
+                    setRevealKey(true);
+                    alert(
+                      "New API key:\n\n" +
+                        api_key +
+                        "\n\nPaste this into Sonarr / Radarr / Lidarr / " +
+                        "Readarr / Prowlarr now. The old key no longer works.",
+                    );
+                  } catch (e) {
+                    alert(
+                      "Failed to rotate API key: " +
+                        (e instanceof Error ? e.message : String(e)),
+                    );
+                  }
+                }}
+              >
+                Rotate
+              </button>
             </dd>
             <dt>Log level</dt>
             <dd>

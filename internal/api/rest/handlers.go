@@ -57,6 +57,7 @@ type URLBaseReader interface {
 	DeferRecoveryVols() bool
 	DeleteSamples() bool
 	CollapseSingleFolder() bool
+	APIKey() string
 }
 
 // URLBaseWriter is implemented by *server.Runtime and exposes the
@@ -72,6 +73,7 @@ type URLBaseWriter interface {
 	SetDeferRecoveryVols(v bool) (bool, error)
 	SetDeleteSamples(v bool) (bool, error)
 	SetCollapseSingleFolder(v bool) (bool, error)
+	RotateAPIKey() (string, error)
 }
 
 // sessionCookiePath returns the Path attribute for the session
@@ -122,11 +124,10 @@ type PathsView struct {
 
 // GeneralView surfaces the slice of runtime config the UI needs to
 // render a meaningful General settings panel and the SAB-compat tab.
-// API key is included so admins can copy it into *arr clients; we
-// only return it to authenticated requests.
+// The API key is read live from Runtime (rotated via Settings →
+// Authentication) so the response always reflects the current value.
 type GeneralView struct {
 	Listen   string
-	APIKey   string
 	LogLevel string
 	SABBase  string // e.g. "http://hoardarr:8085/sabnzbd/api"
 	URLBase  string // reverse-proxy mount prefix; empty when at root
@@ -854,9 +855,13 @@ func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
 		delSamples = h.Runtime.DeleteSamples()
 		collapse = h.Runtime.CollapseSingleFolder()
 	}
+	apiKey := ""
+	if h.Runtime != nil {
+		apiKey = h.Runtime.APIKey()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"listen":                 h.General.Listen,
-		"api_key":                h.General.APIKey,
+		"api_key":                apiKey,
 		"log_level":              h.General.LogLevel,
 		"sab_base":               h.General.SABBase,
 		"url_base":               urlBase,

@@ -109,6 +109,9 @@ export const api = {
       new_password: newPassword,
     });
   },
+  rotateAPIKey(): Promise<{ api_key: string }> {
+    return req("POST", "/api/v1/auth/rotate-api-key");
+  },
 
   // --- public -----------------------------------------------------
   health(): Promise<{ status: string; service: string }> {

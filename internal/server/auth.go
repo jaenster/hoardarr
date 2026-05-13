@@ -29,8 +29,12 @@ type SessionAuthenticator interface {
 //     present X-Api-Key (or ?apikey=) using the config'd shared key.
 //
 // A request without either credential is rejected 401.
-func authMiddleware(expectedKey string, sa SessionAuthenticator) func(http.Handler) http.Handler {
-	expectedBytes := []byte(expectedKey)
+//
+// keyProvider returns the currently-active expected API key on every
+// invocation, so a runtime rotation (Settings -> Authentication ->
+// Rotate API key) takes effect on the very next request without
+// rebuilding the middleware chain.
+func authMiddleware(keyProvider func() string, sa SessionAuthenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Session cookie path (preferred for browser flows).
@@ -48,7 +52,7 @@ func authMiddleware(expectedKey string, sa SessionAuthenticator) func(http.Handl
 			if provided == "" {
 				provided = r.URL.Query().Get("apikey")
 			}
-			if constantTimeStringEq(provided, expectedBytes) {
+			if constantTimeStringEq(provided, keyProvider()) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -58,17 +62,18 @@ func authMiddleware(expectedKey string, sa SessionAuthenticator) func(http.Handl
 	}
 }
 
-func constantTimeStringEq(provided string, expected []byte) bool {
+func constantTimeStringEq(provided, expected string) bool {
 	if len(provided) == 0 || len(expected) == 0 {
 		return false
 	}
 	pb := []byte(provided)
-	if len(pb) != len(expected) {
+	eb := []byte(expected)
+	if len(pb) != len(eb) {
 		// Still run the compare to avoid a length-based timing tell.
 		_ = subtle.ConstantTimeCompare(pb, pb)
 		return false
 	}
-	return subtle.ConstantTimeCompare(pb, expected) == 1
+	return subtle.ConstantTimeCompare(pb, eb) == 1
 }
 
 func writeAuthError(w http.ResponseWriter, msg string) {
