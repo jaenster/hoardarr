@@ -814,6 +814,14 @@ function GeneralSection() {
   const [deferVolsSaving, setDeferVolsSaving] = useState(false);
   const [deferVolsErr, setDeferVolsErr] = useState<string | null>(null);
 
+  // delete_samples toggle (instant-save).
+  const [delSamplesSaving, setDelSamplesSaving] = useState(false);
+  const [delSamplesErr, setDelSamplesErr] = useState<string | null>(null);
+
+  // collapse_single_folder toggle (instant-save).
+  const [collapseSaving, setCollapseSaving] = useState(false);
+  const [collapseErr, setCollapseErr] = useState<string | null>(null);
+
   const refresh = async () => {
     try {
       const g = await api.general();
@@ -842,6 +850,42 @@ function GeneralSection() {
       }
     } finally {
       setDeferVolsSaving(false);
+    }
+  };
+
+  const toggleDeleteSamples = async (v: boolean) => {
+    setDelSamplesSaving(true);
+    setDelSamplesErr(null);
+    try {
+      await api.setGeneral({ delete_samples: v });
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setDelSamplesErr(body?.error ?? e.message);
+      } else {
+        setDelSamplesErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setDelSamplesSaving(false);
+    }
+  };
+
+  const toggleCollapse = async (v: boolean) => {
+    setCollapseSaving(true);
+    setCollapseErr(null);
+    try {
+      await api.setGeneral({ collapse_single_folder: v });
+      await refresh();
+    } catch (e) {
+      if (e instanceof ApiError) {
+        const body = e.body as { error?: string } | null;
+        setCollapseErr(body?.error ?? e.message);
+      } else {
+        setCollapseErr(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setCollapseSaving(false);
     }
   };
 
@@ -1095,6 +1139,49 @@ function GeneralSection() {
               <span>Defer recovery volumes</span>
             </label>
             {deferVolsErr && <p className="text-err">{deferVolsErr}</p>}
+          </div>
+
+          <div className="settings-form">
+            <h3>Delete sample files</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              After a successful delivery, remove files whose name matches
+              <code className="inline-code"> sample </code> or
+              <code className="inline-code"> proof</code>. Hoardarr refuses
+              to remove anything when every file in the release matches
+              the pattern, so genuinely named releases survive intact.
+            </p>
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={gen.delete_samples}
+                disabled={delSamplesSaving}
+                onChange={(e) => void toggleDeleteSamples(e.target.checked)}
+              />
+              <span>Delete sample files after delivery</span>
+            </label>
+            {delSamplesErr && <p className="text-err">{delSamplesErr}</p>}
+          </div>
+
+          <div className="settings-form">
+            <h3>Flatten single-folder releases</h3>
+            <p className="muted" style={{ marginTop: 0 }}>
+              When a release lands inside a single inner directory
+              (e.g. <code className="inline-code">Movie/Release-Inner/file.mkv</code>),
+              lift the contents up one level so the resulting layout is
+              <code className="inline-code"> Movie/file.mkv</code>. Skipped
+              automatically if multiple subfolders or top-level files are
+              present.
+            </p>
+            <label className="settings-checkbox">
+              <input
+                type="checkbox"
+                checked={gen.collapse_single_folder}
+                disabled={collapseSaving}
+                onChange={(e) => void toggleCollapse(e.target.checked)}
+              />
+              <span>Flatten redundant inner directory</span>
+            </label>
+            {collapseErr && <p className="text-err">{collapseErr}</p>}
           </div>
 
           <p className="muted">

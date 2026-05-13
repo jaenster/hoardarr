@@ -82,6 +82,18 @@ type Server struct {
 	// enabled, the SAB-style bandwidth savings apply only to
 	// PAR2-protected releases that don't need repair.
 	DeferRecoveryVols bool `toml:"defer_recovery_vols"`
+
+	// DeleteSamples removes files matching the SAB sample/proof
+	// regex from the target dir after a successful move. Default
+	// true (matches SABnzbd's out-of-the-box behaviour). Disable
+	// via Settings if you want raw releases preserved.
+	DeleteSamples bool `toml:"delete_samples"`
+
+	// CollapseSingleFolder lifts the contents of a single redundant
+	// inner directory up one level when a release lands wrapped
+	// (e.g. complete/cat/release/release-inner/file.mkv → complete/
+	// cat/release/file.mkv). Default true.
+	CollapseSingleFolder bool `toml:"collapse_single_folder"`
 }
 
 // Auth holds authentication configuration. Currently API-key only;
@@ -146,7 +158,9 @@ func Default() Config {
 			// which contends for the shared NNTP pool and produces
 			// jittery per-job speeds. Operators who actually want
 			// parallel downloads can raise this from Settings.
-			MaxConcurrentJobs: 1,
+			MaxConcurrentJobs:    1,
+			DeleteSamples:        true,
+			CollapseSingleFolder: true,
 		},
 		Auth: Auth{
 			APIKey: "",

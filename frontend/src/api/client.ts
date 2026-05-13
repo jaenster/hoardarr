@@ -208,6 +208,8 @@ export const api = {
     max_concurrent_jobs?: number;
     fail_hopeless_ratio?: number;
     defer_recovery_vols?: boolean;
+    delete_samples?: boolean;
+    collapse_single_folder?: boolean;
   }): Promise<void> {
     return jsonReq("PUT", "/api/v1/config/general", body);
   },

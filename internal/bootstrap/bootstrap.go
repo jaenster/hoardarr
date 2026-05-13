@@ -279,15 +279,17 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	deliveryRepo := sqlite.NewDeliveryRepo(db)
 	categoryRepoForDeliver := sqlite.NewCategoryRepo(db)
 	deliverSvc := appdeliver.New(appdeliver.ServiceParams{
-		JobRepo:       jobRepo,
-		DeliveryRepo:  deliveryRepo,
-		CategoryRepo:  categoryRepoForDeliver,
-		FS:            adapterfs.Default,
-		Bus:           bus,
-		TxManager:     txm,
-		IncompleteDir: cfg.Paths.IncompleteDir,
-		CompleteDir:   cfg.Paths.CompleteDir,
-		Logger:        logger,
+		JobRepo:              jobRepo,
+		DeliveryRepo:         deliveryRepo,
+		CategoryRepo:         categoryRepoForDeliver,
+		FS:                   adapterfs.Default,
+		Bus:                  bus,
+		TxManager:            txm,
+		IncompleteDir:        cfg.Paths.IncompleteDir,
+		CompleteDir:          cfg.Paths.CompleteDir,
+		Logger:               logger,
+		DeleteSamples:        runtime.DeleteSamples,
+		CollapseSingleFolder: runtime.CollapseSingleFolder,
 	})
 
 	repairRepo := sqlite.NewRepairRepo(db)

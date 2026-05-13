@@ -55,6 +55,8 @@ type URLBaseReader interface {
 	MaxConcurrentJobs() int
 	FailHopelessRatio() float64
 	DeferRecoveryVols() bool
+	DeleteSamples() bool
+	CollapseSingleFolder() bool
 }
 
 // URLBaseWriter is implemented by *server.Runtime and exposes the
@@ -68,6 +70,8 @@ type URLBaseWriter interface {
 	SetMaxConcurrentJobs(v int) (int, error)
 	SetFailHopelessRatio(v float64) (float64, error)
 	SetDeferRecoveryVols(v bool) (bool, error)
+	SetDeleteSamples(v bool) (bool, error)
+	SetCollapseSingleFolder(v bool) (bool, error)
 }
 
 // sessionCookiePath returns the Path attribute for the session
@@ -840,29 +844,37 @@ func (h *Handlers) getGeneral(w http.ResponseWriter, _ *http.Request) {
 	maxConcurrent := 0
 	failHopeless := 0.0
 	deferVols := false
+	delSamples := false
+	collapse := false
 	if h.Runtime != nil {
 		urlBase = h.Runtime.URLBase()
 		maxConcurrent = h.Runtime.MaxConcurrentJobs()
 		failHopeless = h.Runtime.FailHopelessRatio()
 		deferVols = h.Runtime.DeferRecoveryVols()
+		delSamples = h.Runtime.DeleteSamples()
+		collapse = h.Runtime.CollapseSingleFolder()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"listen":              h.General.Listen,
-		"api_key":             h.General.APIKey,
-		"log_level":           h.General.LogLevel,
-		"sab_base":            h.General.SABBase,
-		"url_base":            urlBase,
-		"max_concurrent_jobs": maxConcurrent,
-		"fail_hopeless_ratio": failHopeless,
-		"defer_recovery_vols": deferVols,
+		"listen":                 h.General.Listen,
+		"api_key":                h.General.APIKey,
+		"log_level":              h.General.LogLevel,
+		"sab_base":               h.General.SABBase,
+		"url_base":               urlBase,
+		"max_concurrent_jobs":    maxConcurrent,
+		"fail_hopeless_ratio":    failHopeless,
+		"defer_recovery_vols":    deferVols,
+		"delete_samples":         delSamples,
+		"collapse_single_folder": collapse,
 	})
 }
 
 type putGeneralReq struct {
-	URLBase           *string  `json:"url_base,omitempty"`
-	MaxConcurrentJobs *int     `json:"max_concurrent_jobs,omitempty"`
-	FailHopelessRatio *float64 `json:"fail_hopeless_ratio,omitempty"`
-	DeferRecoveryVols *bool    `json:"defer_recovery_vols,omitempty"`
+	URLBase              *string  `json:"url_base,omitempty"`
+	MaxConcurrentJobs    *int     `json:"max_concurrent_jobs,omitempty"`
+	FailHopelessRatio    *float64 `json:"fail_hopeless_ratio,omitempty"`
+	DeferRecoveryVols    *bool    `json:"defer_recovery_vols,omitempty"`
+	DeleteSamples        *bool    `json:"delete_samples,omitempty"`
+	CollapseSingleFolder *bool    `json:"collapse_single_folder,omitempty"`
 }
 
 // putGeneral applies runtime-mutable General settings. Currently only
@@ -903,6 +915,18 @@ func (h *Handlers) putGeneral(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DeferRecoveryVols != nil {
 		if _, err := writer.SetDeferRecoveryVols(*req.DeferRecoveryVols); err != nil {
+			h.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.DeleteSamples != nil {
+		if _, err := writer.SetDeleteSamples(*req.DeleteSamples); err != nil {
+			h.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	if req.CollapseSingleFolder != nil {
+		if _, err := writer.SetCollapseSingleFolder(*req.CollapseSingleFolder); err != nil {
 			h.writeError(w, http.StatusBadRequest, err)
 			return
 		}

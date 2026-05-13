@@ -28,11 +28,13 @@ type SettingsStore interface {
 // Setting keys. These are the runtime-mutable fields that used to
 // live in config.toml; they now persist in the SQLite settings table.
 const (
-	SettingURLBase             = "server.url_base"
-	SettingMaxConcurrentJobs   = "server.max_concurrent_jobs"
-	SettingFailHopelessRatio   = "server.fail_hopeless_ratio"
-	SettingDeferRecoveryVols   = "server.defer_recovery_vols"
-	SettingBandwidthGlobalBPS  = "bandwidth.global_bytes_per_sec"
+	SettingURLBase              = "server.url_base"
+	SettingMaxConcurrentJobs    = "server.max_concurrent_jobs"
+	SettingFailHopelessRatio    = "server.fail_hopeless_ratio"
+	SettingDeferRecoveryVols    = "server.defer_recovery_vols"
+	SettingBandwidthGlobalBPS   = "bandwidth.global_bytes_per_sec"
+	SettingDeleteSamples        = "deliver.delete_samples"
+	SettingCollapseSingleFolder = "deliver.collapse_single_folder"
 )
 
 // Runtime holds runtime-mutable config that the UI can edit at any
@@ -43,15 +45,17 @@ const (
 // in-memory mirror under rt.mu is the hot-path read; the DB write only
 // happens on operator-driven changes (rare).
 type Runtime struct {
-	mu                sync.RWMutex
-	store             SettingsStore
-	urlBase            string
-	maxConcurrentJobs  int
-	failHopelessRatio  float64
-	deferRecoveryVols  bool
-	bandwidthGlobalBPS int64
-	listeners          []func(maxConcurrent int)
-	bandwidthListeners []func(bytesPerSec int64)
+	mu                   sync.RWMutex
+	store                SettingsStore
+	urlBase              string
+	maxConcurrentJobs    int
+	failHopelessRatio    float64
+	deferRecoveryVols    bool
+	bandwidthGlobalBPS   int64
+	deleteSamples        bool
+	collapseSingleFolder bool
+	listeners            []func(maxConcurrent int)
+	bandwidthListeners   []func(bytesPerSec int64)
 }
 
 // NewRuntime constructs a Runtime backed by store. Initial values are
@@ -91,6 +95,14 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	if err != nil {
 		return nil, err
 	}
+	delSamples, err := store.GetBoolOr(ctx, SettingDeleteSamples, cfg.Server.DeleteSamples)
+	if err != nil {
+		return nil, err
+	}
+	collapse, err := store.GetBoolOr(ctx, SettingCollapseSingleFolder, cfg.Server.CollapseSingleFolder)
+	if err != nil {
+		return nil, err
+	}
 
 	// Idempotent backfill: writing what we just read is a no-op for
 	// existing rows and seeds the row for missing keys. Cheap on every
@@ -110,12 +122,20 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	if err := store.SetInt(ctx, SettingBandwidthGlobalBPS, bwGlobal); err != nil {
 		logger.Warn("runtime: seed bandwidth_global_bps", "err", err)
 	}
+	if err := store.SetBool(ctx, SettingDeleteSamples, delSamples); err != nil {
+		logger.Warn("runtime: seed delete_samples", "err", err)
+	}
+	if err := store.SetBool(ctx, SettingCollapseSingleFolder, collapse); err != nil {
+		logger.Warn("runtime: seed collapse_single_folder", "err", err)
+	}
 
 	rt.urlBase = urlBase
 	rt.maxConcurrentJobs = maxConc
 	rt.failHopelessRatio = failHop
 	rt.deferRecoveryVols = deferVols
 	rt.bandwidthGlobalBPS = int64(bwGlobal)
+	rt.deleteSamples = delSamples
+	rt.collapseSingleFolder = collapse
 	return rt, nil
 }
 
@@ -197,6 +217,47 @@ func (rt *Runtime) SetDeferRecoveryVols(v bool) (bool, error) {
 	}
 	rt.mu.Lock()
 	rt.deferRecoveryVols = v
+	rt.mu.Unlock()
+	return v, nil
+}
+
+// DeleteSamples reports whether deliver should remove sample/proof
+// files after a successful move.
+func (rt *Runtime) DeleteSamples() bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.deleteSamples
+}
+
+// SetDeleteSamples persists v and returns the stored value. Takes
+// effect on the next delivery; in-flight deliveries are not retroactively
+// rescanned.
+func (rt *Runtime) SetDeleteSamples(v bool) (bool, error) {
+	if err := rt.store.SetBool(context.Background(), SettingDeleteSamples, v); err != nil {
+		return false, fmt.Errorf("persist delete_samples: %w", err)
+	}
+	rt.mu.Lock()
+	rt.deleteSamples = v
+	rt.mu.Unlock()
+	return v, nil
+}
+
+// CollapseSingleFolder reports whether deliver should flatten a release
+// that landed inside a single redundant inner directory.
+func (rt *Runtime) CollapseSingleFolder() bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.collapseSingleFolder
+}
+
+// SetCollapseSingleFolder persists v and returns the stored value.
+// Takes effect on the next delivery.
+func (rt *Runtime) SetCollapseSingleFolder(v bool) (bool, error) {
+	if err := rt.store.SetBool(context.Background(), SettingCollapseSingleFolder, v); err != nil {
+		return false, fmt.Errorf("persist collapse_single_folder: %w", err)
+	}
+	rt.mu.Lock()
+	rt.collapseSingleFolder = v
 	rt.mu.Unlock()
 	return v, nil
 }

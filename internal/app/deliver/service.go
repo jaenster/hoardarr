@@ -44,6 +44,12 @@ type Service struct {
 	logger        *slog.Logger
 	now           func() time.Time
 
+	// Post-processing toggles. Each is a callback into the runtime so
+	// operator changes in Settings take effect on the next delivery
+	// without restarting the service.
+	deleteSamples        func() bool
+	collapseSingleFolder func() bool
+
 	subs []event.Subscription
 
 	wg      sync.WaitGroup
@@ -65,6 +71,13 @@ type ServiceParams struct {
 	CompleteDir   string
 	Logger        *slog.Logger
 	Now           func() time.Time
+
+	// DeleteSamples returns whether sample/proof files should be removed
+	// from the target dir after a successful move. Nil → off.
+	DeleteSamples func() bool
+	// CollapseSingleFolder returns whether a release that landed inside
+	// a single redundant sub-folder should be flattened. Nil → off.
+	CollapseSingleFolder func() bool
 }
 
 // New constructs a deliver Service.
@@ -75,20 +88,28 @@ func New(p ServiceParams) *Service {
 	if p.Now == nil {
 		p.Now = func() time.Time { return time.Now().UTC() }
 	}
+	if p.DeleteSamples == nil {
+		p.DeleteSamples = func() bool { return false }
+	}
+	if p.CollapseSingleFolder == nil {
+		p.CollapseSingleFolder = func() bool { return false }
+	}
 	rootCtx, cancel := context.WithCancel(context.Background())
 	return &Service{
-		jobs:          p.JobRepo,
-		deliveries:    p.DeliveryRepo,
-		categories:    p.CategoryRepo,
-		fs:            p.FS,
-		bus:           p.Bus,
-		txm:           p.TxManager,
-		incompleteDir: p.IncompleteDir,
-		completeDir:   p.CompleteDir,
-		logger:        p.Logger,
-		now:           p.Now,
-		rootCtx:       rootCtx,
-		cancel:        cancel,
+		jobs:                 p.JobRepo,
+		deliveries:           p.DeliveryRepo,
+		categories:           p.CategoryRepo,
+		fs:                   p.FS,
+		bus:                  p.Bus,
+		txm:                  p.TxManager,
+		incompleteDir:        p.IncompleteDir,
+		completeDir:          p.CompleteDir,
+		logger:               p.Logger,
+		now:                  p.Now,
+		deleteSamples:        p.DeleteSamples,
+		collapseSingleFolder: p.CollapseSingleFolder,
+		rootCtx:              rootCtx,
+		cancel:               cancel,
 	}
 }
 
@@ -317,6 +338,30 @@ func (s *Service) runDelivery(ctx context.Context, jobID download.JobID) error {
 	if err := s.fs.RemoveAll(jobDir); err != nil {
 		s.logger.Warn("deliver: cleanup of incomplete dir failed",
 			"job_id", jobID, "dir", jobDir, "err", err)
+	}
+
+	// Post-move processing. Each step is best-effort: failure logs but
+	// doesn't fail the delivery — files are already in complete/ and
+	// the move was the point. Order matters: rename obfuscated files
+	// first (uses the largest-data-file heuristic, which needs to see
+	// the original layout), then strip samples (frees up the "single
+	// non-sample folder" shape collapse looks for), then collapse a
+	// redundant outer wrap.
+	if _, err := deobfuscateRename(targetDir, job.Name(), s.logger); err != nil {
+		s.logger.Warn("deliver: deobfuscate rename failed",
+			"job_id", jobID, "dir", targetDir, "err", err)
+	}
+	if s.deleteSamples() {
+		if err := removeSamples(targetDir, s.logger); err != nil {
+			s.logger.Warn("deliver: remove samples failed",
+				"job_id", jobID, "dir", targetDir, "err", err)
+		}
+	}
+	if s.collapseSingleFolder() {
+		if err := collapseSingleFolder(targetDir, s.logger); err != nil {
+			s.logger.Warn("deliver: collapse single folder failed",
+				"job_id", jobID, "dir", targetDir, "err", err)
+		}
 	}
 
 	if err := d.Complete(s.now()); err != nil {
