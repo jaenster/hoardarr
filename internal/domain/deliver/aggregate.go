@@ -125,13 +125,17 @@ func (d *Delivery) PullEvents() []event.Event {
 	return out
 }
 
-// Start transitions pending → moving.
+// Start transitions pending → moving. Also valid from failed →
+// moving as a retry: a previous attempt errored mid-move (e.g.
+// missing source file), the operator or a service-restart sweep
+// triggers a fresh attempt. The previous errMsg is cleared.
 func (d *Delivery) Start(now time.Time) error {
-	if d.state != StatePending {
-		return errors.New("deliver: Start requires pending state")
+	if d.state != StatePending && d.state != StateFailed {
+		return errors.New("deliver: Start requires pending or failed state")
 	}
 	d.state = StateMoving
 	d.startedAt = now
+	d.errMsg = ""
 	d.events = append(d.events, DeliveryStarted{
 		ID: d.id, JobID: d.jobID, At: now,
 	})

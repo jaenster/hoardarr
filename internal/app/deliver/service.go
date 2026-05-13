@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"path/filepath"
 	"strconv"
@@ -108,7 +109,46 @@ func (s *Service) Start(_ context.Context) error {
 	s.subs = []event.Subscription{sub}
 	s.started = true
 	s.logger.Info("deliver service started")
+
+	// Startup recovery: re-drive any job stuck in download_complete or
+	// repairing whose verify.ok / repair.ok event was already
+	// delivered (and so won't fire again). Without this, a crash
+	// between "verify.ok handler scheduled" and "delivery row
+	// persisted" leaves the job orphaned indefinitely — which is what
+	// happened in production after the 2026-05-12 container restart.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.recoverStuck(s.rootCtx)
+	}()
 	return nil
+}
+
+// recoverStuck sweeps for jobs that should be in the deliver pipeline
+// but aren't because their trigger event was already consumed. Safe
+// to re-run — runDelivery is idempotent (StateComplete/Skipped fast-
+// paths the work).
+func (s *Service) recoverStuck(ctx context.Context) {
+	active, err := s.jobs.Active(ctx)
+	if err != nil {
+		s.logger.Warn("deliver: recover sweep failed", "err", err)
+		return
+	}
+	for _, j := range active {
+		switch j.State() {
+		case download.JobStateDownloadComplete, download.JobStateRepairing, download.JobStateUnpacking:
+		default:
+			continue
+		}
+		jobID := j.ID()
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if err := s.runDelivery(ctx, jobID); err != nil {
+				s.logger.Warn("deliver: recovery run failed", "job_id", jobID, "err", err)
+			}
+		}()
+	}
 }
 
 // Stop closes subscriptions, cancels in-flight deliveries, waits for
@@ -155,15 +195,26 @@ func (s *Service) runDelivery(ctx context.Context, jobID download.JobID) error {
 		return fmt.Errorf("load job: %w", err)
 	}
 
-	// Idempotency: if a delivery row exists in a terminal state, skip.
+	// Idempotency: if a delivery row exists in a terminal state, the
+	// move was already done. Skip the filesystem work — but still
+	// ensure the Job state has advanced. A crash between "delivery
+	// complete" and "Job.MarkCompleted" used to leave the job stuck
+	// in download_complete forever; this pulls it across the line on
+	// the next re-fire (e.g. after restart).
 	existing, err := s.deliveries.ByJobID(ctx, jobID)
 	if err != nil && !errors.Is(err, deliver.ErrNotFound) {
 		return fmt.Errorf("load delivery: %w", err)
 	}
 	if existing != nil && (existing.State() == deliver.StateComplete ||
 		existing.State() == deliver.StateSkipped) {
-		s.logger.Info("deliver: already terminal, skipping",
+		s.logger.Info("deliver: already terminal, ensuring job advanced",
 			"job_id", jobID, "state", string(existing.State()))
+		// StateSkipped means an extractor is handling this job —
+		// leave it alone. StateComplete is the non-archive happy
+		// path; advance the Job.
+		if existing.State() == deliver.StateComplete {
+			return s.markJobCompleted(ctx, jobID)
+		}
 		return nil
 	}
 
@@ -218,6 +269,7 @@ func (s *Service) runDelivery(ctx context.Context, jobID download.JobID) error {
 	if err := s.fs.MkdirAll(targetDir); err != nil {
 		return s.failDelivery(ctx, d, fmt.Errorf("mkdir target: %w", err))
 	}
+	var movedAny bool
 	for _, f := range job.Files() {
 		if f.IsPar2() {
 			continue
@@ -225,8 +277,26 @@ func (s *Service) runDelivery(ctx context.Context, jobID download.JobID) error {
 		src := filepath.Join(jobDir, strconv.FormatInt(int64(f.ID()), 10)+".tmp")
 		dst := filepath.Join(targetDir, sanitizeFilename(f.Filename()))
 		if err := s.fs.Move(src, dst); err != nil {
+			// Missing source: every segment of this file 430'd or
+			// failed. Common for non-essential sidecars (.nfo, .sfv)
+			// that aren't in the PAR2 set — PAR2 said the release
+			// verifies clean but the metadata didn't arrive. Don't
+			// fail the whole delivery for a missing sidecar; just
+			// log and keep moving.
+			if errors.Is(err, fs.ErrNotExist) || strings.Contains(err.Error(), "no such file or directory") {
+				s.logger.Warn("deliver: source missing, skipping",
+					"job_id", jobID, "file", f.Filename(), "src", src)
+				continue
+			}
 			return s.failDelivery(ctx, d, fmt.Errorf("move %s: %w", f.Filename(), err))
 		}
+		movedAny = true
+	}
+	if !movedAny {
+		// Every data file was missing — nothing actually ended up in
+		// complete/. Treat as a delivery failure rather than silently
+		// "completing" an empty release.
+		return s.failDelivery(ctx, d, fmt.Errorf("no data files moved"))
 	}
 
 	// Best-effort cleanup of incomplete/<jobid>/ — leftover PAR2
@@ -246,6 +316,18 @@ func (s *Service) runDelivery(ctx context.Context, jobID download.JobID) error {
 	// Mark the Job terminal-completed. Do this in its own tx so the
 	// JobCompleted event is published with the (separately-saved)
 	// row state.
+	return s.markJobCompleted(ctx, jobID)
+}
+
+// markJobCompleted transitions the Job to JobStateCompleted and
+// publishes JobCompleted. Idempotent: if the Job is already in a
+// terminal state, MarkCompleted is a no-op and no events are emitted.
+//
+// Called from the happy path (after a successful move) AND from the
+// idempotent-skip path (when a Delivery row is already complete but
+// the Job state never advanced — e.g. process crashed between the
+// two writes).
+func (s *Service) markJobCompleted(ctx context.Context, jobID download.JobID) error {
 	return s.txm.InTx(ctx, func(ctx context.Context) error {
 		j, err := s.jobs.ByID(ctx, jobID)
 		if err != nil {
