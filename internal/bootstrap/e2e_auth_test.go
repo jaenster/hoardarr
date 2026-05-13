@@ -358,8 +358,14 @@ func newClient(t *testing.T) *http.Client {
 		t.Fatalf("cookiejar.New: %v", err)
 	}
 	return &http.Client{
-		Jar:     jar,
-		Timeout: 10 * time.Second,
+		Jar: jar,
+		// 30s rather than the gut-feel 10s: bcrypt at default cost
+		// (~70ms warm) climbs to several hundred ms under -race on
+		// the GitHub-hosted runners, and the package's tests run
+		// concurrently enough that a request can sit briefly behind
+		// the scheduler. 30s is still well under the package-level
+		// 10m go-test timeout in CI.
+		Timeout: 30 * time.Second,
 	}
 }
 
