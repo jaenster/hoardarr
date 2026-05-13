@@ -25,8 +25,14 @@ import (
 //     5s timeout; the retry-then-roll-back-and-replay pattern is the
 //     same as for 517.
 //
-// Five retries with a small linear stagger is empirically plenty.
-const maxSnapshotRetries = 5
+// 20 retries with exponential backoff (1ms * 2^attempt, capped at
+// 250ms) absorbs the bursty contention pattern we see under CI's
+// -race overhead, where multiple tests in the same process are
+// hammering the DB concurrently and the writer set turns over fast
+// enough that 5 retries can hit 5 consecutive collisions. Worst-case
+// total stagger is ~2.5s, well below the 10m go-test timeout and
+// the 30s HTTP-client timeout that's the actual outer bound.
+const maxSnapshotRetries = 20
 
 // txKey is the unexported context-key type used to attach an active
 // *sql.Tx to a context. Repos and the outbox bus extract via TxFromContext
@@ -76,9 +82,15 @@ func (m *TxManager) InTx(ctx context.Context, fn func(ctx context.Context) error
 			return err
 		}
 		lastErr = err
-		// Tiny backoff so we don't spin if another writer is bursty.
+		// Exponential backoff with a 250ms cap. Spinning every
+		// attempt+1 ms (the previous linear scheme) doesn't give the
+		// other writer enough room to finish on a slow runner.
+		delay := time.Duration(1<<attempt) * time.Millisecond
+		if delay > 250*time.Millisecond {
+			delay = 250 * time.Millisecond
+		}
 		select {
-		case <-time.After(time.Duration(attempt+1) * time.Millisecond):
+		case <-time.After(delay):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -87,7 +99,7 @@ func (m *TxManager) InTx(ctx context.Context, fn func(ctx context.Context) error
 }
 
 // runTx is one transaction attempt. Separated so InTx can replay on
-// SQLITE_BUSY_SNAPSHOT.
+// SQLITE_BUSY_SNAPSHOT / SQLITE_BUSY.
 func (m *TxManager) runTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	sqlTx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
