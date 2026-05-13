@@ -989,6 +989,112 @@ a:hover {
   transition: width 0.1s linear;
 }
 
+/* --- File tree explorer (JobDetail) ----------------------------- */
+.file-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.file-tree-item {
+  border-bottom: 1px solid var(--border);
+}
+.file-tree-item:last-child {
+  border-bottom: none;
+}
+.file-tree-row {
+  display: grid;
+  grid-template-columns: 1.25rem 1.25rem 1fr auto auto 8rem auto;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.45rem 0.5rem;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.file-tree-row:hover {
+  background: var(--bg);
+}
+.file-tree-row:disabled {
+  cursor: default;
+}
+.file-tree-row:disabled:hover {
+  background: transparent;
+}
+.file-tree-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+}
+.file-tree-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.file-tree-meta {
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+.file-tree-segs {
+  font-size: 0.78rem;
+  white-space: nowrap;
+  min-width: 5.5rem;
+  text-align: right;
+}
+.file-tree-progress {
+  position: relative;
+  display: inline-block;
+  height: 5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.file-tree-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent, #4f7bb2);
+  transition: width 0.1s linear;
+}
+.file-tree-children {
+  padding: 0.4rem 0.5rem 0.8rem 2.5rem;
+  background: rgba(255, 255, 255, 0.02);
+}
+.file-tree-summary {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+}
+.file-tree-segments {
+  font-size: 0.8rem;
+}
+.file-tree-segments td,
+.file-tree-segments th {
+  padding: 0.25rem 0.4rem;
+}
+.file-tree-segments .file-seg-idx {
+  width: 2.5rem;
+}
+.file-tree-segments .file-seg-msgid {
+  max-width: 24rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-tree-segments .file-seg-err {
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-tree-segments .file-seg-row-bad td {
+  background: rgba(220, 100, 100, 0.06);
+}
+
 .queue-meta {
   display: inline-flex;
   align-items: center;

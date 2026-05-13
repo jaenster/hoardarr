@@ -17,6 +17,12 @@ export type JobState =
   | "waiting_for_server";
 
 export type FileState = "pending" | "downloading" | "complete" | "failed";
+export type SegmentState =
+  | "pending"
+  | "inflight"
+  | "done"
+  | "missing"
+  | "failed";
 
 export type Job = {
   id: number;
@@ -44,6 +50,21 @@ export type JobFile = {
   segment_count: number;
   segments_done: number;
   is_par2: boolean;
+  is_recovery_vol: boolean;
+  // Populated only by the per-job endpoint (/api/v1/queue/{id});
+  // list endpoints leave it undefined.
+  segments?: JobSegment[];
+};
+
+export type JobSegment = {
+  id: number;
+  seq_index: number;
+  message_id: string;
+  bytes: number;
+  state: SegmentState;
+  attempts: number;
+  last_error?: string;
+  file_offset: number;
 };
 
 export type BillingMode = "flat" | "metered";

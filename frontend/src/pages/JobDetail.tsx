@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   ChevronLeft,
+  ChevronRight,
+  ChevronDown,
   RefreshCw,
   Activity,
   Wrench,
@@ -10,13 +12,21 @@ import {
   Box,
   FileText,
   ShieldCheck,
+  Layers,
 } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
 import { api } from "../api/client";
-import type { EventEnvelope, FileState, Job, JobFile } from "../api/types";
+import type {
+  EventEnvelope,
+  FileState,
+  Job,
+  JobFile,
+  JobSegment,
+  SegmentState,
+} from "../api/types";
 
 // Per-job timeline. Polls /api/v1/queue/{id}/events on a tick so live
 // jobs grow in front of the operator. For terminal jobs it's a static
@@ -107,28 +117,7 @@ export default function JobDetail() {
       {error && <p className="text-err">{error}</p>}
 
       {job && job.files && job.files.length > 0 && (
-        <Panel
-          title="Files"
-          meta={<StatusBadge tone="neutral">{job.files.length} files</StatusBadge>}
-        >
-          <table className="table file-list">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Type</th>
-                <th>Size</th>
-                <th>Segments</th>
-                <th>Progress</th>
-                <th>State</th>
-              </tr>
-            </thead>
-            <tbody>
-              {job.files.map((f) => (
-                <FileRow key={f.id} file={f} />
-              ))}
-            </tbody>
-          </table>
-        </Panel>
+        <FilesPanel job={job} />
       )}
 
       <Panel
@@ -164,39 +153,255 @@ export default function JobDetail() {
   );
 }
 
-function FileRow({ file }: { file: JobFile }) {
+// Expandable file/segment explorer. Default view groups by file with a
+// per-file summary row (state, size, progress, segment counts). Click
+// a file to reveal its segments — the operator can spot exactly which
+// articles 430'd, are still pending, or hit retry budget.
+//
+// "Show problems only" filters to files with any segment in a non-done
+// terminal state (missing/failed) or any non-resolved segment when the
+// file's state is non-terminal. Useful for tracking down stuck jobs
+// when most files completed cleanly.
+function FilesPanel({ job }: { job: Job }) {
+  const [problemsOnly, setProblemsOnly] = useState(false);
+  const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
+
+  const files = problemsOnly
+    ? job.files.filter((f) => hasProblems(f))
+    : job.files;
+
+  const problemCount = useMemo(
+    () => job.files.filter(hasProblems).length,
+    [job.files],
+  );
+
+  const toggle = (id: number) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  return (
+    <Panel
+      title="Files"
+      meta={
+        <>
+          <StatusBadge tone="neutral">
+            <Layers size={12} />
+            {job.files.length} files
+          </StatusBadge>
+          {problemCount > 0 && (
+            <StatusBadge tone="warn" dot>
+              {problemCount} with problems
+            </StatusBadge>
+          )}
+        </>
+      }
+      actions={
+        problemCount > 0 ? (
+          <Button
+            variant={problemsOnly ? "primary" : "ghost"}
+            onClick={() => setProblemsOnly((v) => !v)}
+          >
+            {problemsOnly ? "Show all" : "Problems only"}
+          </Button>
+        ) : null
+      }
+    >
+      {files.length === 0 ? (
+        <p className="muted">
+          {problemsOnly
+            ? "No files with unresolved segments — everything healthy."
+            : "No files."}
+        </p>
+      ) : (
+        <ul className="file-tree" role="tree">
+          {files.map((f) => (
+            <FileTreeRow
+              key={f.id}
+              file={f}
+              expanded={expanded.has(f.id)}
+              onToggle={() => toggle(f.id)}
+            />
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+function FileTreeRow({
+  file,
+  expanded,
+  onToggle,
+}: {
+  file: JobFile;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   const pct =
     file.segment_count > 0
       ? Math.round((file.segments_done / file.segment_count) * 100)
       : 0;
+  const segs = file.segments;
+  const hasSegmentData = Array.isArray(segs);
+  const counts = hasSegmentData ? countSegmentStates(segs!) : null;
+  const problems =
+    counts && counts.missing + counts.failed + counts.inflight + counts.pending > 0
+      ? counts
+      : null;
+
   return (
-    <tr>
-      <td className="file-name" title={file.filename}>
+    <li role="treeitem" aria-expanded={expanded} className="file-tree-item">
+      <button
+        type="button"
+        className="file-tree-row"
+        onClick={onToggle}
+        disabled={!hasSegmentData}
+      >
+        <span className="file-tree-chevron" aria-hidden="true">
+          {hasSegmentData ? (
+            expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
+          ) : null}
+        </span>
         {file.is_par2 ? (
           <ShieldCheck size={14} aria-hidden="true" className="file-icon" />
         ) : (
           <FileText size={14} aria-hidden="true" className="file-icon" />
         )}
-        <span>{file.filename}</span>
-      </td>
-      <td className="muted">{file.is_par2 ? "PAR2" : "data"}</td>
-      <td className="muted">{formatBytes(file.size_bytes)}</td>
-      <td className="muted">
-        {file.segments_done} / {file.segment_count}
-      </td>
-      <td className="file-progress-cell">
-        <div className="file-progress" role="progressbar" aria-valuenow={pct}>
-          <div className="file-progress-fill" style={{ width: pct + "%" }} />
-        </div>
-        <span className="muted">{pct}%</span>
-      </td>
-      <td>
+        <span className="file-tree-name" title={file.filename}>
+          {file.filename}
+        </span>
+        <span className="muted file-tree-meta">
+          {fileKindLabel(file)} · {formatBytes(file.size_bytes)}
+        </span>
+        <span className="muted file-tree-segs">
+          {file.segments_done} / {file.segment_count}
+        </span>
+        <span className="file-tree-progress" aria-hidden="true">
+          <span
+            className="file-tree-progress-fill"
+            style={{ width: pct + "%" }}
+          />
+        </span>
         <StatusBadge tone={fileStateTone(file.state)} dot>
           {fileStateLabel(file.state)}
         </StatusBadge>
-      </td>
-    </tr>
+      </button>
+      {expanded && hasSegmentData && (
+        <div className="file-tree-children">
+          {problems && (
+            <p className="muted file-tree-summary">
+              {problems.done > 0 && <>{problems.done} done · </>}
+              {problems.pending > 0 && <>{problems.pending} pending · </>}
+              {problems.inflight > 0 && <>{problems.inflight} inflight · </>}
+              {problems.missing > 0 && (
+                <span className="text-err">{problems.missing} missing · </span>
+              )}
+              {problems.failed > 0 && (
+                <span className="text-err">{problems.failed} failed</span>
+              )}
+            </p>
+          )}
+          <table className="table file-tree-segments">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Message-ID</th>
+                <th>Bytes</th>
+                <th>Attempts</th>
+                <th>State</th>
+                <th>Error</th>
+              </tr>
+            </thead>
+            <tbody>
+              {segs!.map((s) => (
+                <tr
+                  key={s.id}
+                  className={segmentRowClass(s.state)}
+                >
+                  <td className="muted file-seg-idx">{s.seq_index}</td>
+                  <td className="file-seg-msgid" title={s.message_id}>
+                    <code className="inline-code">{s.message_id}</code>
+                  </td>
+                  <td className="muted">{formatBytes(s.bytes)}</td>
+                  <td className="muted">{s.attempts}</td>
+                  <td>
+                    <StatusBadge tone={segStateTone(s.state)} dot>
+                      {s.state}
+                    </StatusBadge>
+                  </td>
+                  <td className="text-err file-seg-err" title={s.last_error || ""}>
+                    {s.last_error || ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </li>
   );
+}
+
+function countSegmentStates(segs: JobSegment[]) {
+  let done = 0,
+    pending = 0,
+    inflight = 0,
+    missing = 0,
+    failed = 0;
+  for (const s of segs) {
+    switch (s.state) {
+      case "done": done++; break;
+      case "pending": pending++; break;
+      case "inflight": inflight++; break;
+      case "missing": missing++; break;
+      case "failed": failed++; break;
+    }
+  }
+  return { done, pending, inflight, missing, failed };
+}
+
+function hasProblems(f: JobFile): boolean {
+  if (Array.isArray(f.segments)) {
+    return f.segments.some(
+      (s) => s.state === "missing" || s.state === "failed",
+    );
+  }
+  // Fall back to header counts when segments aren't hydrated.
+  return f.state === "failed" ||
+    (f.state !== "complete" && f.segments_done < f.segment_count);
+}
+
+function fileKindLabel(f: JobFile): string {
+  if (f.is_recovery_vol) return "PAR2 vol";
+  if (f.is_par2) return "PAR2";
+  return "data";
+}
+
+function segStateTone(
+  s: SegmentState,
+): "ok" | "warn" | "err" | "info" | "neutral" {
+  switch (s) {
+    case "done": return "ok";
+    case "pending": return "neutral";
+    case "inflight": return "info";
+    case "missing": return "err";
+    case "failed": return "err";
+  }
+}
+
+function segmentRowClass(s: SegmentState): string {
+  switch (s) {
+    case "missing":
+    case "failed":
+      return "file-seg-row-bad";
+    default:
+      return "";
+  }
 }
 
 function fileStateTone(s: FileState): "ok" | "warn" | "err" | "info" | "neutral" {

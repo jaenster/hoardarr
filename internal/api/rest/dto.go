@@ -34,15 +34,33 @@ type JobDTO struct {
 	Files       []FileDTO `json:"files"`
 }
 
-// FileDTO is the per-file slice attached to a JobDTO.
+// FileDTO is the per-file slice attached to a JobDTO. Segments is
+// populated only on the per-job endpoint (/api/v1/queue/{id}); list
+// endpoints leave it nil to keep payload bounded.
 type FileDTO struct {
-	ID            int64  `json:"id"`
-	Filename      string `json:"filename"`
-	SizeBytes     int64  `json:"size_bytes"`
-	State         string `json:"state"`
-	SegmentCount  int    `json:"segment_count"`
-	SegmentsDone  int    `json:"segments_done"`
-	IsPar2        bool   `json:"is_par2"`
+	ID            int64        `json:"id"`
+	Filename      string       `json:"filename"`
+	SizeBytes     int64        `json:"size_bytes"`
+	State         string       `json:"state"`
+	SegmentCount  int          `json:"segment_count"`
+	SegmentsDone  int          `json:"segments_done"`
+	IsPar2        bool         `json:"is_par2"`
+	IsRecoveryVol bool         `json:"is_recovery_vol"`
+	Segments      []SegmentDTO `json:"segments,omitempty"`
+}
+
+// SegmentDTO is the per-segment slice attached to a FileDTO on the
+// detail endpoint. Surfaces the operator-visible metadata the file
+// explorer renders: state, attempts, last_error, message_id.
+type SegmentDTO struct {
+	ID         int64  `json:"id"`
+	SeqIndex   int    `json:"seq_index"`
+	MessageID  string `json:"message_id"`
+	Bytes      int64  `json:"bytes"`
+	State      string `json:"state"`
+	Attempts   int    `json:"attempts"`
+	LastError  string `json:"last_error,omitempty"`
+	FileOffset int64  `json:"file_offset"`
 }
 
 // ServerDTO is the JSON shape returned by /api/v1/servers. Passwords
@@ -139,15 +157,33 @@ func jobToDTO(j *download.Job) JobDTO {
 	files := j.Files()
 	dto.Files = make([]FileDTO, 0, len(files))
 	for _, f := range files {
-		dto.Files = append(dto.Files, FileDTO{
-			ID:           int64(f.ID()),
-			Filename:     f.Filename(),
-			SizeBytes:    f.SizeBytes(),
-			State:        string(f.State()),
-			SegmentCount: f.SegmentCount(),
-			SegmentsDone: f.SegmentsDone(),
-			IsPar2:       f.IsPar2(),
-		})
+		fdto := FileDTO{
+			ID:            int64(f.ID()),
+			Filename:      f.Filename(),
+			SizeBytes:     f.SizeBytes(),
+			State:         string(f.State()),
+			SegmentCount:  f.SegmentCount(),
+			SegmentsDone:  f.SegmentsDone(),
+			IsPar2:        f.IsPar2(),
+			IsRecoveryVol: f.IsRecoveryVol(),
+		}
+		segs := f.Segments()
+		if len(segs) > 0 {
+			fdto.Segments = make([]SegmentDTO, 0, len(segs))
+			for _, s := range segs {
+				fdto.Segments = append(fdto.Segments, SegmentDTO{
+					ID:         int64(s.ID()),
+					SeqIndex:   s.SeqIndex(),
+					MessageID:  s.MessageID(),
+					Bytes:      s.Bytes(),
+					State:      string(s.State()),
+					Attempts:   s.Attempts(),
+					LastError:  s.LastError(),
+					FileOffset: s.FileOffset(),
+				})
+			}
+		}
+		dto.Files = append(dto.Files, fdto)
 	}
 	return dto
 }
