@@ -123,7 +123,9 @@ func TestM3a_E2E_VerifyOK(t *testing.T) {
 	waitListen(t, cfg.Server.Listen)
 	base := "http://" + cfg.Server.Listen
 
-	jobID := uploadNZB(t, base, apiKey, "m3a.nzb", nzbXML)
+	// Upload filename drives the job's display name (REST handler trims
+	// .nzb and uses that as the release dir). Match the expected dir.
+	jobID := uploadNZB(t, base, apiKey, "m3a-release.nzb", nzbXML)
 
 	// Wait for ALL relevant events to settle. Each topic has its own
 	// dispatcher goroutine, so VerifyOK can land before our

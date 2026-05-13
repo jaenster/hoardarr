@@ -135,7 +135,9 @@ func TestSAB_E2E_PhaseOneModes(t *testing.T) {
 					"abcdefghij\r\n=yend size=10 part=1 crc32=0\r\n")},
 		})
 
-		body, ct := buildSABAddFile(t, "sab.nzb", nzbXML)
+		// Upload filename drives the SAB queue's slot filename (it's the
+		// trimmed-of-.nzb display name). Match the expected slot label.
+		body, ct := buildSABAddFile(t, "sab-test.nzb", nzbXML)
 		resp := sabPost(t, base+"?mode=addfile&apikey="+apiKey+"&cat=*", ct, body)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {

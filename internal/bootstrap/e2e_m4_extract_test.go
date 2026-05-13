@@ -128,7 +128,7 @@ func TestM4_E2E_ExtractWithStub(t *testing.T) {
 	waitListen(t, cfg.Server.Listen)
 	base := "http://" + cfg.Server.Listen
 
-	jobID := uploadNZB(t, base, apiKey, "m4-rar.nzb", nzbXML)
+	jobID := uploadNZB(t, base, apiKey, "m4-rar-release.nzb", nzbXML)
 
 	final := waitForJobState(t, app, jobID, "completed", 15*time.Second)
 	if final == nil {

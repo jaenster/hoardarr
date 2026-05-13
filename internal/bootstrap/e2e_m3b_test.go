@@ -126,7 +126,7 @@ func TestM3b_E2E_RepairAndDeliver(t *testing.T) {
 	waitListen(t, cfg.Server.Listen)
 	base := "http://" + cfg.Server.Listen
 
-	jobID := uploadNZB(t, base, apiKey, "m3b.nzb", nzbXML)
+	jobID := uploadNZB(t, base, apiKey, "m3b-release.nzb", nzbXML)
 
 	final := waitForJobState(t, app, jobID, "completed", 20*time.Second)
 	if final == nil {
