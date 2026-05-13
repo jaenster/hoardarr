@@ -45,11 +45,16 @@ make build            # frontend bundle + go build -tags embed
 ./hoardarr serve      # default: listens on :8085, data dir ./data
 ```
 
-Or with Docker:
+Or with Docker — images are published to both GHCR and Docker Hub:
 
 ```bash
+# GHCR
 docker run -p 8085:8085 -v /path/to/data:/data \
   ghcr.io/jaenster/hoardarr:latest
+
+# Docker Hub (jaenster/hoardarr, requires DOCKERHUB_USERNAME repo secret)
+docker run -p 8085:8085 -v /path/to/data:/data \
+  jaenster/hoardarr:latest
 ```
 
 Or with [docker-compose](docker-compose.yml):
