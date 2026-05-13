@@ -207,3 +207,26 @@ func ensureParentDir(path string) error {
 	}
 	return os.MkdirAll(dir, 0o755)
 }
+
+// Checkpoint runs `PRAGMA wal_checkpoint(TRUNCATE)` to force the WAL
+// file back down to zero bytes. Without periodic checkpoints the WAL
+// can grow indefinitely under sustained write load (every write goes
+// to the WAL until SQLite auto-checkpoints, but the auto-checkpoint
+// threshold is per-connection and our pool means each conn has its
+// own counter — they rarely cross the auto-checkpoint line in
+// isolation).
+//
+// Returns the busy / log / checkpointed page counts SQLite emits, so
+// callers can log a single line per cycle. Errors propagate; the
+// background ticker logs and continues so a transient lock doesn't
+// kill the loop.
+func (db *DB) Checkpoint(ctx context.Context) (busy, logSize, checkpointed int64, err error) {
+	if db.path == ":memory:" {
+		return 0, 0, 0, nil
+	}
+	row := db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	if err = row.Scan(&busy, &logSize, &checkpointed); err != nil {
+		return 0, 0, 0, fmt.Errorf("wal_checkpoint: %w", err)
+	}
+	return busy, logSize, checkpointed, nil
+}

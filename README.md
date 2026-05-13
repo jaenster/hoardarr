@@ -1,9 +1,21 @@
 # hoardarr
 
+[![ci](https://github.com/jaenster/hoardarr/actions/workflows/ci.yml/badge.svg)](https://github.com/jaenster/hoardarr/actions/workflows/ci.yml)
+[![docker](https://github.com/jaenster/hoardarr/actions/workflows/docker.yml/badge.svg)](https://github.com/jaenster/hoardarr/actions/workflows/docker.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![release](https://img.shields.io/github/v/release/jaenster/hoardarr?include_prereleases&sort=semver)](https://github.com/jaenster/hoardarr/releases)
+
 Go-based SABnzbd alternative with a Sonarr/Radarr-style UI. Drop-in
 replacement for the SAB API that Sonarr / Radarr / Lidarr / Readarr /
 Prowlarr expect — point them at hoardarr's `/sabnzbd/api` and they
 don't know the difference.
+
+<!-- Screenshots go here. Drop in:
+     - docs/img/activity.png — Activity page mid-download
+     - docs/img/settings.png — Settings → Servers card grid
+     and uncomment the lines below. -->
+<!-- ![Activity](docs/img/activity.png) -->
+<!-- ![Settings](docs/img/settings.png) -->
 
 Single binary. Pure-Go SQLite (no cgo). Frontend is embedded via
 `go:embed`, so deployment is "scp the binary, give it a writable data
@@ -36,14 +48,25 @@ make build            # frontend bundle + go build -tags embed
 Or with Docker:
 
 ```bash
-docker build -t hoardarr:latest .
-docker run -p 8085:8085 -v /path/to/data:/data hoardarr:latest
+docker run -p 8085:8085 -v /path/to/data:/data \
+  ghcr.io/jaenster/hoardarr:latest
+```
+
+Or with [docker-compose](docker-compose.yml):
+
+```bash
+curl -O https://raw.githubusercontent.com/jaenster/hoardarr/main/docker-compose.yml
+# edit the bind mounts + UID/GID, then:
+docker compose up -d
 ```
 
 First-run flow: open `http://localhost:8085`, create an admin account,
 add a Usenet server, drop an NZB. Point Sonarr/Radarr at
 `http://hoardarr:8085/sabnzbd` with the API key from `Settings →
 Authentication`.
+
+For reverse-proxy / TLS-terminating deployments (nginx, Caddy, Traefik),
+see [`docs/reverse-proxy.md`](docs/reverse-proxy.md).
 
 ## Configuration
 
@@ -94,6 +117,21 @@ NNTP stub (`internal/testserver/nntp`). Playwright specs drive the
 UI against a real hoardarr binary + the testserver, so the SAB shim,
 SSE updates, drag-reorder, and per-job detail flows are exercised
 under a real browser.
+
+## Observability
+
+`/metrics` exposes a Prometheus scrape endpoint behind the same API-key
+auth. See [`docs/observability.md`](docs/observability.md) for scrape
+config, the metric reference, and a starter alert ruleset.
+
+## Backup
+
+Stop hoardarr and copy the `data/` directory. SQLite WAL is checkpointed
+periodically and on shutdown, so the bytes on disk are consistent. The
+data directory contains the DB, settings, sessions, and any
+job-in-flight state under `incomplete/`. Without that subtree restored,
+in-progress downloads start over on next boot — finished jobs in
+`complete/` are unaffected.
 
 ## License
 

@@ -1,0 +1,47 @@
+# hoardarr — sample docker-compose for the homelab use case.
+#
+# Drops the published GHCR image, binds a host data directory, and
+# publishes :8085 to the host. Pair with Sonarr / Radarr in the same
+# compose stack (or a separate one) by pointing them at hoardarr's
+# /sabnzbd/api endpoint and the API key shown in `Settings → General`.
+
+services:
+  hoardarr:
+    image: ghcr.io/jaenster/hoardarr:latest
+    container_name: hoardarr
+    restart: unless-stopped
+
+    # Run as the operator's UID/GID so files written to the bind mounts
+    # are owned by the host user, not the container's `nonroot` uid.
+    # Adjust to match your host: `id -u` and `id -g`.
+    user: "1000:1000"
+
+    ports:
+      # Host:container. Change the left side if 8085 is taken.
+      - "8085:8085"
+
+    volumes:
+      # State: SQLite DB, runtime settings, sessions, logs.
+      - ./data:/data
+      # Where finished releases land. Mount the same path Sonarr / Radarr
+      # read from so they can pick up imports without copying.
+      - /srv/media/incomplete:/data/incomplete
+      - /srv/media/complete:/data/complete
+
+    environment:
+      # config.toml lives at /data/config.toml; hoardarr auto-generates
+      # it on first run with a fresh API key. These env vars override
+      # anything the file says — useful for transient docker-compose
+      # tweaks without editing config.toml.
+      HOARDARR_LISTEN: ":8085"
+      HOARDARR_LOG_LEVEL: "info"
+      # HOARDARR_URL_BASE: "/hoardarr"  # only if behind a path-prefix proxy
+
+    healthcheck:
+      # Dockerfile already declares HEALTHCHECK via `hoardarr healthcheck`.
+      # Restate here in case you swap to your own image build.
+      test: ["CMD", "/usr/local/bin/hoardarr", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

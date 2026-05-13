@@ -537,6 +537,46 @@ func closePools(pools map[domainserver.ServerID]*nntp.Pool) {
 	}
 }
 
+// startWALCheckpointer kicks off a goroutine that runs
+// `PRAGMA wal_checkpoint(TRUNCATE)` every 5 minutes plus once on
+// shutdown. SQLite auto-checkpoints per-connection, but our pooled
+// driver means no single connection sees enough writes to cross the
+// auto-checkpoint threshold quickly; the WAL grows for days otherwise.
+// Truncating it back to zero keeps the on-disk DB compact and crash-
+// recovery fast.
+func (a *App) startWALCheckpointer(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				// Final checkpoint on graceful shutdown so the next
+				// boot opens a tidy DB.
+				cpCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				if _, log, ck, err := a.DB.Checkpoint(cpCtx); err != nil {
+					a.Logger.Warn("wal: final checkpoint failed", "err", err)
+				} else {
+					a.Logger.Info("wal: final checkpoint", "wal_pages", log, "checkpointed", ck)
+				}
+				cancel()
+				return
+			case <-ticker.C:
+				cpCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				busy, log, ck, err := a.DB.Checkpoint(cpCtx)
+				cancel()
+				if err != nil {
+					a.Logger.Warn("wal: checkpoint failed", "err", err)
+					continue
+				}
+				if log > 0 {
+					a.Logger.Debug("wal: checkpoint", "busy", busy, "wal_pages", log, "checkpointed", ck)
+				}
+			}
+		}
+	}()
+}
+
 // Run starts the orchestrator service and the HTTP listener, blocking
 // until ctx is cancelled or HTTP fails.
 //
@@ -576,6 +616,7 @@ func (a *App) Run(ctx context.Context) error {
 		return fmt.Errorf("start scheduler: %w", err)
 	}
 	a.ByteFlusher.Start(ctx)
+	a.startWALCheckpointer(ctx)
 
 	errCh := make(chan error, 1)
 	go func() {
