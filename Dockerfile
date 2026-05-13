@@ -11,7 +11,11 @@
 # Image is intentionally minimal because the data dir is mounted from
 # the host. Everything that needs to persist lives outside the image.
 
-FROM node:22-alpine AS frontend
+# Pin the frontend stage to the build platform so buildx doesn't run
+# npm under QEMU on arm64 — npm install + vite build under emulation
+# is brutally slow (we observed >90 min on a free runner before
+# cancelling). Frontend output is arch-neutral JS/CSS so this is safe.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install --no-fund --no-audit
