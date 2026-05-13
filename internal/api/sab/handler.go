@@ -30,9 +30,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
@@ -47,17 +49,30 @@ const reportedVersion = "3.7.2"
 // Handler is the SAB API entry point. Mount at /sabnzbd/api (and
 // /sabnzbd/ for the few clients that path-prefix without /api).
 type Handler struct {
-	APIKey     string
-	Queue      *appdownload.QueueService
-	AddJob     *appdownload.AddJobService
-	Categories *sqlite.CategoryRepo
-	Logger     *slog.Logger
+	APIKey      string
+	Queue       *appdownload.QueueService
+	AddJob      *appdownload.AddJobService
+	Categories  *sqlite.CategoryRepo
+	Logger      *slog.Logger
 	CompleteDir string
 	// Throughput returns current overall download rate in bytes/sec.
 	// Used to populate queue.kbpersec / queue.timeleft and per-slot
 	// eta/timeleft. May be nil; the SAB API then reports 0 / unknown
 	// (existing behaviour, but *arr clients prefer numbers).
 	Throughput func() int64
+	// fetchClient handles mode=addurl downloads. Lazily constructed so
+	// tests can inject a stubbed transport without touching the global
+	// http.DefaultClient.
+	fetchClient *http.Client
+}
+
+// FetchClient returns the (lazily-constructed) http.Client used by
+// mode=addurl. Exposed so tests can replace its Transport.
+func (h *Handler) FetchClient() *http.Client {
+	if h.fetchClient == nil {
+		h.fetchClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	return h.fetchClient
 }
 
 // ServeHTTP dispatches on mode=.
@@ -86,10 +101,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.modeGetCats(w, r)
 	case "addfile":
 		h.modeAddFile(w, r)
+	case "addurl":
+		h.modeAddURL(w, r)
 	case "queue":
 		h.modeQueue(w, r)
 	case "history":
 		h.modeHistory(w, r)
+	case "get_files":
+		h.modeGetFiles(w, r)
+	case "eval_sort":
+		h.modeEvalSort(w, r)
 	case "":
 		h.writeError(w, http.StatusBadRequest, errors.New("mode= required"))
 	default:
@@ -335,6 +356,27 @@ func (h *Handler) modeQueueAction(w http.ResponseWriter, r *http.Request, action
 }
 
 func (h *Handler) modeHistory(w http.ResponseWriter, r *http.Request) {
+	switch formGet(r, "name") {
+	case "":
+		h.modeHistoryList(w, r)
+		return
+	case "delete":
+		// History delete uses the same RemoveJob plumbing as queue delete:
+		// the underlying repo doesn't distinguish, and removing a
+		// completed/failed row is just an UPDATE that nulls history.
+		h.modeQueueAction(w, r, "delete")
+		return
+	case "mark_as_completed":
+		h.modeMarkCompleted(w, r)
+		return
+	default:
+		h.writeError(w, http.StatusBadRequest,
+			fmt.Errorf("history.name=%q not implemented", formGet(r, "name")))
+		return
+	}
+}
+
+func (h *Handler) modeHistoryList(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if v := formGet(r, "limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -361,6 +403,196 @@ func (h *Handler) modeHistory(w http.ResponseWriter, r *http.Request) {
 			"day_size":       "0 B",
 		},
 	})
+}
+
+// modeAddURL fetches an NZB by URL and routes the body through the
+// existing addfile pipeline. Sonarr's "Send NZB by URL" button hits
+// this; before this lands the button silently fails and the job never
+// makes it into hoardarr's queue.
+func (h *Handler) modeAddURL(w http.ResponseWriter, r *http.Request) {
+	rawURL := strings.TrimSpace(formGet(r, "name"))
+	if rawURL == "" {
+		h.writeError(w, http.StatusBadRequest, errors.New("name= (url) required"))
+		return
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		h.writeError(w, http.StatusBadRequest, errors.New("url must be http:// or https://"))
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rawURL, nil)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("build request: %w", err))
+		return
+	}
+	req.Header.Set("User-Agent", "hoardarr/sab-shim")
+	resp, err := h.FetchClient().Do(req)
+	if err != nil {
+		h.writeError(w, http.StatusBadGateway, fmt.Errorf("fetch nzb: %w", err))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		h.writeError(w, http.StatusBadGateway, fmt.Errorf("fetch nzb: upstream %d", resp.StatusCode))
+		return
+	}
+
+	// Display name precedence: explicit nzbname= > Content-Disposition >
+	// derived from URL path > a placeholder. Indexers usually send a
+	// Content-Disposition: attachment; filename="Release.Name.nzb" header.
+	displayName := strings.TrimSpace(formGet(r, "nzbname"))
+	if displayName == "" {
+		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+			if _, params, perr := mime.ParseMediaType(cd); perr == nil {
+				if fn := params["filename"]; fn != "" {
+					displayName = strings.TrimSuffix(fn, ".nzb")
+					displayName = strings.TrimSuffix(displayName, ".NZB")
+				}
+			}
+		}
+	}
+	if displayName == "" {
+		displayName = filenameFromURL(rawURL)
+	}
+	if displayName == "" {
+		displayName = "addurl-job"
+	}
+
+	id, err := h.AddJob.AddJob(r.Context(), appdownload.AddJobCmd{
+		NZB:      resp.Body,
+		Name:     displayName,
+		Category: formGet(r, "cat"),
+		Source:   r.UserAgent() + " (addurl)",
+	})
+	if err != nil && !errors.Is(err, appdownload.ErrDuplicateNZB) {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  true,
+		"nzo_ids": []string{nzoID(id)},
+	})
+}
+
+// modeGetFiles returns the per-file list for a job. Sonarr's queue
+// detail view in some versions enumerates these; the data is already
+// hydrated by QueueService.Get (issue #125), this is just a SAB-shaped
+// wrapper.
+func (h *Handler) modeGetFiles(w http.ResponseWriter, r *http.Request) {
+	raw := strings.TrimSpace(formGet(r, "value"))
+	if raw == "" {
+		h.writeError(w, http.StatusBadRequest, errors.New("value= (nzo_id) required"))
+		return
+	}
+	id, err := jobIDFromNZO(raw)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("nzo_id %q: %w", raw, err))
+		return
+	}
+	j, err := h.Queue.Get(r.Context(), id)
+	if err != nil {
+		h.writeError(w, http.StatusNotFound, err)
+		return
+	}
+	files := make([]map[string]any, 0, len(j.Files()))
+	for _, f := range j.Files() {
+		total := f.SizeBytes()
+		var doneBytes int64
+		if cnt := f.SegmentCount(); cnt > 0 {
+			doneBytes = total * int64(f.SegmentsDone()) / int64(cnt)
+		}
+		files = append(files, map[string]any{
+			"filename": f.Filename(),
+			"mb":       fmt.Sprintf("%.2f", float64(total)/(1024*1024)),
+			"mbleft":   fmt.Sprintf("%.2f", float64(total-doneBytes)/(1024*1024)),
+			"bytes":    total,
+			"set":      "",
+			"easy_id":  int(f.ID()),
+			"status":   sabFileStatus(f),
+			"nzf_id":   fmt.Sprintf("nzf_%d", int(f.ID())),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+}
+
+// modeEvalSort renders a SAB-style sort template. *arr clients call
+// this to preview where an import will land before submitting it; a
+// 4xx response makes them refuse the download client entirely.
+func (h *Handler) modeEvalSort(w http.ResponseWriter, r *http.Request) {
+	template := formGet(r, "name")
+	if template == "" {
+		h.writeError(w, http.StatusBadRequest, errors.New("name= (template) required"))
+		return
+	}
+	ctx := buildSortContext(func(k string) string { return formGet(r, k) })
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": true,
+		"result": evalSort(template, ctx),
+	})
+}
+
+// modeMarkCompleted flips a Failed job to Completed. SAB exposes this
+// from its web UI's "mark as completed" right-click action and *arr
+// clients sometimes call it after a manual re-import. Files on disk
+// are untouched; only DB state + history view change.
+func (h *Handler) modeMarkCompleted(w http.ResponseWriter, r *http.Request) {
+	rawIDs := formGet(r, "value")
+	ids := strings.Split(rawIDs, ",")
+	results := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		id, err := jobIDFromNZO(raw)
+		if err != nil {
+			h.writeError(w, http.StatusBadRequest, fmt.Errorf("nzo_id %q: %w", raw, err))
+			return
+		}
+		if err := h.Queue.MarkCompleted(r.Context(), id); err != nil {
+			h.writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		results = append(results, raw)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  true,
+		"nzo_ids": results,
+	})
+}
+
+// sabFileStatus maps hoardarr's per-file state to a single-word SAB
+// status string. *arr clients tend to just display whatever they get,
+// so the exact vocabulary is less important than being non-empty.
+func sabFileStatus(f *download.File) string {
+	switch f.State() {
+	case download.FileStateComplete:
+		return "Finished"
+	case download.FileStateDownloading:
+		return "Active"
+	case download.FileStatePending:
+		return "Queued"
+	case download.FileStateFailed:
+		return "Failed"
+	default:
+		return "Unknown"
+	}
+}
+
+// filenameFromURL extracts a reasonable display name from a URL like
+// https://indexer.example/getnzb?id=abc.nzb&apikey=… by stripping the
+// query and any trailing .nzb suffix.
+func filenameFromURL(u string) string {
+	// Strip query.
+	if i := strings.Index(u, "?"); i >= 0 {
+		u = u[:i]
+	}
+	// Last path component.
+	if i := strings.LastIndex(u, "/"); i >= 0 {
+		u = u[i+1:]
+	}
+	u = strings.TrimSuffix(u, ".nzb")
+	u = strings.TrimSuffix(u, ".NZB")
+	return u
 }
 
 // --- helpers ---------------------------------------------------------

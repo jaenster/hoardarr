@@ -185,6 +185,31 @@ func (s *QueueService) Get(ctx context.Context, id download.JobID) (*download.Jo
 	return s.repo.ByID(ctx, id)
 }
 
+// MarkCompleted forces the job to a terminal "completed" state. Used by
+// SAB's mode=history&name=mark_as_completed, which *arr clients invoke
+// when they've manually re-imported a release that hoardarr marked
+// failed. Files on disk are untouched — this only flips DB state +
+// emits JobCompleted so the history view reflects reality.
+//
+// Idempotent: a job already in JobStateCompleted is a no-op.
+func (s *QueueService) MarkCompleted(ctx context.Context, id download.JobID) error {
+	return s.txm.InTx(ctx, func(ctx context.Context) error {
+		j, err := s.repo.ByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		j.MarkCompleted(s.now())
+		evts := j.PullEvents()
+		if len(evts) == 0 {
+			return nil
+		}
+		if err := s.repo.Save(ctx, j); err != nil {
+			return fmt.Errorf("save: %w", err)
+		}
+		return s.bus.Publish(ctx, evts...)
+	})
+}
+
 // List returns all jobs in the queue, most recent first by queue_order.
 func (s *QueueService) List(ctx context.Context) ([]*download.Job, error) {
 	return s.repo.List(ctx)
