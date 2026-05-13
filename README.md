@@ -10,12 +10,10 @@ replacement for the SAB API that Sonarr / Radarr / Lidarr / Readarr /
 Prowlarr expect — point them at hoardarr's `/sabnzbd/api` and they
 don't know the difference.
 
-<!-- Screenshots go here. Drop in:
-     - docs/img/activity.png — Activity page mid-download
-     - docs/img/settings.png — Settings → Servers card grid
-     and uncomment the lines below. -->
-<!-- ![Activity](docs/img/activity.png) -->
-<!-- ![Settings](docs/img/settings.png) -->
+![Settings — server + category cards](docs/img/settings-servers.png)
+![Job detail — per-file + per-segment drilldown](docs/img/job-detail.png)
+![Activity — live queue with SSE progress](docs/img/activity.png)
+![History — completed releases](docs/img/history.png)
 
 Single binary. Pure-Go SQLite (no cgo). Frontend is embedded via
 `go:embed`, so deployment is "scp the binary, give it a writable data
