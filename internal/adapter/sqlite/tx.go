@@ -12,11 +12,20 @@ import (
 )
 
 // maxSnapshotRetries caps the number of times InTx will reopen on a
-// SQLITE_BUSY_SNAPSHOT (517). With MaxOpenConns > 1 it's possible for
-// a tx to open a read snapshot, then attempt a write after another
-// connection has already advanced the DB. busy_timeout doesn't help
-// here — the right answer is roll back, re-begin, replay the closure.
-// Five retries with a tiny stagger is plenty in practice.
+// retryable busy error. Two flavours surface from modernc.org/sqlite:
+//
+//   - SQLITE_BUSY_SNAPSHOT (517): a tx opened a read snapshot, then
+//     attempted a write after another connection advanced the DB.
+//     busy_timeout doesn't help here; only roll back, re-begin, replay.
+//
+//   - SQLITE_BUSY (5): two connections raced for the write lock and
+//     the loser's busy-timeout countdown ran out. With MaxOpenConns >
+//     1 and bursty writers (outbox dispatcher + orchestrator + REST
+//     mutating endpoints) this still happens occasionally even with a
+//     5s timeout; the retry-then-roll-back-and-replay pattern is the
+//     same as for 517.
+//
+// Five retries with a small linear stagger is empirically plenty.
 const maxSnapshotRetries = 5
 
 // txKey is the unexported context-key type used to attach an active
@@ -63,7 +72,7 @@ func (m *TxManager) InTx(ctx context.Context, fn func(ctx context.Context) error
 		if err == nil {
 			return nil
 		}
-		if !isSnapshotConflict(err) {
+		if !isRetryableBusy(err) {
 			return err
 		}
 		lastErr = err
@@ -74,7 +83,7 @@ func (m *TxManager) InTx(ctx context.Context, fn func(ctx context.Context) error
 			return ctx.Err()
 		}
 	}
-	return fmt.Errorf("intx: snapshot conflict after %d retries: %w", maxSnapshotRetries, lastErr)
+	return fmt.Errorf("intx: busy after %d retries: %w", maxSnapshotRetries, lastErr)
 }
 
 // runTx is one transaction attempt. Separated so InTx can replay on
@@ -102,16 +111,27 @@ func (m *TxManager) runTx(ctx context.Context, fn func(ctx context.Context) erro
 	return nil
 }
 
-// isSnapshotConflict matches SQLITE_BUSY_SNAPSHOT (extended code 517).
-// modernc.org/sqlite surfaces the error code in the error string.
-func isSnapshotConflict(err error) bool {
+// isRetryableBusy matches the two flavours of busy / lock-contention
+// modernc.org/sqlite surfaces: plain SQLITE_BUSY (5) and the snapshot-
+// conflict variant SQLITE_BUSY_SNAPSHOT (517). Both clear with a tx
+// replay; neither benefits from blindly waiting (517 never times out,
+// and a 5 that already exhausted busy_timeout won't relax on its own).
+func isRetryableBusy(err error) bool {
 	if err == nil {
 		return false
 	}
 	s := err.Error()
-	return strings.Contains(s, "SQLITE_BUSY_SNAPSHOT") ||
-		strings.Contains(s, "database is locked (517)") ||
-		strings.Contains(s, "(517)")
+	// 517 — snapshot conflict.
+	if strings.Contains(s, "SQLITE_BUSY_SNAPSHOT") ||
+		strings.Contains(s, "(517)") {
+		return true
+	}
+	// 5 — plain SQLITE_BUSY (write-write race after busy_timeout).
+	if strings.Contains(s, "database is locked (5)") ||
+		strings.Contains(s, "SQLITE_BUSY") {
+		return true
+	}
+	return false
 }
 
 // TxFromContext returns the *sql.Tx attached to ctx, or nil if none.
