@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest a feature or enhancement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. For anything bigger than a small change,
+        please describe the problem you are trying to solve before
+        proposing a specific implementation — that lets us discuss the
+        approach without locking in a shape too early.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that hoardarr doesn't make easy today?
+      placeholder: "I run Sonarr behind a path-prefix reverse proxy at /sonarr and want hoardarr at /hoardarr without a separate hostname."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you imagine this could work. Mockups / API sketches welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, and why you prefer the proposal above.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / impact
+      description: Which area of the codebase does this touch (domain, adapter, API, UI, ops)?  If you've read CONTRIBUTING.md, this is the place to flag schema / DDD-level changes.

@@ -1,0 +1,72 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill in the
+        sections below — the more concrete the report, the faster we can
+        fix it.
+
+        **Do not paste API keys, NNTP credentials, or session cookies.**
+
+  - type: input
+    id: version
+    attributes:
+      label: hoardarr version
+      description: Output of `./hoardarr version` (or the git SHA if you built from source).
+      placeholder: "v0.1.0 (commit abc1234)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Binary directly on host
+        - Docker image (ghcr.io/jaenster/hoardarr)
+        - Built from source
+        - Other (describe in details)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the bug, including what you expected vs what you observed.
+      placeholder: "When I uploaded an NZB via the SAB API, the job stayed in download_complete forever instead of advancing to verify."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Minimum sequence to trigger the bug. If applicable, include
+        a small NZB / config snippet (with credentials redacted) that
+        reproduces it.
+      placeholder: |
+        1. Start hoardarr with the attached config.toml
+        2. POST `mode=addurl&name=...` to /sabnzbd/api
+        3. Watch /api/v1/queue — job sits in `download_complete`
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        slog text-format lines around the time of the problem.
+        Please redact API keys, passwords, and any private hostnames.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, related issues, environment quirks (Synology / Unraid / etc).
