@@ -30,8 +30,10 @@ func TestE2E_HotwirePoolAfterServerAdd(t *testing.T) {
 	}
 	defer fake.Stop()
 
-	const totalSize = 32 * 1024
-	_, spec := fake.SynthesizeFile("hotwire-seg", "hotwire.bin", totalSize, 1)
+	// Two segments — exercises the worker-pool concurrency that the
+	// Playwright spec was hitting trouble with.
+	const totalSize = 64 * 1024
+	_, spec := fake.SynthesizeFile("hotwire-seg", "hotwire.bin", totalSize, 2)
 	nzb := testnntp.BuildNZB([]testnntp.FileSpec{spec})
 
 	dir := t.TempDir()

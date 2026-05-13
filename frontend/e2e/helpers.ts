@@ -70,6 +70,7 @@ export class HoardarrInstance {
           HOARDARR_LISTEN: this.listen,
           HOARDARR_DATA_DIR: this.dataDir,
           HOARDARR_API_KEY: this.apiKey,
+          HOARDARR_LOG_LEVEL: "debug",
         },
         stdio: ["ignore", "pipe", "pipe"],
       },
@@ -151,6 +152,109 @@ export class HoardarrInstance {
       throw new Error(`seed-nzb status=${res.status}: ${await res.text()}`);
     }
     return Buffer.from(await res.arrayBuffer());
+  }
+
+  // setupAdmin creates the first admin via the public setup endpoint.
+  // Safe to call once per HoardarrInstance; subsequent tests should
+  // use loginViaAPI to authenticate without re-setting-up.
+  async setupAdmin(username: string, password: string): Promise<void> {
+    const res = await fetch(`${this.baseURL}/api/v1/auth/setup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      throw new Error(`setupAdmin failed: ${res.status} ${await res.text()}`);
+    }
+  }
+
+  // loginViaAPI authenticates against /auth/login and writes the
+  // resulting session cookie into the supplied Playwright browser
+  // context. Idempotently creates the admin first if it doesn't
+  // exist yet — that way individual specs are self-sufficient and
+  // can be re-run in isolation.
+  async loginViaAPI(context: import("@playwright/test").BrowserContext, username: string, password: string): Promise<void> {
+    const doLogin = async () =>
+      fetch(`${this.baseURL}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username, password }),
+        redirect: "manual",
+      });
+
+    let res = await doLogin();
+    if (res.status === 401 || res.status === 503) {
+      // Either no user yet (whoami: needs_setup → login disabled) or
+      // the credentials don't match a real account. Try to create
+      // the admin; if that conflicts, propagate.
+      const setup = await fetch(`${this.baseURL}/api/v1/auth/setup`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      // 409 = admin already exists; happens when the password is
+      // simply wrong, which we want to surface.
+      if (!setup.ok && setup.status !== 409) {
+        throw new Error(`loginViaAPI: setup failed ${setup.status}: ${await setup.text()}`);
+      }
+      res = await doLogin();
+    }
+    if (!res.ok) {
+      throw new Error(`loginViaAPI failed: ${res.status}`);
+    }
+    const setCookie = res.headers.get("set-cookie") || "";
+    const match = setCookie.match(/hoardarr_session=([^;]+)/);
+    if (!match) throw new Error("loginViaAPI: no session cookie issued");
+    const url = new URL(this.baseURL);
+    await context.addCookies([
+      {
+        name: "hoardarr_session",
+        value: match[1],
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+  }
+
+  // seedFixture generates a realistic multi-file release (data
+  // files + PAR2) on the fake server and returns the NZB body. Pair
+  // with setTestserverOptions({missing_fraction: 0.1}) to exercise
+  // the verify + repair path.
+  async seedFixture(spec: {
+    name: string;
+    fileCount: number;
+    fileSize: number;
+    articleSize: number;
+    par2SliceSize: number;
+    recoverySlices: number;
+  }): Promise<{ nzb: Buffer; files: string[]; articleCount: number }> {
+    const res = await fetch(`${this.state.testserverHTTP}/seed-fixture`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: spec.name,
+        file_count: spec.fileCount,
+        file_size: spec.fileSize,
+        article_size: spec.articleSize,
+        par2_slice_size: spec.par2SliceSize,
+        recovery_slices: spec.recoverySlices,
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`seed-fixture status=${res.status}: ${await res.text()}`);
+    }
+    const body = (await res.json()) as {
+      nzb_base64: string;
+      files: string[];
+      article_count: number;
+    };
+    return {
+      nzb: Buffer.from(body.nzb_base64, "base64"),
+      files: body.files,
+      articleCount: body.article_count,
+    };
   }
 
   async setTestserverOptions(opts: {
