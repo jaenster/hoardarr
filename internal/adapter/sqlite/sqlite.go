@@ -153,6 +153,18 @@ func buildDSN(path string, opts Options) string {
 		"_pragma=foreign_keys(on)",
 		fmt.Sprintf("_pragma=busy_timeout(%d)", opts.BusyTimeout),
 		fmt.Sprintf("_pragma=cache_size(%d)", opts.CacheSizeKB),
+		// _txlock=immediate makes every BEGIN claim the RESERVED
+		// write-lock upfront. Without this the driver issues BEGIN
+		// DEFERRED, which opens a read snapshot and only upgrades on
+		// the first write — at which point any concurrent committed
+		// writer surfaces SQLITE_BUSY_SNAPSHOT (517). With IMMEDIATE,
+		// writer contention manifests as busy_timeout wait (5s here),
+		// which is the behaviour busy_timeout is actually designed
+		// for. WAL mode keeps readers running against their own
+		// snapshot independently. This is the recommended pattern
+		// for any Go app with multiple writer goroutines hitting one
+		// SQLite DB.
+		"_txlock=immediate",
 	}
 	return "file:" + path + "?" + joinAmpersand(pragmas)
 }
