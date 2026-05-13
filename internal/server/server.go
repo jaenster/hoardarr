@@ -20,10 +20,13 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/jaenster/hoardarr/internal/api/rest"
 	"github.com/jaenster/hoardarr/internal/api/sab"
 	"github.com/jaenster/hoardarr/internal/api/sse"
 	"github.com/jaenster/hoardarr/internal/config"
+	"github.com/jaenster/hoardarr/internal/metrics"
 )
 
 // Server wraps an http.ServeMux with hoardarr-specific routing,
@@ -190,6 +193,16 @@ func (s *Server) routes() {
 	// /healthz — kubernetes-convention alias of /api/v1/health. Used
 	// by the Dockerfile HEALTHCHECK; orchestrators expect this path.
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+	// /metrics — Prometheus scrape endpoint. Behind the same API-key
+	// auth as the rest of the surface; Prometheus is configured with
+	// the key as a bearer token (see docs/observability/prometheus.md).
+	s.mux.Handle("GET /metrics", protect(promhttp.HandlerFor(
+		metrics.Registry,
+		promhttp.HandlerOpts{
+			Registry:          metrics.Registry,
+			EnableOpenMetrics: true,
+		},
+	)))
 
 	// Protected. Mounted per-route so the public health endpoint is not
 	// accidentally guarded.

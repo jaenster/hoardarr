@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/domain/extract"
 	"github.com/jaenster/hoardarr/internal/domain/notify"
 	"github.com/jaenster/hoardarr/internal/loghub"
+	"github.com/jaenster/hoardarr/internal/metrics"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainschedule "github.com/jaenster/hoardarr/internal/domain/schedule"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
@@ -189,6 +191,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	if bo.version == "" {
 		bo.version = defaultBuildVersion
 	}
+	metrics.SetBuildInfo(bo.version, bo.commit, runtime.Version())
 
 	if err := ensureDirs(cfg); err != nil {
 		return nil, err

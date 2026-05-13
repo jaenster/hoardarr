@@ -18,6 +18,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/domain/download"
 	"github.com/jaenster/hoardarr/internal/domain/event"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
+	"github.com/jaenster/hoardarr/internal/metrics"
 )
 
 // Status is the snapshot returned by Service.Status. Field naming is
@@ -332,6 +333,16 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 			QuotaBytes:  srv.QuotaBytes(),
 			UsedBytes:   srv.UsedBytes(),
 		})
+	}
+
+	// Cheap, on-poll metrics update. Status() runs on every
+	// /api/v1/system/status hit AND on the periodic SSE poll, so the
+	// gauges stay reasonably fresh without a dedicated metric ticker.
+	metrics.JobsByState.WithLabelValues("active").Set(float64(activeCount))
+	metrics.JobsByState.WithLabelValues("total").Set(float64(totalCount))
+	for _, p := range pools {
+		metrics.NNTPConnections.WithLabelValues(p.ServerName, "in_use").Set(float64(p.InUse))
+		metrics.NNTPConnections.WithLabelValues(p.ServerName, "idle").Set(float64(p.Idle))
 	}
 
 	return Status{
