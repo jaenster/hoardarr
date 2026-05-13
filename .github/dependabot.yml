@@ -1,0 +1,42 @@
+version: 2
+
+# Weekly dependency PRs for the three ecosystems hoardarr lives in.
+# Grouped where the noise/value ratio benefits from it.
+
+updates:
+  # Go modules.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["deps", "go"]
+    groups:
+      go-minor:
+        update-types:
+          - minor
+          - patch
+
+  # Frontend (Vite / React / TS).
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["deps", "frontend"]
+    groups:
+      npm-minor:
+        update-types:
+          - minor
+          - patch
+
+  # CI / release workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    labels: ["deps", "ci"]

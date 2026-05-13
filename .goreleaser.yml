@@ -1,0 +1,78 @@
+# goreleaser config for tagged releases.
+#
+# Triggered by the .github/workflows/release.yml action on `git push
+# vX.Y.Z`. Produces:
+#   - linux + darwin binaries (amd64 + arm64) with frontend embedded
+#   - sha256 checksums file
+#   - a tarball per (os, arch) attached to the GitHub Release
+#   - the CHANGELOG section for the tag as the release notes
+#
+# The Docker image is built separately by docker.yml — keeping them in
+# different workflows means a release-artifact failure doesn't block
+# the image and vice versa.
+version: 2
+
+project_name: hoardarr
+
+before:
+  hooks:
+    - go mod tidy
+    # Frontend bundle has to exist before `go build -tags embed` runs.
+    - sh -c "cd frontend && npm ci"
+    - sh -c "cd frontend && npm run build"
+
+builds:
+  - id: hoardarr
+    main: ./cmd/hoardarr
+    binary: hoardarr
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -tags=embed
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.buildDate={{ .Date }}
+
+archives:
+  - id: tarballs
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+      - docker-compose.yml
+      - docs/**/*
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  # GitHub Releases shows the CHANGELOG.md section for the tag as the
+  # release notes; goreleaser's auto-generated changelog tends to add
+  # noise on top of it, so disable.
+  disable: true
+
+release:
+  github:
+    owner: jaenster
+    name: hoardarr
+  prerelease: auto
+  draft: false
+  mode: replace
