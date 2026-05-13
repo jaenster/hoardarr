@@ -32,7 +32,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: run goreleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: latest
