@@ -8,8 +8,8 @@ on:
 permissions:
   contents: read
   packages: write
-  # id-token: write is what lets actions/attest-build-provenance mint
-  # a short-lived sigstore certificate via GitHub's OIDC issuer.
+  # id-token: write lets actions/attest-build-provenance mint a
+  # short-lived sigstore certificate via GitHub's OIDC issuer.
   # attestations: write stores the signed attestation as a sibling
   # OCI artifact in the registry the image was pushed to.
   id-token: write
@@ -37,51 +37,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: preflight docker hub
-        # GitHub Actions disallows `secrets` in step-level `if:`
-        # expressions, so we capture the decision (and the username)
-        # into step outputs that subsequent step `if:`s CAN read.
-        id: dh
-        env:
-          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          if [ -n "$DH_USERNAME" ] && [ -n "$DH_TOKEN" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "username=$DH_USERNAME" >> "$GITHUB_OUTPUT"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "username=" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: login dockerhub
-        if: steps.dh.outputs.publish == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: compute image list
-        id: images
-        # GHCR is always published. Docker Hub is appended only when
-        # the preflight said publish=true; otherwise we emit only the
-        # ghcr entry so the metadata action doesn't choke on an empty
-        # line.
-        run: |
-          {
-            echo "list<<EOF"
-            echo "ghcr.io/${{ github.repository_owner }}/hoardarr"
-            if [ "${{ steps.dh.outputs.publish }}" = "true" ]; then
-              echo "docker.io/${{ steps.dh.outputs.username }}/hoardarr"
-            fi
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.images.outputs.list }}
+          images: ghcr.io/${{ github.repository_owner }}/hoardarr
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -118,23 +78,11 @@ jobs:
       # cert through GH's OIDC issuer, signs the image digest, and
       # uploads the attestation as a sibling OCI artifact. Verify with:
       #
-      #   gh attestation verify oci://ghcr.io/jaenster/hoardarr:0.1.1 \
+      #   gh attestation verify oci://ghcr.io/jaenster/hoardarr:0.1.2 \
       #     --repo jaenster/hoardarr
-      #
-      # One run per registry so the attestation lands wherever the image
-      # actually lives. Docker Hub leg is conditional on the same
-      # publish=true flag the login + image list use.
-      - name: attest provenance (ghcr)
+      - name: attest provenance
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/hoardarr
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-
-      - name: attest provenance (dockerhub)
-        if: steps.dh.outputs.publish == 'true'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: docker.io/${{ steps.dh.outputs.username }}/hoardarr
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true

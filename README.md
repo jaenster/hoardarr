@@ -43,16 +43,13 @@ make build            # frontend bundle + go build -tags embed
 ./hoardarr serve      # default: listens on :8085, data dir ./data
 ```
 
-Or with Docker — images are published to both GHCR and Docker Hub:
+Or with Docker — images are published to GHCR for every tag (multi-arch
+`linux/amd64` + `linux/arm64`, signed via GitHub Actions sigstore
+provenance):
 
 ```bash
-# GHCR
 docker run -p 8085:8085 -v /path/to/data:/data \
   ghcr.io/jaenster/hoardarr:latest
-
-# Docker Hub (jaenster/hoardarr, requires DOCKERHUB_USERNAME repo secret)
-docker run -p 8085:8085 -v /path/to/data:/data \
-  jaenster/hoardarr:latest
 ```
 
 Or with [docker-compose](docker-compose.yml):
@@ -79,12 +76,12 @@ No PGP key to manage, no service to trust beyond GitHub + the public
 Rekor transparency log.
 
 ```bash
-# Container (works against GHCR or Docker Hub):
-gh attestation verify oci://ghcr.io/jaenster/hoardarr:0.1.1 \
+# Container:
+gh attestation verify oci://ghcr.io/jaenster/hoardarr:0.1.2 \
   --repo jaenster/hoardarr
 
 # Source tarball:
-gh attestation verify hoardarr_0.1.1_linux_amd64.tar.gz \
+gh attestation verify hoardarr_0.1.2_linux_amd64.tar.gz \
   --repo jaenster/hoardarr
 ```
 
