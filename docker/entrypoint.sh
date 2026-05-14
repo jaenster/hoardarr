@@ -49,6 +49,12 @@ if [ -d "$HOARDARR_DATA_DIR" ]; then
     chown -R "$PUID:$PGID" "$HOARDARR_DATA_DIR" 2>/dev/null || true
 fi
 
+# cd into the data dir so hoardarr's default `./config.toml` lookup
+# lands inside the bind-mounted volume rather than at /. Without this
+# the binary errors with `permission denied` on first run because the
+# unprivileged PUID/PGID user can't write to the container root.
+cd "$HOARDARR_DATA_DIR"
+
 # su-exec is suid-less — uses setresuid/setresgid directly, no fork
 # overhead, no signal-forwarding wrapper. PID 1 is the hoardarr
 # binary, which is what we want for graceful SIGTERM handling.

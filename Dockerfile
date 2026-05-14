@@ -55,7 +55,11 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # /data is the canonical mount point — config.toml, the SQLite DB,
-# sessions, incomplete/, and complete/ all live here.
+# sessions, incomplete/, and complete/ all live here. WORKDIR matches
+# the entrypoint's `cd $HOARDARR_DATA_DIR` so a `docker run` without
+# the shim (e.g. `docker run ... hoardarr version` for ad-hoc probes)
+# still picks up the right cwd.
+WORKDIR /data
 ENV HOARDARR_LISTEN=:8085
 ENV HOARDARR_DATA_DIR=/data
 VOLUME ["/data"]
