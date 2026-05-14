@@ -71,6 +71,27 @@ Authentication`.
 For reverse-proxy / TLS-terminating deployments (nginx, Caddy, Traefik),
 see [`docs/reverse-proxy.md`](docs/reverse-proxy.md).
 
+### Verifying the release
+
+Every container image and source tarball is signed with sigstore-
+keyless via GitHub Actions provenance attestations (SLSA build level 3).
+No PGP key to manage, no service to trust beyond GitHub + the public
+Rekor transparency log.
+
+```bash
+# Container (works against GHCR or Docker Hub):
+gh attestation verify oci://ghcr.io/jaenster/hoardarr:0.1.1 \
+  --repo jaenster/hoardarr
+
+# Source tarball:
+gh attestation verify hoardarr_0.1.1_linux_amd64.tar.gz \
+  --repo jaenster/hoardarr
+```
+
+A pass means the artifact was built by hoardarr's own GitHub Actions
+workflow from the matching git tag. A fail means it was altered or
+came from somewhere else.
+
 ## Configuration
 
 Bootstrap-time config lives in `config.toml` (or `HOARDARR_*` env vars)

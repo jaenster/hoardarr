@@ -6,6 +6,12 @@ on:
 
 permissions:
   contents: write
+  # id-token: write — OIDC for sigstore-keyless signing.
+  # attestations: write — stores the signed attestation in the repo
+  # (per-binary, downloadable via `gh attestation download` or
+  # verifiable via `gh attestation verify <file> --repo …`).
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -39,3 +45,15 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # SLSA build provenance over every release tarball + the
+      # checksums file goreleaser produced. Verify with:
+      #
+      #   gh attestation verify hoardarr_0.1.2_linux_amd64.tar.gz \
+      #     --repo jaenster/hoardarr
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/hoardarr_*.tar.gz
+            dist/checksums.txt

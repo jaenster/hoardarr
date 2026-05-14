@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
   packages: write
+  # id-token: write is what lets actions/attest-build-provenance mint
+  # a short-lived sigstore certificate via GitHub's OIDC issuer.
+  # attestations: write stores the signed attestation as a sibling
+  # OCI artifact in the registry the image was pushed to.
+  id-token: write
+  attestations: write
 
 jobs:
   publish:
@@ -92,6 +98,7 @@ jobs:
           echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: build + push
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -106,3 +113,28 @@ jobs:
             BUILD_DATE=${{ steps.build_meta.outputs.build_date }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # SLSA build provenance via sigstore-keyless. Mints a short-lived
+      # cert through GH's OIDC issuer, signs the image digest, and
+      # uploads the attestation as a sibling OCI artifact. Verify with:
+      #
+      #   gh attestation verify oci://ghcr.io/jaenster/hoardarr:0.1.1 \
+      #     --repo jaenster/hoardarr
+      #
+      # One run per registry so the attestation lands wherever the image
+      # actually lives. Docker Hub leg is conditional on the same
+      # publish=true flag the login + image list use.
+      - name: attest provenance (ghcr)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/hoardarr
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: attest provenance (dockerhub)
+        if: steps.dh.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: docker.io/${{ steps.dh.outputs.username }}/hoardarr
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
