@@ -53,7 +53,9 @@ services:
 Open `http://localhost:8085`, create the admin account, add a Usenet
 server in `Settings → Servers`, then point Sonarr / Radarr at
 `http://hoardarr:8085/sabnzbd` with the API key from
-`Settings → Authentication`.
+`Settings → Authentication`. See
+[Coming from SABnzbd](#coming-from-sabnzbd) at the bottom for the
+*arr-side download-client config (with screenshots).
 
 ### docker run
 
@@ -161,6 +163,25 @@ docker compose start hoardarr
 Finished releases in `complete/` are unaffected if you only restore
 the `data/` subtree — in-progress jobs in `incomplete/` start over on
 next boot.
+
+## Coming from SABnzbd
+
+In Sonarr / Radarr / Lidarr / Readarr / Prowlarr,
+`Settings → Download Clients` → `+` → **SABnzbd**. Toggle
+**`Show Advanced`** in the top toolbar *before* filling the form —
+the one field most people miss is `URL Base`, and it only renders
+after that toggle:
+
+![Sonarr SABnzbd form with Show Advanced expanded; URL Base = /sabnzbd](docs/img/sonarr-sab-form-advanced.png)
+
+For a default install, set `URL Base = /sabnzbd`. If you put hoardarr
+behind a reverse proxy at `/hoardarr`, it's `/hoardarr/sabnzbd`. An
+empty URL Base makes the `Test` button fail with a misleading
+"Sabnzbd authentication failed" — that's almost always this.
+
+Full walk-through (per-app categories, common test-failure diagnostics,
+running side-by-side with SABnzbd, etc.):
+[**`docs/coming-from-sabnzbd.md`**](docs/coming-from-sabnzbd.md).
 
 ## Status
 
