@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -209,11 +210,35 @@ func (s *Service) runVerify(ctx context.Context, jobID download.JobID) error {
 	// Build the par2/data path partitioning from the Job aggregate.
 	// IsPar2 was set during NZB parsing based on filename suffix
 	// (.par2 / .vol* / .par).
+	//
+	// Recovery-vol filtering: when the job has fetch_recovery_vols=false
+	// (SAB-style "smart par2" defer mode), the recovery-volume .par2
+	// files were deliberately not downloaded and their .tmp files
+	// don't exist. The index .par2 alone is sufficient for verify —
+	// it carries the MD5s for every data file. Including a missing
+	// recovery-vol path in par2Paths makes the parser open(2) fail
+	// and the whole verify error out. Skip them.
+	//
+	// Defence in depth: os.Stat the file path before adding too, so
+	// a recovery vol that was *enabled* but whose download genuinely
+	// failed (every segment 430'd from every server) doesn't crash
+	// verify either. Verify is supposed to be best-effort against
+	// whatever bytes actually arrived; the missing files surface as
+	// verify failures, not parse failures.
 	var par2Paths []string
 	dataPaths := make(map[string]string)
 	for _, f := range job.Files() {
 		p := filepath.Join(jobDir, strconv.FormatInt(int64(f.ID()), 10)+".tmp")
 		if f.IsPar2() {
+			if f.IsRecoveryVol() && !job.FetchRecoveryVols() {
+				continue
+			}
+			if _, err := os.Stat(p); err != nil {
+				s.logger.Warn("verify: par2 file missing, skipping",
+					"job_id", jobID, "file_id", int64(f.ID()),
+					"path", p, "recovery_vol", f.IsRecoveryVol())
+				continue
+			}
 			par2Paths = append(par2Paths, p)
 		} else {
 			dataPaths[f.Filename()] = p

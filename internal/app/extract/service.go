@@ -324,6 +324,14 @@ func stageArchiveFilenames(job *download.Job, incompleteDir string) ([]string, e
 			out = append(out, dst)
 			continue
 		}
+		// If the source .tmp never materialised — every segment 430'd,
+		// or the file is otherwise absent — skip it. The extract step
+		// downstream can still try to assemble what's on disk. Failing
+		// hard here would abort extraction on releases that are 95%
+		// downloaded and missing one .r-part the user could repair.
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
 		if err := os.Rename(src, dst); err != nil {
 			return nil, fmt.Errorf("stage %s → %s: %w", src, dst, err)
 		}

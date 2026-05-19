@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -168,12 +169,28 @@ func (s *Service) runRepair(ctx context.Context, jobID download.JobID) error {
 
 	// Resolve paths from the Job aggregate. PAR2 files vs data files
 	// are distinguished by File.IsPar2.
+	//
+	// Filter recovery vols that weren't fetched (defer mode) and any
+	// par2 path whose .tmp didn't materialise — see the mirror logic
+	// + comment in app/verify/service.go. Without this filter, par2
+	// repair crashes mid-run with `open ... no such file or directory`
+	// the moment it touches a deferred recovery vol; that was the
+	// production error that surfaced this whole class of bug.
 	jobDir := filepath.Join(s.incompleteDir, strconv.FormatInt(int64(jobID), 10))
 	var par2Paths []string
 	dataPaths := make(map[string]string)
 	for _, f := range job.Files() {
 		p := filepath.Join(jobDir, strconv.FormatInt(int64(f.ID()), 10)+".tmp")
 		if f.IsPar2() {
+			if f.IsRecoveryVol() && !job.FetchRecoveryVols() {
+				continue
+			}
+			if _, err := os.Stat(p); err != nil {
+				s.logger.Warn("repair: par2 file missing, skipping",
+					"job_id", jobID, "file_id", int64(f.ID()),
+					"path", p, "recovery_vol", f.IsRecoveryVol())
+				continue
+			}
 			par2Paths = append(par2Paths, p)
 		} else {
 			dataPaths[f.Filename()] = p

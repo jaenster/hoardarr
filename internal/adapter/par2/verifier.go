@@ -8,9 +8,39 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/jaenster/hoardarr/internal/domain/verify"
 )
+
+// quickCheckIgnoreExts mirrors SABnzbd's quick-check-ignore list
+// (newsunpack.py around line 1588). When a PAR2 FileDesc names one of
+// these sidecar formats and the file isn't on disk, we skip it
+// silently — they're optional metadata that NZB posters often drop,
+// and a missing .nfo or .sfv should not block a release with an
+// intact main file.
+//
+// A file that IS on disk but mismatches MD5 still fails normally;
+// this only suppresses the "missing entirely" case.
+var quickCheckIgnoreExts = map[string]struct{}{
+	".nfo":    {},
+	".sfv":    {},
+	".srr":    {},
+	".srt":    {},
+	".idx":    {},
+	".sub":    {},
+	".jpg":    {},
+	".jpeg":   {},
+	".png":    {},
+	".txt":    {},
+	".readme": {},
+}
+
+func isQuickCheckIgnorable(name string) bool {
+	_, ok := quickCheckIgnoreExts[strings.ToLower(filepath.Ext(name))]
+	return ok
+}
 
 // Verifier implements verify.Verifier using PAR2 file metadata.
 //
@@ -53,6 +83,14 @@ func (Verifier) Verify(_ context.Context, par2Paths []string, dataPaths map[stri
 			}
 		}
 		if !ok {
+			// SAB-style quick-check ignore: optional sidecars (.nfo,
+			// .sfv, subtitles, art) often go missing on release-posting
+			// drops and shouldn't fail verify for the rest of the set.
+			// Drop the FileResult entirely so it doesn't even count
+			// against the "any not-OK = RepairNeeded" downstream rule.
+			if isQuickCheckIgnorable(pf.Name) {
+				continue
+			}
 			fr.Reason = "not in NZB"
 			out.Files = append(out.Files, fr)
 			continue
