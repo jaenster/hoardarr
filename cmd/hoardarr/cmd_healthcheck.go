@@ -28,7 +28,11 @@ func cmdHealthcheck(_ []string) error {
 	if i := strings.LastIndex(listen, ":"); i >= 0 {
 		port = listen[i:]
 	}
-	url := "http://127.0.0.1" + port + "/healthz"
+	// Honour HOARDARR_URL_BASE so a reverse-proxy install (where the
+	// server serves at /hoardarr/healthz rather than /healthz) still
+	// gets a healthy probe inside the container.
+	base := strings.TrimSuffix(os.Getenv("HOARDARR_URL_BASE"), "/")
+	url := "http://127.0.0.1" + port + base + "/healthz"
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

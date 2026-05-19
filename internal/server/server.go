@@ -104,6 +104,15 @@ func (s *Server) serveInner(w http.ResponseWriter, r *http.Request) {
 		s.mux.ServeHTTP(w, r)
 		return
 	}
+	// Infrastructure endpoints serve at the unprefixed path regardless
+	// of URL_BASE — they're consumed by the container runtime
+	// (Dockerfile HEALTHCHECK, kubelet, Prometheus) which doesn't
+	// know about hoardarr's reverse-proxy mount and can't reasonably
+	// be expected to track a live-mutable URL base.
+	if r.URL.Path == "/healthz" {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
 	if r.URL.Path == "/" || r.URL.Path == base {
 		http.Redirect(w, r, base+"/", http.StatusMovedPermanently)
 		return
