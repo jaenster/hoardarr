@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Pause, Play, RefreshCw } from "lucide-react";
+import { Database, Pause, Play, PlayCircle, RefreshCw, Send } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
 import StatusBadge from "../components/StatusBadge";
+import { useToasts } from "../components/Toasts";
 import { api, logStreamURL } from "../api/client";
-import type { LogEntry, SystemStatus, Throughput } from "../api/types";
+import type { BackupFile, Command, DiskEntry, LogEntry, LogFile, ScheduledTask, SystemStatus, Throughput } from "../api/types";
 
 export default function System() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
@@ -69,7 +70,27 @@ export default function System() {
             <dt>Version</dt>
             <dd>
               <code className="inline-code">{status.version}</code>
+              {status.commit && <span className="muted" style={{ marginLeft: "0.5rem" }}>commit {status.commit.slice(0, 8)}</span>}
+              {status.build_date && <span className="muted" style={{ marginLeft: "0.5rem" }}>built {status.build_date}</span>}
             </dd>
+            {status.runtime_version && (
+              <>
+                <dt>Runtime</dt>
+                <dd className="muted">
+                  {status.runtime_version}
+                  {status.os && status.arch && <> • {status.os}/{status.arch}</>}
+                  {status.is_docker && <> • docker</>}
+                </dd>
+              </>
+            )}
+            {(status.database_type || status.migration_version !== undefined) && (
+              <>
+                <dt>Database</dt>
+                <dd className="muted">
+                  {status.database_type ?? "sqlite"} • schema v{status.migration_version ?? "?"}
+                </dd>
+              </>
+            )}
             <dt>Started</dt>
             <dd className="muted">{formatTime(status.started_at)}</dd>
             <dt>Uptime</dt>
@@ -157,9 +178,356 @@ export default function System() {
         )}
       </Panel>
 
+      <DiskSpacePanel />
+
+      <TasksPanel />
+
+      <CommandsPanel />
+
       <LogsPanel />
+
+      <BackupsPanel />
+
+      <LogFilesPanel />
     </Page>
   );
+}
+
+function BackupsPanel() {
+  const [backups, setBackups] = useState<BackupFile[]>([]);
+  const [busy, setBusy] = useState(false);
+  const toast = useToasts();
+
+  const reload = async () => {
+    try {
+      const r = await api.listBackups();
+      setBackups(r.backups ?? []);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+    const t = setInterval(() => void reload(), 60_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const runNow = async () => {
+    setBusy(true);
+    try {
+      const r = await api.runBackup();
+      setBackups(r.backups ?? []);
+      toast.success("Backup completed");
+    } catch (e) {
+      toast.error("Backup failed", { message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Panel
+      title="Backups"
+      meta={backups.length > 0 && <StatusBadge tone="neutral">{backups.length} files</StatusBadge>}
+      actions={
+        <Button
+          variant="secondary"
+          icon={<Database size={14} />}
+          onClick={() => void runNow()}
+          disabled={busy}
+        >
+          Back up now
+        </Button>
+      }
+    >
+      {backups.length === 0 ? (
+        <p className="muted">No backups yet. Weekly auto-backup runs in the scheduler; click "Back up now" to take one immediately.</p>
+      ) : (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Size</th>
+              <th>Created</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {backups.map((b) => (
+              <tr key={b.name}>
+                <td><code className="inline-code">{b.name}</code></td>
+                <td className="muted">{formatBytes(b.size_bytes)}</td>
+                <td className="muted">{new Date(b.created_at).toLocaleString()}</td>
+                <td>
+                  <a
+                    className="link"
+                    href={api.backupURL(b.name)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    download={b.name}
+                  >
+                    Download
+                  </a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Panel>
+  );
+}
+
+function CommandsPanel() {
+  const [commands, setCommands] = useState<Command[]>([]);
+  const [names, setNames] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string>("");
+  const [submitting, setSubmitting] = useState(false);
+  const toast = useToasts();
+
+  const reload = async () => {
+    try {
+      const resp = await api.listCommands(20);
+      setCommands(resp.commands ?? []);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+    void api.commandNames().then((r) => {
+      setNames(r.names ?? []);
+      if (r.names && r.names.length > 0) setSelected(r.names[0]);
+    });
+    const t = setInterval(() => void reload(), 3000);
+    return () => clearInterval(t);
+  }, []);
+
+  const submit = async () => {
+    if (!selected) return;
+    setSubmitting(true);
+    try {
+      await api.submitCommand(selected);
+      toast.success(`Queued command: ${selected}`);
+      await reload();
+    } catch (e) {
+      toast.error("Could not queue command", { message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Panel
+      title="Commands"
+      meta={commands.length > 0 && <StatusBadge tone="neutral">{commands.length} recent</StatusBadge>}
+    >
+      <div className="commands-trigger">
+        <select
+          className="select"
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+        >
+          {names.map((n) => (
+            <option key={n} value={n}>{n}</option>
+          ))}
+        </select>
+        <Button
+          variant="primary"
+          icon={<Send size={14} />}
+          onClick={() => void submit()}
+          disabled={submitting || !selected}
+        >
+          Run
+        </Button>
+      </div>
+      {commands.length === 0 ? (
+        <p className="muted">No commands run yet.</p>
+      ) : (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Trigger</th>
+              <th>Status</th>
+              <th>Duration</th>
+              <th>Queued</th>
+            </tr>
+          </thead>
+          <tbody>
+            {commands.map((c) => (
+              <tr key={c.id}>
+                <td>
+                  {c.name}
+                  {c.error && (
+                    <div className="text-err" title={c.error}>{c.error}</div>
+                  )}
+                </td>
+                <td className="muted">{c.trigger}</td>
+                <td>{commandTone(c)}</td>
+                <td className="muted">{c.duration_ms ? `${c.duration_ms} ms` : "—"}</td>
+                <td className="muted">{new Date(c.queued_at).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Panel>
+  );
+}
+
+function commandTone(c: Command) {
+  if (c.status === "queued") return <StatusBadge tone="neutral">queued</StatusBadge>;
+  if (c.status === "running") return <StatusBadge tone="info" dot>running</StatusBadge>;
+  if (c.result === "failed") return <StatusBadge tone="err" dot>failed</StatusBadge>;
+  return <StatusBadge tone="ok" dot>success</StatusBadge>;
+}
+
+function LogFilesPanel() {
+  const [files, setFiles] = useState<LogFile[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const reload = async () => {
+      try {
+        const resp = await api.logFiles();
+        if (!cancelled) {
+          setFiles(resp.files ?? []);
+          setErr(null);
+        }
+      } catch (e) {
+        if (!cancelled) setErr(e instanceof Error ? e.message : String(e));
+      }
+    };
+    void reload();
+    const t = setInterval(() => void reload(), 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  return (
+    <Panel
+      title="Log files"
+      meta={files.length > 0 && <StatusBadge tone="neutral">{files.length} files</StatusBadge>}
+    >
+      {err && <p className="text-err">{err}</p>}
+      {!err && files.length === 0 && <p className="muted">No log files yet.</p>}
+      {files.length > 0 && (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>File</th>
+              <th>Size</th>
+              <th>Updated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {files.map((f) => (
+              <tr key={f.name}>
+                <td>
+                  <code className="inline-code">{f.name}</code>
+                  {f.active && (
+                    <StatusBadge tone="ok" dot>
+                      live
+                    </StatusBadge>
+                  )}
+                </td>
+                <td className="muted">{formatBytes(f.size_bytes)}</td>
+                <td className="muted">{new Date(f.updated_at).toLocaleString()}</td>
+                <td>
+                  <a
+                    className="link"
+                    href={api.logFileURL(f.name)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    download={f.name}
+                  >
+                    Download
+                  </a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Panel>
+  );
+}
+
+function DiskSpacePanel() {
+  const [entries, setEntries] = useState<DiskEntry[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const resp = await api.diskspace();
+        if (!cancelled) setEntries(resp.entries ?? []);
+      } catch {
+        /* ignore */
+      }
+    };
+    void tick();
+    const t = setInterval(() => void tick(), 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  return (
+    <Panel title="Disk space">
+      {entries.length === 0 ? (
+        <p className="muted">Loading…</p>
+      ) : (
+        <ul className="disk-list">
+          {entries.map((e) => (
+            <li key={e.path} className="disk-row">
+              <div className="disk-head">
+                <span className="disk-label">{e.label}</span>
+                <code className="muted disk-path">{e.path}</code>
+              </div>
+              {!e.reachable ? (
+                <p className="text-err">{e.error || "unreachable"}</p>
+              ) : (
+                <>
+                  <div
+                    className={
+                      "disk-bar " +
+                      (e.free_bytes < 1 << 30
+                        ? "disk-bar-crit"
+                        : e.free_bytes < 5 * (1 << 30)
+                          ? "disk-bar-warn"
+                          : "")
+                    }
+                  >
+                    <div
+                      className="disk-bar-fill"
+                      style={{ width: `${pct(e.used_bytes, e.total_bytes)}%` }}
+                    />
+                  </div>
+                  <div className="disk-meta muted">
+                    {formatBytes(e.free_bytes)} free of {formatBytes(e.total_bytes)}
+                  </div>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+function pct(used: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.min(100, Math.max(0, Math.round((used / total) * 100)));
 }
 
 function Sparkline({ data, height = 22, width = 140 }: { data: number[]; height?: number; width?: number }) {
@@ -319,4 +687,102 @@ function formatUptime(ms: number): string {
   if (hours > 0) return `${hours}h ${mins}m`;
   if (mins > 0) return `${mins}m ${secs}s`;
   return `${secs}s`;
+}
+
+// TasksPanel lists every recurring + oneshot scheduled task with
+// last/next-run timestamps. The Run-Now button pulls next_run_at to
+// now so the scheduler's normal dispatch picks the task up on its
+// next tick — keeps the claim model intact and avoids blocking the
+// HTTP request on long-running tasks.
+function TasksPanel() {
+  const [tasks, setTasks] = useState<ScheduledTask[]>([]);
+  const [busy, setBusy] = useState<Set<number>>(() => new Set());
+  const toast = useToasts();
+
+  const reload = async () => {
+    try {
+      const resp = await api.systemTasks();
+      setTasks(resp.tasks ?? []);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+    const t = setInterval(() => void reload(), 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  const runNow = async (id: number) => {
+    setBusy((s) => new Set(s).add(id));
+    try {
+      const resp = await api.runTaskNow(id);
+      setTasks((cur) => cur.map((t) => (t.id === id ? resp.task : t)));
+      toast.success(`Task scheduled to run`);
+    } catch (e) {
+      toast.error("Could not run task", { message: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy((s) => {
+        const n = new Set(s);
+        n.delete(id);
+        return n;
+      });
+    }
+  };
+
+  return (
+    <Panel title="Scheduled tasks" meta={<StatusBadge tone="neutral">{tasks.length} tasks</StatusBadge>}>
+      {tasks.length === 0 ? (
+        <p className="muted">No scheduled tasks registered.</p>
+      ) : (
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Cadence</th>
+              <th>Last run</th>
+              <th>Next run</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map((t) => (
+              <tr key={t.id}>
+                <td>{t.name}</td>
+                <td className="muted">
+                  {t.kind === "oneshot" ? "one-shot" : formatUptime(t.cadence_seconds * 1000)}
+                </td>
+                <td className="muted">{t.last_run_at ? new Date(t.last_run_at).toLocaleString() : "never"}</td>
+                <td className="muted">{new Date(t.next_run_at).toLocaleString()}</td>
+                <td>
+                  {t.status === "running" ? (
+                    <StatusBadge tone="info" dot>running</StatusBadge>
+                  ) : t.last_error ? (
+                    <StatusBadge tone="err" dot>{`failed (${t.consecutive_failures}×)`}</StatusBadge>
+                  ) : !t.enabled ? (
+                    <StatusBadge tone="neutral">disabled</StatusBadge>
+                  ) : (
+                    <StatusBadge tone="ok" dot>idle</StatusBadge>
+                  )}
+                </td>
+                <td>
+                  <Button
+                    variant="ghost"
+                    icon={<PlayCircle size={14} />}
+                    onClick={() => void runNow(t.id)}
+                    disabled={busy.has(t.id) || t.status === "running"}
+                    title="Pull next run forward to now"
+                  >
+                    Run now
+                  </Button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Panel>
+  );
 }

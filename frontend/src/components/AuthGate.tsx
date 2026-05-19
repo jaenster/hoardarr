@@ -1,18 +1,23 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { KeyRound, UserPlus } from "lucide-react";
 import { api, ApiError, type WhoamiState } from "../api/client";
 import Button from "./Button";
 
+// LazyApp is the entire authenticated UI — router, pages, charts,
+// SSE client, the lot. Vite splits it into its own chunk so a
+// logged-out visitor never downloads it.
+const LazyApp = lazy(() => import("../App"));
+
 // AuthGate is the front door. It probes /api/v1/auth/whoami once on
 // mount, then renders one of:
 //
-//   - children                       (state: authenticated)
+//   - <LazyApp/>                     (state: authenticated)
 //   - <SetupAdminForm/>              (state: needs_setup, first run)
 //   - <LoginForm/>                   (state: needs_login)
 //
-// Submitting either form re-probes whoami so the children render
-// without a refresh.
-export default function AuthGate({ children }: { children: ReactNode }) {
+// Submitting either form re-probes whoami so the app mounts without
+// a page refresh.
+export default function AuthGate() {
   const [state, setState] = useState<WhoamiState | "checking" | "error">("checking");
   const [error, setError] = useState<string | null>(null);
 
@@ -47,7 +52,11 @@ export default function AuthGate({ children }: { children: ReactNode }) {
     );
   }
   if (state.state === "authenticated") {
-    return <>{children}</>;
+    return (
+      <Suspense fallback={<div className="auth-gate"><p className="muted">Loading…</p></div>}>
+        <LazyApp />
+      </Suspense>
+    );
   }
   if (state.state === "needs_setup") {
     return <SetupAdminForm onDone={refresh} />;

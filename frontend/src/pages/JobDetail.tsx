@@ -127,29 +127,154 @@ export default function JobDetail() {
         {events.length === 0 && !loading ? (
           <p className="muted">No events recorded for this job yet.</p>
         ) : (
-          <ol className="timeline">
-            {events.map((e) => (
-              <li key={e.ID} className="timeline-item">
-                <span className={`timeline-marker ${toneFor(e.Topic)}`}>
-                  {iconFor(e.Topic)}
-                </span>
-                <div className="timeline-body">
-                  <div className="timeline-head">
-                    <code className="inline-code">{e.Topic}</code>
-                    <span className="muted timeline-time">
-                      {new Date(e.OccurredAt).toLocaleString()}
-                    </span>
-                  </div>
-                  <pre className="timeline-payload">
-                    {prettyPayload(e.Payload)}
-                  </pre>
-                </div>
-              </li>
-            ))}
-          </ol>
+          <TimelineGroups events={events} />
         )}
       </Panel>
     </Page>
+  );
+}
+
+// TimelineGroups renders the event list as collapsed groups of
+// adjacent same-topic events. For a job with thousands of
+// `download.segment.completed` events, we collapse them into a single
+// "1234× download.segment.completed" row that expands on click —
+// turning a 1000-line DOM into a 10-line one. Click an individual
+// event inside the group to reveal its JSON payload.
+function TimelineGroups({ events }: { events: EventEnvelope[] }) {
+  const groups = useMemo(() => groupEvents(events), [events]);
+  return (
+    <ol className="timeline">
+      {groups.map((g) => (
+        <TimelineGroup key={g.firstID} group={g} />
+      ))}
+    </ol>
+  );
+}
+
+type EventGroup = {
+  firstID: string;
+  topic: string;
+  events: EventEnvelope[];
+  firstAt: string;
+  lastAt: string;
+};
+
+function groupEvents(events: EventEnvelope[]): EventGroup[] {
+  const out: EventGroup[] = [];
+  for (const e of events) {
+    const tail = out[out.length - 1];
+    if (tail && tail.topic === e.Topic) {
+      tail.events.push(e);
+      tail.lastAt = e.OccurredAt;
+      continue;
+    }
+    out.push({
+      firstID: e.ID,
+      topic: e.Topic,
+      events: [e],
+      firstAt: e.OccurredAt,
+      lastAt: e.OccurredAt,
+    });
+  }
+  return out;
+}
+
+function TimelineGroup({ group }: { group: EventGroup }) {
+  const [open, setOpen] = useState(false);
+  const single = group.events.length === 1;
+  // Single-event groups behave like leaf items — clicking expands the
+  // payload directly. Multi-event groups expand to show the per-event
+  // list (and each event in there is its own click-to-expand).
+  if (single) {
+    return (
+      <li className="timeline-item">
+        <span className={`timeline-marker ${toneFor(group.topic)}`}>
+          {iconFor(group.topic)}
+        </span>
+        <div className="timeline-body">
+          <button
+            className="timeline-head timeline-head-btn"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+          >
+            <ChevronRight
+              size={12}
+              className={"timeline-chev " + (open ? "is-open" : "")}
+              aria-hidden="true"
+            />
+            <code className="inline-code">{group.topic}</code>
+            <span className="muted timeline-time">
+              {new Date(group.firstAt).toLocaleString()}
+            </span>
+          </button>
+          {open && (
+            <pre className="timeline-payload">
+              {prettyPayload(group.events[0].Payload)}
+            </pre>
+          )}
+        </div>
+      </li>
+    );
+  }
+  return (
+    <li className="timeline-item">
+      <span className={`timeline-marker ${toneFor(group.topic)}`}>
+        {iconFor(group.topic)}
+      </span>
+      <div className="timeline-body">
+        <button
+          className="timeline-head timeline-head-btn"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+        >
+          <ChevronRight
+            size={12}
+            className={"timeline-chev " + (open ? "is-open" : "")}
+            aria-hidden="true"
+          />
+          <code className="inline-code">{group.topic}</code>
+          <span className="timeline-count">{group.events.length}×</span>
+          <span className="muted timeline-time">
+            {new Date(group.firstAt).toLocaleString()}
+            {group.firstAt !== group.lastAt && (
+              <> → {new Date(group.lastAt).toLocaleString()}</>
+            )}
+          </span>
+        </button>
+        {open && (
+          <ol className="timeline-sub">
+            {group.events.map((e) => (
+              <TimelineSubItem key={e.ID} event={e} />
+            ))}
+          </ol>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function TimelineSubItem({ event }: { event: EventEnvelope }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <li className="timeline-sub-item">
+      <button
+        className="timeline-sub-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <ChevronRight
+          size={11}
+          className={"timeline-chev " + (open ? "is-open" : "")}
+          aria-hidden="true"
+        />
+        <span className="muted timeline-time">
+          {new Date(event.OccurredAt).toLocaleString()}
+        </span>
+      </button>
+      {open && (
+        <pre className="timeline-payload">{prettyPayload(event.Payload)}</pre>
+      )}
+    </li>
   );
 }
 

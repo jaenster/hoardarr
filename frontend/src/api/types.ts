@@ -113,6 +113,14 @@ export type User = {
 export type SystemStatus = {
   service: string;
   version: string;
+  commit?: string;
+  build_date?: string;
+  runtime_version?: string;
+  os?: string;
+  arch?: string;
+  is_docker?: boolean;
+  database_type?: string;
+  migration_version?: number;
   started_at: string;
   uptime_ms: number;
   queue: {
@@ -193,4 +201,68 @@ export type Subscription = {
   last_error?: string;
   created_at: string;
   updated_at: string;
+};
+
+export type HealthSeverity = "warning" | "error";
+
+export type HealthIssue = {
+  source: string;
+  severity: HealthSeverity;
+  message: string;
+  docs_url?: string;
+};
+
+export type CommandStatus = "queued" | "running" | "completed";
+export type CommandResult = "" | "successful" | "failed";
+export type CommandTrigger = "manual" | "api" | "scheduled";
+
+export type Command = {
+  id: number;
+  name: string;
+  trigger: CommandTrigger;
+  status: CommandStatus;
+  result?: CommandResult;
+  error?: string;
+  queued_at: string;
+  started_at?: string;
+  ended_at?: string;
+  duration_ms?: number;
+  body?: unknown;
+};
+
+export type BackupFile = {
+  name: string;
+  size_bytes: number;
+  created_at: string;
+};
+
+export type LogFile = {
+  name: string;
+  size_bytes: number;
+  updated_at: string;
+  active: boolean;
+};
+
+export type DiskEntry = {
+  label: string;
+  path: string;
+  free_bytes: number;
+  total_bytes: number;
+  used_bytes: number;
+  reachable: boolean;
+  error?: string;
+};
+
+export type ScheduledTask = {
+  id: number;
+  name: string;
+  kind: "recurring" | "oneshot";
+  cadence_seconds: number;
+  next_run_at: string;
+  last_run_at?: string;
+  last_error?: string;
+  consecutive_failures: number;
+  enabled: boolean;
+  status: "idle" | "running";
+  claimed_at?: string;
 };

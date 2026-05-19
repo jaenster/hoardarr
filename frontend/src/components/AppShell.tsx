@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
-import AuthGate from "./AuthGate";
+import HealthBanner from "./HealthBanner";
 import Sidebar from "./Sidebar";
+import { ToastProvider } from "./Toasts";
 import TopBar from "./TopBar";
 
 type AppShellProps = {
@@ -9,14 +10,17 @@ type AppShellProps = {
 
 export default function AppShell({ children }: AppShellProps) {
   return (
-    <AuthGate>
+    <ToastProvider>
       <div className="app-shell">
         <TopBar />
         <div className="app-body">
           <Sidebar />
-          <main className="content">{children}</main>
+          <main className="content">
+            <HealthBanner />
+            {children}
+          </main>
         </div>
       </div>
-    </AuthGate>
+    </ToastProvider>
   );
 }

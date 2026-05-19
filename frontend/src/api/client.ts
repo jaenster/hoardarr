@@ -12,13 +12,19 @@
 // SPA works whether mounted at "/" or "/hoardarr".
 
 import type {
+  BackupFile,
   BandwidthConfig,
   Category,
+  Command,
+  DiskEntry,
   EventEnvelope,
   General,
+  HealthIssue,
   Job,
   LogEntry,
+  LogFile,
   Paths,
+  ScheduledTask,
   Server,
   Subscription,
   SystemStatus,
@@ -129,7 +135,12 @@ export const api = {
   getJob(id: number): Promise<{ job: Job }> {
     return req("GET", `/api/v1/queue/${id}`);
   },
-  uploadNZB(file: File, category?: string): Promise<{ job_id: number; duplicate?: boolean }> {
+  uploadNZB(file: File, category?: string): Promise<{
+    job_id: number;
+    duplicate?: boolean;
+    state?: string;
+    name?: string;
+  }> {
     const fd = new FormData();
     fd.append("nzb", file);
     if (category) fd.append("category", category);
@@ -227,6 +238,60 @@ export const api = {
   },
   logSnapshot(): Promise<{ entries: LogEntry[] }> {
     return req("GET", "/api/v1/system/logs");
+  },
+
+  // --- health ----------------------------------------------------
+  systemHealth(): Promise<{ issues: HealthIssue[]; last_run: string }> {
+    return req("GET", "/api/v1/system/health");
+  },
+  refreshSystemHealth(): Promise<{ issues: HealthIssue[]; last_run: string }> {
+    return req("POST", "/api/v1/system/health/refresh");
+  },
+
+  // --- scheduled tasks -------------------------------------------
+  systemTasks(): Promise<{ tasks: ScheduledTask[] }> {
+    return req("GET", "/api/v1/system/tasks");
+  },
+  runTaskNow(id: number): Promise<{ task: ScheduledTask }> {
+    return req("POST", `/api/v1/system/tasks/${id}/run-now`);
+  },
+
+  // --- disk space -----------------------------------------------
+  diskspace(): Promise<{ entries: DiskEntry[] }> {
+    return req("GET", "/api/v1/system/diskspace");
+  },
+
+  // --- commands ---------------------------------------------------
+  listCommands(limit = 50): Promise<{ commands: Command[] }> {
+    return req("GET", `/api/v1/commands?limit=${limit}`);
+  },
+  commandNames(): Promise<{ names: string[] }> {
+    return req("GET", "/api/v1/commands/names");
+  },
+  submitCommand(name: string, body?: unknown): Promise<{ command: Command }> {
+    return jsonReq("POST", "/api/v1/commands", { name, body });
+  },
+  getCommand(id: number): Promise<{ command: Command }> {
+    return req("GET", `/api/v1/commands/${id}`);
+  },
+
+  // --- backups ---------------------------------------------------
+  listBackups(): Promise<{ backups: BackupFile[] }> {
+    return req("GET", "/api/v1/system/backups");
+  },
+  runBackup(): Promise<{ backups: BackupFile[] }> {
+    return req("POST", "/api/v1/system/backups");
+  },
+  backupURL(name: string): string {
+    return withBase(`/api/v1/system/backups/${encodeURIComponent(name)}`);
+  },
+
+  // --- log files -------------------------------------------------
+  logFiles(): Promise<{ files: LogFile[] }> {
+    return req("GET", "/api/v1/system/logs/files");
+  },
+  logFileURL(name: string): string {
+    return withBase(`/api/v1/system/logs/files/${encodeURIComponent(name)}`);
   },
 
   // --- subscriptions / webhooks ----------------------------------

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import {
   Activity as ActivityIcon,
@@ -6,6 +7,8 @@ import {
   Cpu as SystemIcon,
   type LucideIcon,
 } from "lucide-react";
+import { api } from "../api/client";
+import type { Job, SystemStatus } from "../api/types";
 
 type BadgeTone = "warn" | "err";
 
@@ -59,8 +62,96 @@ function renderBadge(badge: Badge | undefined) {
   return <span className={`sidebar-badge ${toneClass}`}>{badge.count}</span>;
 }
 
+// formatVersion strips a leading "v" from the server-reported version
+// before re-prefixing it, so a Go-module pseudo-version
+// ("v0.1.5-0.20260514...") doesn't render as "vv0.1.5-...".
+function formatVersion(v?: string): string {
+  if (!v) return "dev";
+  return "v" + v.replace(/^v/, "");
+}
+
+// formatRate is a short bytes/s formatter used in the footer; the
+// Activity page has its own copy but the sidebar is in the pre-auth
+// bundle and we don't want to drag the queue page in here just for
+// this. Tiny duplicate, big-perf win.
+function formatRate(bps: number): string {
+  if (bps < 1024) return `${bps} B/s`;
+  const units = ["KB/s", "MB/s", "GB/s"];
+  let v = bps / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+// sidebarStatus picks the right label + dot color for the footer pill
+// based on the queue snapshot. "Idle" when no jobs are downloading,
+// throughput rate when at least one is, "Paused" when all are paused.
+function sidebarStatus(jobs: Job[], bytesPerSec: number): {
+  label: string;
+  tone: "ok" | "info" | "warn" | "neutral";
+} {
+  if (!jobs || jobs.length === 0) return { label: "Idle", tone: "ok" };
+  const downloading = jobs.filter((j) => j.state === "downloading").length;
+  if (downloading > 0) {
+    return {
+      label: bytesPerSec > 0 ? formatRate(bytesPerSec) : "Downloading",
+      tone: "info",
+    };
+  }
+  const paused = jobs.filter((j) => j.state === "paused").length;
+  if (paused > 0 && paused === jobs.length) return { label: "Paused", tone: "warn" };
+  return { label: "Idle", tone: "ok" };
+}
+
 export default function Sidebar() {
   const location = useLocation();
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [throughput, setThroughput] = useState<number>(0);
+  const [status, setStatus] = useState<SystemStatus | null>(null);
+
+  // Poll the queue + throughput at a slow cadence rather than opening
+  // a second SSE stream (Activity already owns one). 5s is plenty for
+  // a footer pill that just answers "is anything happening".
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const [q, t] = await Promise.all([
+          api.listQueue(),
+          api.throughput().catch(() => null),
+        ]);
+        if (cancelled) return;
+        setJobs(q.jobs ?? []);
+        if (t) setThroughput(t.current_bytes_per_sec ?? 0);
+      } catch {
+        /* footer is decorative — ignore */
+      }
+    };
+    void tick();
+    const id = setInterval(() => void tick(), 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  // System status (for the version label) only needs to be fetched once.
+  useEffect(() => {
+    let cancelled = false;
+    void api.systemStatus().then((s) => {
+      if (!cancelled) setStatus(s);
+    }).catch(() => {
+      /* ignore */
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const footer = sidebarStatus(jobs, throughput);
 
   return (
     <aside className="sidebar">
@@ -106,11 +197,14 @@ export default function Sidebar() {
       </nav>
 
       <div className="sidebar-footer">
-        <div className="sidebar-status">
-          <span className="status-dot" aria-hidden="true" />
-          <span className="status-text">Idle</span>
+        <div className="sidebar-status" title={`hoardarr ${status?.version ?? ""}`}>
+          <span
+            className={`status-dot status-dot-${footer.tone}`}
+            aria-hidden="true"
+          />
+          <span className="status-text">{footer.label}</span>
         </div>
-        <span className="sidebar-version">v0.0.1-dev</span>
+        <span className="sidebar-version">{formatVersion(status?.version)}</span>
       </div>
     </aside>
   );

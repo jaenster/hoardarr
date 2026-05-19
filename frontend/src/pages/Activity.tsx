@@ -6,14 +6,23 @@ import StatusBadge from "../components/StatusBadge";
 import Button from "../components/Button";
 import QueueList from "../components/QueueList";
 import { api, ApiError } from "../api/client";
+import { useToasts } from "../components/Toasts";
 import { useQueue } from "../hooks/useQueue";
 import type { Job, PoolStatus } from "../api/types";
+
+// jobStateIsTerminal mirrors the server's terminal-state set —
+// completed/failed/aborted. Used to choose between "already in
+// queue" and "already finished" toast wording.
+function jobStateIsTerminal(s?: string): boolean {
+  return s === "completed" || s === "failed" || s === "aborted";
+}
 
 export default function Activity() {
   const { jobs, activity, bytesPerSec, pools, error, loading, refresh, applyReorder } = useQueue();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const toast = useToasts();
   // Drag-counter: dragenter/leave fire for every child element. Track
   // a depth count so we only hide the overlay when ALL nested
   // dragleave events have fired.
@@ -67,15 +76,28 @@ export default function Activity() {
       try {
         for (const f of list) {
           try {
-            await api.uploadNZB(f);
-          } catch (err) {
-            if (err instanceof ApiError) {
-              setUploadError(
-                `${err.status}: ${(err.body as { error?: string })?.error ?? err.message}`,
-              );
+            const resp = await api.uploadNZB(f);
+            const display = resp.name || f.name;
+            if (resp.duplicate) {
+              if (jobStateIsTerminal(resp.state)) {
+                toast.info(`Already finished: ${display}`, {
+                  message: `Job #${resp.job_id} is in history (${resp.state ?? "terminal"}). Remove it from History first to re-queue.`,
+                });
+              } else {
+                toast.info(`Already in queue: ${display}`, {
+                  message: `Job #${resp.job_id} is ${resp.state ?? "queued"}.`,
+                });
+              }
             } else {
-              setUploadError(err instanceof Error ? err.message : String(err));
+              toast.success(`Added: ${display}`, {
+                message: `Job #${resp.job_id}`,
+              });
             }
+          } catch (err) {
+            const msg = err instanceof ApiError
+              ? `${err.status}: ${(err.body as { error?: string })?.error ?? err.message}`
+              : err instanceof Error ? err.message : String(err);
+            toast.error(`Upload failed: ${f.name}`, { message: msg });
           }
         }
         await refresh();
@@ -83,7 +105,7 @@ export default function Activity() {
         setUploading(false);
       }
     },
-    [refresh],
+    [refresh, toast],
   );
 
   const onFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
