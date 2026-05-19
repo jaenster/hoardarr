@@ -226,11 +226,20 @@ func TestOrchestrator_GivesUpAfterMaxAttempts(t *testing.T) {
 	}
 	_ = job.PullEvents()
 
+	// MaxDurableAttempts: 1 gives the segment one durable-retry pass
+	// after the in-process retry budget exhausts, then escalates to
+	// terminal failure. Total fetch calls = maxAttempts * (1 + 1
+	// durable retry) = 6. DurableBackoff is squeezed to ~zero so the
+	// outer Run loop doesn't sleep between batches.
 	orch := NewOrchestrator(f.repo, fetcher, f.bus, f.txm,
 		1, 1, f.jobDir,
 		OrchestratorOptions{
-			MaxAttempts: maxAttempts,
-			BaseBackoff: 1 * time.Millisecond,
+			MaxAttempts:        maxAttempts,
+			BaseBackoff:        1 * time.Millisecond,
+			MaxDurableAttempts: 1,
+			DurableBackoffBase: 1 * time.Millisecond,
+			DurableBackoffMax:  1 * time.Millisecond,
+			MaxPollGap:         1 * time.Millisecond,
 		},
 	)
 	if err := orch.Run(ctx, job.ID()); err != nil {
@@ -242,8 +251,139 @@ func TestOrchestrator_GivesUpAfterMaxAttempts(t *testing.T) {
 	if got := segs[0].State(); got != download.SegmentStateFailed {
 		t.Errorf("segment state = %s; want failed", got)
 	}
-	if got := fetcher.calls.Load(); got != int64(maxAttempts) {
-		t.Errorf("fetch calls = %d; want %d (max attempts)", got, maxAttempts)
+	if got, want := fetcher.calls.Load(), int64(maxAttempts*2); got != want {
+		t.Errorf("fetch calls = %d; want %d (max attempts × (1 + durable retry))", got, want)
+	}
+}
+
+// TestOrchestrator_DurableRetry_TransientThenSuccess proves the
+// happy-path of durable retry: a segment fails enough times to
+// exhaust the in-process retry budget, gets deferred via
+// MarkSegmentForRetry with next_retry_at = now+backoff, and on the
+// outer Run loop's next poll iteration is dispatched again and
+// succeeds.
+func TestOrchestrator_DurableRetry_TransientThenSuccess(t *testing.T) {
+	f := newOrchestratorFixture(t)
+	ctx := context.Background()
+	now := time.UnixMilli(1).UTC()
+
+	payload := []byte("hello!")
+	bodies := map[string][]byte{"flaky@host": yencSinglePart(payload, "f.bin")}
+	// 5 failures: in-process attempts run 3 (fail) → durable retry → 2 more (fail) → durable retry → succeeds on 6th call.
+	const maxAttempts = 3
+	fetcher := newFlakyFetcher(5, bodies)
+
+	job, _ := download.NewJob(download.NewJobParams{
+		NZBHash: "durable-happy",
+		Name:    "release",
+		NZBBlob: []byte("<nzb/>"),
+		Files: []download.NewFileParams{
+			{
+				Filename:  "f.bin",
+				SizeBytes: int64(len(payload)),
+				Segments:  []download.NewSegmentParams{{SeqIndex: 1, MessageID: "flaky@host", Bytes: int64(len(payload))}},
+			},
+		},
+	}, now)
+	if err := f.repo.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	_ = job.PullEvents()
+
+	orch := NewOrchestrator(f.repo, fetcher, f.bus, f.txm,
+		1, 1, f.jobDir,
+		OrchestratorOptions{
+			MaxAttempts:        maxAttempts,
+			BaseBackoff:        1 * time.Millisecond,
+			MaxDurableAttempts: 5,
+			DurableBackoffBase: 1 * time.Millisecond,
+			DurableBackoffMax:  1 * time.Millisecond,
+			MaxPollGap:         1 * time.Millisecond,
+		},
+	)
+	if err := orch.Run(ctx, job.ID()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	final, _ := f.repo.ByID(ctx, job.ID())
+	segs := final.Files()[0].Segments()
+	if got := segs[0].State(); got != download.SegmentStateDone {
+		t.Errorf("segment state = %s; want done (durable retry should have caught the success on a later batch)", got)
+	}
+	// In-process retries don't bump segment.Attempts; only MarkPendingRetry does.
+	// Dispatch 1 (3 in-process attempts: all fail, calls 1-3) → durable retry #1
+	// (Attempts → 1). Dispatch 2 (in-process attempts 1-2 fail = calls 4-5,
+	// attempt 3 succeeds = call 6) → done. Net: exactly one durable retry.
+	if got := segs[0].Attempts(); got != 1 {
+		t.Errorf("seg.Attempts = %d; want 1 (one durable retry before success)", got)
+	}
+}
+
+// TestOrchestrator_DurableRetry_RespectsNextRetryAt validates that the
+// outer Run loop honours next_retry_at: a segment scheduled for a
+// future time must not be picked up until that time has passed.
+func TestOrchestrator_DurableRetry_RespectsNextRetryAt(t *testing.T) {
+	f := newOrchestratorFixture(t)
+	ctx := context.Background()
+	now := time.UnixMilli(1).UTC()
+
+	payload := []byte("ok-body")
+	bodies := map[string][]byte{"slow@host": yencSinglePart(payload, "s.bin")}
+	// Permanent failure: ensures the orchestrator decides "transient"
+	// and schedules a durable retry. We fix the backoff small so the
+	// test runs quickly; we still assert that *some* wall-clock time
+	// elapsed between dispatches.
+	fetcher := newFlakyFetcher(99, bodies)
+
+	job, _ := download.NewJob(download.NewJobParams{
+		NZBHash: "durable-defer",
+		Name:    "release",
+		NZBBlob: []byte("<nzb/>"),
+		Files: []download.NewFileParams{
+			{
+				Filename:  "s.bin",
+				SizeBytes: int64(len(payload)),
+				Segments:  []download.NewSegmentParams{{SeqIndex: 1, MessageID: "slow@host", Bytes: int64(len(payload))}},
+			},
+		},
+	}, now)
+	if err := f.repo.Save(ctx, job); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	_ = job.PullEvents()
+
+	orch := NewOrchestrator(f.repo, fetcher, f.bus, f.txm,
+		1, 1, f.jobDir,
+		OrchestratorOptions{
+			MaxAttempts:        1, // one in-process attempt per dispatch — fail fast
+			BaseBackoff:        1 * time.Millisecond,
+			MaxDurableAttempts: 2,
+			DurableBackoffBase: 50 * time.Millisecond,
+			DurableBackoffMax:  50 * time.Millisecond,
+			MaxPollGap:         50 * time.Millisecond,
+		},
+	)
+	start := time.Now()
+	if err := orch.Run(ctx, job.ID()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// 3 dispatches total: initial + 2 durable retries (then terminal).
+	// Between each dispatch the orchestrator sleeps DurableBackoffBase
+	// (50ms). Floor: 2 * 50ms = 100ms. We assert at least 80ms to leave
+	// room for scheduler jitter on busy CI.
+	if elapsed < 80*time.Millisecond {
+		t.Errorf("elapsed = %v; want ≥80ms (must wait for next_retry_at)", elapsed)
+	}
+	if got := fetcher.calls.Load(); got != 3 {
+		t.Errorf("fetch calls = %d; want 3 (initial + 2 durable retries)", got)
+	}
+
+	final, _ := f.repo.ByID(ctx, job.ID())
+	segs := final.Files()[0].Segments()
+	if got := segs[0].State(); got != download.SegmentStateFailed {
+		t.Errorf("final state = %s; want failed (exhausted durable retries)", got)
 	}
 }
 

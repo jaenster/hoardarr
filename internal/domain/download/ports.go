@@ -64,11 +64,12 @@ type HistoryQuery struct {
 // completion drainer. The repo applies all updates in one tx so they
 // commit atomically with the events the orchestrator publishes.
 type SegmentUpdate struct {
-	SegmentID  SegmentID
-	State      SegmentState
-	Attempts   int
-	LastError  string
-	FileOffset int64
+	SegmentID   SegmentID
+	State       SegmentState
+	Attempts    int
+	LastError   string
+	FileOffset  int64
+	NextRetryAt time.Time
 }
 
 // ErrJobNotFound is returned by repo lookups when the id has no row.

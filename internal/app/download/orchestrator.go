@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,9 +46,16 @@ type Orchestrator struct {
 	flushInterval time.Duration
 	flushBatchMax int
 
-	// segment retry
+	// segment retry — in-process retries within a single dispatch.
 	maxAttempts int
 	baseBackoff time.Duration
+
+	// durable retry — survives restart by writing next_retry_at into
+	// the DB and re-polling on a later orchestrator pass.
+	maxDurableAttempts int           // hard cap on total dispatches per segment
+	durableBackoffBase time.Duration // first deferred-retry delay
+	durableBackoffMax  time.Duration // ceiling for exponential growth
+	maxPollGap         time.Duration // hard ceiling on how long Run sleeps between polls
 
 	// failHopelessRatio is SABnzbd's fail_hopeless threshold expressed
 	// as a fraction (0.05 = 5%). When a job's failed_bytes exceed this
@@ -90,6 +98,33 @@ type OrchestratorOptions struct {
 	// BaseBackoff is the first-retry delay; each subsequent retry
 	// doubles. Default 200ms (so 200 / 400 / 800 ms for 3 attempts).
 	BaseBackoff time.Duration
+
+	// MaxDurableAttempts caps the total number of *dispatches* per
+	// segment across the whole job's lifetime — each call to
+	// processSegment counts as one dispatch, regardless of how many
+	// in-process retries (MaxAttempts) it ran internally. Once a
+	// segment's Attempts() reaches this value, its next failure
+	// becomes terminal instead of getting another durable retry.
+	// Default 10.
+	MaxDurableAttempts int
+
+	// DurableBackoffBase is the first deferred-retry delay after
+	// in-process retries exhaust. Default 30s. Grows exponentially
+	// per attempt (30s → 60s → 120s → … capped at DurableBackoffMax).
+	DurableBackoffBase time.Duration
+
+	// DurableBackoffMax caps the deferred-retry delay. Default 30min.
+	// Without a cap, segments that have failed many times would wait
+	// hours, which is rarely useful — provider-side conn-limits and
+	// transient outages typically clear in minutes.
+	DurableBackoffMax time.Duration
+
+	// MaxPollGap is the longest the orchestrator's Run loop will
+	// sleep between re-polling for ready segments when all pending
+	// segments are deferred. A small ceiling lets us detect ctx
+	// cancellation and operator-driven state changes (pause, remove)
+	// without hanging on a 30-min sleep. Default 60s.
+	MaxPollGap time.Duration
 
 	// FailHopelessRatio aborts the download mid-flight when failed
 	// bytes exceed this fraction of total bytes. Saves bandwidth on
@@ -142,6 +177,18 @@ func NewOrchestrator(
 	if opts.PoolWait == 0 {
 		opts.PoolWait = 5 * time.Second
 	}
+	if opts.MaxDurableAttempts == 0 {
+		opts.MaxDurableAttempts = 10
+	}
+	if opts.DurableBackoffBase == 0 {
+		opts.DurableBackoffBase = 30 * time.Second
+	}
+	if opts.DurableBackoffMax == 0 {
+		opts.DurableBackoffMax = 30 * time.Minute
+	}
+	if opts.MaxPollGap == 0 {
+		opts.MaxPollGap = 60 * time.Second
+	}
 	if workers <= 0 {
 		workers = 1
 	}
@@ -160,10 +207,14 @@ func NewOrchestrator(
 		incompleteDir: incompleteDir,
 		flushInterval: opts.FlushInterval,
 		flushBatchMax: opts.FlushBatchMax,
-		maxAttempts:   opts.MaxAttempts,
-		baseBackoff:   opts.BaseBackoff,
-		poolWait:      opts.PoolWait,
-		failHopelessRatio: opts.FailHopelessRatio,
+		maxAttempts:        opts.MaxAttempts,
+		baseBackoff:        opts.BaseBackoff,
+		poolWait:           opts.PoolWait,
+		maxDurableAttempts: opts.MaxDurableAttempts,
+		durableBackoffBase: opts.DurableBackoffBase,
+		durableBackoffMax:  opts.DurableBackoffMax,
+		maxPollGap:         opts.MaxPollGap,
+		failHopelessRatio:  opts.FailHopelessRatio,
 	}
 }
 
@@ -193,27 +244,73 @@ func (o *Orchestrator) Run(ctx context.Context, jobID download.JobID) error {
 		return fmt.Errorf("mark started: %w", err)
 	}
 
-	pending := job.PendingSegments()
-	if len(pending) == 0 {
-		o.logger.Info("orchestrator: no pending segments", "job", jobID)
-		return nil
-	}
-
 	jobDir := filepath.Join(o.incompleteDir, fmt.Sprintf("%d", int64(job.ID())))
 	if err := os.MkdirAll(jobDir, 0o755); err != nil {
 		return fmt.Errorf("create job dir: %w", err)
 	}
 
+	// Outer re-poll loop: keep dispatching batches of *ready* pending
+	// segments until none are ready and none are deferred. Deferred
+	// segments are those with next_retry_at in the future — we wait
+	// for them rather than burning workers re-fetching articles whose
+	// server just rejected them for being over connection limit.
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		now := o.now()
+		pending := job.PendingSegments(now)
+		if len(pending) > 0 {
+			if err := o.runBatch(ctx, job, jobDir, pending); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// No ready segments. Anything deferred?
+		next := job.NextRetryReadyAt(now)
+		if next.IsZero() {
+			return nil // truly done — nothing pending, nothing deferred.
+		}
+		wait := next.Sub(now)
+		if wait > o.maxPollGap {
+			wait = o.maxPollGap
+		}
+		if wait < 0 {
+			wait = 0
+		}
+		o.logger.Info("orchestrator: deferring; all pending segments retry-gated",
+			"job_id", int64(job.ID()),
+			"next_ready_at", next,
+			"sleep", wait,
+		)
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// runBatch dispatches one batch of ready pending segments through the
+// worker pool and waits for the drainer to flush all results. Returns
+// only after every worker + producer + drainer goroutine has exited,
+// so the outer Run() loop can safely re-poll the (now-updated) job.
+func (o *Orchestrator) runBatch(
+	ctx context.Context,
+	job *download.Job,
+	jobDir string,
+	pending []*download.Segment,
+) error {
 	workCh := make(chan *download.Segment, o.workers*2)
 	resultCh := make(chan segmentResult, o.workers*2)
 
-	// Run() blocks until workers + producer + drainer are all done,
-	// so on ctx-cancel we don't return while one of them is still
-	// alive. Previously the producer was a bare `go func()` not in
-	// any WaitGroup — under aggressive pause/resume + retries those
-	// orphan goroutines accumulated; suspect for the live-container
-	// CPU climb.
-
+	// We block until workers + producer + drainer are all done so on
+	// ctx-cancel we don't return while one of them is still alive.
+	// Previously the producer was a bare `go func()` not in any
+	// WaitGroup — under aggressive pause/resume + retries those orphan
+	// goroutines accumulated; suspect for the live-container CPU climb.
 	var workersWG sync.WaitGroup
 	for i := 0; i < o.workers; i++ {
 		workersWG.Add(1)
@@ -248,11 +345,7 @@ func (o *Orchestrator) Run(ctx context.Context, jobID download.JobID) error {
 	workersWG.Wait()
 	close(resultCh)
 	<-producerDone
-	if err := <-drainerDone; err != nil {
-		return err
-	}
-
-	return nil
+	return <-drainerDone
 }
 
 func (o *Orchestrator) markStarted(ctx context.Context, job *download.Job) error {
@@ -484,8 +577,31 @@ func (o *Orchestrator) flushBatch(ctx context.Context, job *download.Job, batch 
 			if r.err != nil {
 				msg = r.err.Error()
 			}
-			if err := job.MarkSegmentFailed(r.seg.ID(), msg, now); err != nil {
-				o.logger.Error("MarkSegmentFailed", "err", err)
+			// Durable retry vs terminal failure decision: a transient
+			// error (network blip, provider conn-limit, 4xx response)
+			// gets pushed back to pending with next_retry_at = now +
+			// exponential backoff, so the outer Run loop will re-poll
+			// it after the gate elapses. A terminal error (yenc decode
+			// failure on a complete body, 5xx that won't fix itself,
+			// or simply too many dispatches already burned) goes to
+			// the final Failed state.
+			if r.err != nil && isTransientFetchErr(r.err) && r.seg.Attempts() < o.maxDurableAttempts {
+				backoff := o.durableBackoff(r.seg.Attempts())
+				if err := job.MarkSegmentForRetry(r.seg.ID(), now.Add(backoff), msg); err != nil {
+					o.logger.Error("MarkSegmentForRetry", "err", err)
+				} else {
+					o.logger.Info("orchestrator: durable retry scheduled",
+						"job_id", int64(job.ID()),
+						"segment_id", int64(r.seg.ID()),
+						"attempts", r.seg.Attempts()+1,
+						"next_at", now.Add(backoff),
+						"err", msg,
+					)
+				}
+			} else {
+				if err := job.MarkSegmentFailed(r.seg.ID(), msg, now); err != nil {
+					o.logger.Error("MarkSegmentFailed", "err", err)
+				}
 			}
 		}
 		persisted = append(persisted, r)
@@ -568,3 +684,70 @@ type segmentResult struct {
 
 // Ensure imports are referenced (some are used only in error paths).
 var _ = bytes.Buffer{}
+
+// isTransientFetchErr decides whether a segment-fetch error should be
+// pushed back to the pending queue with a backoff (durable retry) or
+// marked terminal-failed. The bias is forgiving: when in doubt, retry.
+//
+//	- ErrArticleMissing never lands here (handled separately as missing)
+//	- ErrTooManyConnections: classic transient — provider just told us
+//	  we're over our slot, retry in a minute
+//	- ErrAuthRequired: pool may pick a different conn next time
+//	- ErrAuthFailed: terminal — bad creds won't fix themselves
+//	- *ProtocolError 4xx: transient by RFC 3977's "transient negative"
+//	- *ProtocolError 5xx: permanent — won't fix on retry
+//	- yenc decode errors: terminal — body was malformed, same body next
+//	  time. Caught by string match because yenc.Decode wraps with
+//	  fmt.Errorf("yenc decode: %w", ...).
+//	- everything else: transient (network blips, ctx timeouts, EOF)
+func isTransientFetchErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, nntp.ErrTooManyConnections) {
+		return true
+	}
+	if errors.Is(err, nntp.ErrAuthRequired) {
+		return true
+	}
+	if errors.Is(err, nntp.ErrAuthFailed) {
+		return false
+	}
+	if errors.Is(err, nntp.ErrUnexpectedGreeting) {
+		return true
+	}
+	var pe *nntp.ProtocolError
+	if errors.As(err, &pe) {
+		return pe.IsTransient()
+	}
+	// yenc decode failure has no sentinel; sniff the wrap prefix.
+	if strings.Contains(err.Error(), "yenc decode") {
+		return false
+	}
+	if strings.Contains(err.Error(), "writeat") || strings.Contains(err.Error(), "truncate") || strings.Contains(err.Error(), "open tmp") {
+		// Local IO errors aren't going to fix themselves on retry —
+		// the disk is the disk. Mark terminal so the operator sees
+		// the problem in history instead of an indefinite retry loop.
+		return false
+	}
+	return true
+}
+
+// durableBackoff returns the next-attempt delay for a segment that
+// has been retried `attempts` times (post-MarkPendingRetry-increment).
+// Exponential growth with a max ceiling: base, 2×base, 4×base, … cap.
+// Jitter would be nice but isn't necessary today — segments retry
+// independently anyway and won't thunder.
+func (o *Orchestrator) durableBackoff(attempts int) time.Duration {
+	d := o.durableBackoffBase
+	if attempts < 1 {
+		return d
+	}
+	for i := 0; i < attempts && d < o.durableBackoffMax; i++ {
+		d *= 2
+	}
+	if d > o.durableBackoffMax {
+		d = o.durableBackoffMax
+	}
+	return d
+}

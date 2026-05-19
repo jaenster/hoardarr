@@ -134,11 +134,12 @@ func (r *JobRepo) insertFile(ctx context.Context, f *download.File) error {
 func (r *JobRepo) insertSegment(ctx context.Context, s *download.Segment) error {
 	res, err := r.db.ExecCtx(ctx, `
 		INSERT INTO segments(
-			file_id, seq_index, message_id, bytes, state, attempts, last_error, file_offset
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			file_id, seq_index, message_id, bytes, state, attempts, last_error, file_offset, next_retry_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		int64(s.FileID()), s.SeqIndex(), s.MessageID(), s.Bytes(),
 		string(s.State()), s.Attempts(), nullableString(s.LastError()), s.FileOffset(),
+		retryAtMillis(s.NextRetryAt()),
 	)
 	if err != nil {
 		return fmt.Errorf("insert segment: %w", err)
@@ -375,11 +376,14 @@ func (r *JobRepo) UpdateSegmentBatch(ctx context.Context, updates []download.Seg
 	if len(updates) == 0 {
 		return nil
 	}
-	const stmt = `UPDATE segments SET state = ?, attempts = ?, last_error = ?, file_offset = ? WHERE id = ?`
+	const stmt = `UPDATE segments
+		SET state = ?, attempts = ?, last_error = ?, file_offset = ?, next_retry_at = ?
+		WHERE id = ?`
 	for _, u := range updates {
 		if _, err := r.db.ExecCtx(ctx, stmt,
 			string(u.State), u.Attempts, nullableString(u.LastError),
-			u.FileOffset, int64(u.SegmentID),
+			u.FileOffset, retryAtMillis(u.NextRetryAt),
+			int64(u.SegmentID),
 		); err != nil {
 			return fmt.Errorf("update segment %d: %w", u.SegmentID, err)
 		}
@@ -636,32 +640,52 @@ func (r *JobRepo) loadSegments(ctx context.Context, fileID download.FileID) ([]*
 	var out []*download.Segment
 	for rows.Next() {
 		var (
-			sid        int64
-			fid        int64
-			seqIndex   int
-			msgID      string
-			bytesN     int64
-			state      string
-			attempts   int
-			lastError  sql.NullString
-			fileOffset int64
+			sid         int64
+			fid         int64
+			seqIndex    int
+			msgID       string
+			bytesN      int64
+			state       string
+			attempts    int
+			lastError   sql.NullString
+			fileOffset  int64
+			nextRetryMs int64
 		)
-		if err := rows.Scan(&sid, &fid, &seqIndex, &msgID, &bytesN, &state, &attempts, &lastError, &fileOffset); err != nil {
+		if err := rows.Scan(
+			&sid, &fid, &seqIndex, &msgID, &bytesN, &state, &attempts,
+			&lastError, &fileOffset, &nextRetryMs,
+		); err != nil {
 			return nil, err
 		}
+		var nextRetry time.Time
+		if nextRetryMs > 0 {
+			nextRetry = time.UnixMilli(nextRetryMs).UTC()
+		}
 		out = append(out, download.HydrateSegment(download.HydrateSegmentParams{
-			ID:         download.SegmentID(sid),
-			FileID:     download.FileID(fid),
-			SeqIndex:   seqIndex,
-			MessageID:  msgID,
-			Bytes:      bytesN,
-			State:      download.SegmentState(state),
-			Attempts:   attempts,
-			LastError:  lastError.String,
-			FileOffset: fileOffset,
+			ID:          download.SegmentID(sid),
+			FileID:      download.FileID(fid),
+			SeqIndex:    seqIndex,
+			MessageID:   msgID,
+			Bytes:       bytesN,
+			State:       download.SegmentState(state),
+			Attempts:    attempts,
+			LastError:   lastError.String,
+			FileOffset:  fileOffset,
+			NextRetryAt: nextRetry,
 		}))
 	}
 	return out, rows.Err()
+}
+
+// retryAtMillis encodes a time.Time as the unix-ms representation the
+// segments.next_retry_at column stores. Zero time maps to 0 (the
+// schema's "ready now" sentinel) rather than NULL — the column is
+// NOT NULL on purpose so the pending-segment index stays usable.
+func retryAtMillis(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 const jobColumns = `id, nzb_hash, name, category, priority, queue_order, source, state,
@@ -686,7 +710,7 @@ const selectFilesForJob = `SELECT id, job_id, filename, poster, groups, size_byt
 	FROM files WHERE job_id = ? ORDER BY id ASC`
 
 const selectSegmentsForFile = `SELECT id, file_id, seq_index, message_id, bytes, state,
-	attempts, last_error, file_offset
+	attempts, last_error, file_offset, next_retry_at
 	FROM segments WHERE file_id = ? ORDER BY seq_index ASC`
 
 func scanJob(row *sql.Row) (*download.Job, error) {

@@ -1,5 +1,7 @@
 package download
 
+import "time"
+
 // SegmentID identifies a Segment. Allocated by the persistence layer.
 type SegmentID int64
 
@@ -22,6 +24,11 @@ type Segment struct {
 	// where this segment's decoded bytes go. Set after the first
 	// successful yEnc decode (from =ypart begin - 1) and persisted.
 	fileOffset int64
+	// nextRetryAt is the earliest time this segment is eligible for
+	// re-dispatch. Zero = ready now. Populated on transient retry so
+	// the back-off survives a restart instead of being lost with the
+	// in-memory goroutine that was sleeping on time.After.
+	nextRetryAt time.Time
 }
 
 // NewSegmentParams constructs a fresh pending Segment.
@@ -43,30 +50,32 @@ func newSegment(p NewSegmentParams) *Segment {
 // HydrateSegmentParams is what the repository hands back when loading
 // a row.
 type HydrateSegmentParams struct {
-	ID         SegmentID
-	FileID     FileID
-	SeqIndex   int
-	MessageID  string
-	Bytes      int64
-	State      SegmentState
-	Attempts   int
-	LastError  string
-	FileOffset int64
+	ID          SegmentID
+	FileID      FileID
+	SeqIndex    int
+	MessageID   string
+	Bytes       int64
+	State       SegmentState
+	Attempts    int
+	LastError   string
+	FileOffset  int64
+	NextRetryAt time.Time
 }
 
 // HydrateSegment is the adapter-side constructor that reconstructs a
 // Segment from persistence. No events are emitted.
 func HydrateSegment(p HydrateSegmentParams) *Segment {
 	return &Segment{
-		id:         p.ID,
-		fileID:     p.FileID,
-		seqIndex:   p.SeqIndex,
-		messageID:  p.MessageID,
-		bytes:      p.Bytes,
-		state:      p.State,
-		attempts:   p.Attempts,
-		lastError:  p.LastError,
-		fileOffset: p.FileOffset,
+		id:          p.ID,
+		fileID:      p.FileID,
+		seqIndex:    p.SeqIndex,
+		messageID:   p.MessageID,
+		bytes:       p.Bytes,
+		state:       p.State,
+		attempts:    p.Attempts,
+		lastError:   p.LastError,
+		fileOffset:  p.FileOffset,
+		nextRetryAt: p.NextRetryAt,
 	}
 }
 
@@ -80,6 +89,26 @@ func (s *Segment) State() SegmentState { return s.state }
 func (s *Segment) Attempts() int       { return s.attempts }
 func (s *Segment) LastError() string   { return s.lastError }
 func (s *Segment) FileOffset() int64   { return s.fileOffset }
+
+// NextRetryAt returns the earliest instant this segment is eligible
+// for re-dispatch. Zero = ready now.
+func (s *Segment) NextRetryAt() time.Time { return s.nextRetryAt }
+
+// MarkPendingRetry flips a transient-failed (inflight/failed) segment
+// back to pending with a durable backoff. After saving, the
+// orchestrator's pending-segment query (filtered by next_retry_at)
+// will skip this segment until `at` passes — even across a process
+// restart.
+//
+// Records the error string so the per-job timeline + UI surface what
+// went wrong on the previous attempt without callers having to track
+// it separately.
+func (s *Segment) MarkPendingRetry(at time.Time, errMsg string) {
+	s.state = SegmentStatePending
+	s.nextRetryAt = at.UTC()
+	s.attempts++
+	s.lastError = errMsg
+}
 
 // SetID is called by the repository to assign a database id after
 // insert.

@@ -67,7 +67,7 @@ func TestMarkSegmentDispatched(t *testing.T) {
 		}
 	}
 
-	segs := j.PendingSegments()
+	segs := j.PendingSegments(time.Now())
 	if len(segs) != 3 {
 		t.Fatalf("PendingSegments = %d; want 3", len(segs))
 	}
@@ -198,7 +198,7 @@ func TestPendingSegments_SkipsDeferredRecoveryVols(t *testing.T) {
 		t.Fatalf("NewJob: %v", err)
 	}
 
-	pending := j.PendingSegments()
+	pending := j.PendingSegments(time.Now())
 	if len(pending) != 2 {
 		t.Fatalf("pending = %d; want 2 (data + index, not vols)", len(pending))
 	}
@@ -253,7 +253,7 @@ func TestRequestRecoveryVols_RevealsHiddenSegments(t *testing.T) {
 	if j.State() != JobStateDownloading {
 		t.Errorf("state after request = %s; want downloading", j.State())
 	}
-	pending := j.PendingSegments()
+	pending := j.PendingSegments(time.Now())
 	if len(pending) != 1 {
 		t.Fatalf("pending after request = %d; want 1 (the vol)", len(pending))
 	}
@@ -289,5 +289,102 @@ func TestResetInflightToPending(t *testing.T) {
 		if s.State() != SegmentStatePending {
 			t.Errorf("seg %d state = %s; want pending", s.id, s.State())
 		}
+	}
+}
+
+// TestPendingSegments_FiltersByNextRetryAt covers the durable-retry
+// query semantics: a pending segment with next_retry_at in the future
+// is hidden until that instant has passed.
+func TestPendingSegments_FiltersByNextRetryAt(t *testing.T) {
+	t0 := time.UnixMilli(1_000_000).UTC()
+	j, err := NewJob(NewJobParams{
+		NZBHash: "deadbeef",
+		Name:    "release",
+		Files: []NewFileParams{
+			{
+				Filename:  "f.bin",
+				SizeBytes: 100,
+				Segments: []NewSegmentParams{
+					{SeqIndex: 1, MessageID: "ready@host", Bytes: 50},
+					{SeqIndex: 2, MessageID: "deferred@host", Bytes: 50},
+				},
+			},
+		},
+	}, t0)
+	if err != nil {
+		t.Fatalf("NewJob: %v", err)
+	}
+	id := SegmentID(100)
+	for _, f := range j.files {
+		for _, s := range f.segments {
+			s.SetID(id)
+			id++
+		}
+	}
+
+	// Defer the second segment 1 minute into the future.
+	future := t0.Add(time.Minute)
+	if err := j.MarkSegmentForRetry(101, future, "conn-limit"); err != nil {
+		t.Fatalf("MarkSegmentForRetry: %v", err)
+	}
+
+	got := j.PendingSegments(t0)
+	if len(got) != 1 {
+		t.Fatalf("ready segments = %d; want 1 (deferred one is hidden)", len(got))
+	}
+	if got[0].ID() != 100 {
+		t.Errorf("returned wrong seg: %d", got[0].ID())
+	}
+
+	// After the window elapses, both are ready.
+	got = j.PendingSegments(future.Add(time.Second))
+	if len(got) != 2 {
+		t.Fatalf("ready after window = %d; want 2", len(got))
+	}
+
+	// NextRetryReadyAt reports the exact instant the deferred segment
+	// becomes eligible.
+	if got := j.NextRetryReadyAt(t0); !got.Equal(future) {
+		t.Errorf("NextRetryReadyAt = %v; want %v", got, future)
+	}
+	// After all segments are ready, NextRetryReadyAt returns zero.
+	if got := j.NextRetryReadyAt(future.Add(time.Second)); !got.IsZero() {
+		t.Errorf("NextRetryReadyAt after window = %v; want zero", got)
+	}
+}
+
+func TestMarkSegmentForRetry_IncrementsAttemptsAndPersistsError(t *testing.T) {
+	t0 := time.UnixMilli(0).UTC()
+	j, _ := NewJob(NewJobParams{
+		NZBHash: "x", Name: "x",
+		Files: []NewFileParams{{
+			Filename: "f.bin", SizeBytes: 10,
+			Segments: []NewSegmentParams{{SeqIndex: 1, MessageID: "m@host", Bytes: 10}},
+		}},
+	}, t0)
+	id := SegmentID(1)
+	for _, f := range j.files {
+		for _, s := range f.segments {
+			s.SetID(id)
+			id++
+		}
+	}
+
+	at := t0.Add(30 * time.Second)
+	if err := j.MarkSegmentForRetry(1, at, "boom"); err != nil {
+		t.Fatalf("MarkSegmentForRetry: %v", err)
+	}
+	_, s := j.SegmentByID(1)
+	if s.Attempts() != 1 {
+		t.Errorf("Attempts = %d; want 1", s.Attempts())
+	}
+	if s.LastError() != "boom" {
+		t.Errorf("LastError = %q; want boom", s.LastError())
+	}
+	if !s.NextRetryAt().Equal(at) {
+		t.Errorf("NextRetryAt = %v; want %v", s.NextRetryAt(), at)
+	}
+	if s.State() != SegmentStatePending {
+		t.Errorf("state = %s; want pending", s.State())
 	}
 }

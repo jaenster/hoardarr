@@ -482,24 +482,91 @@ func (j *Job) ResetInflightToPending() int {
 	return n
 }
 
-// PendingSegments returns segments awaiting dispatch. Useful for the
-// orchestrator's per-job loop. When fetch_recovery_vols is false,
-// segments belonging to recovery-vol files are hidden — repair will
-// flip the flag (via RequestRecoveryVols) and a re-entry of the
-// orchestrator picks them up at that point.
-func (j *Job) PendingSegments() []*Segment {
+// PendingSegments returns segments awaiting dispatch whose retry
+// window has elapsed (`next_retry_at <= now`). Segments whose
+// `next_retry_at` is still in the future are *deferred* — they remain
+// in state=pending in the DB but are intentionally hidden so the
+// orchestrator's worker pool doesn't burn capacity re-fetching
+// articles whose servers just rejected them for being over-conns.
+// Callers wanting to know whether deferred work exists (and when) ask
+// NextRetryReadyAt separately.
+//
+// When fetch_recovery_vols is false, segments belonging to recovery-
+// vol files are hidden — repair will flip the flag (via
+// RequestRecoveryVols) and a re-entry of the orchestrator picks them
+// up at that point.
+func (j *Job) PendingSegments(now time.Time) []*Segment {
 	var out []*Segment
 	for _, f := range j.files {
 		if f.isRecoveryVol && !j.fetchRecoveryVols {
 			continue
 		}
 		for _, s := range f.segments {
-			if s.state == SegmentStatePending {
-				out = append(out, s)
+			if s.state != SegmentStatePending {
+				continue
 			}
+			// Zero next_retry_at means "never been retried" → ready.
+			// Otherwise compare: the segment is ready when its retry
+			// window has elapsed.
+			if !s.nextRetryAt.IsZero() && s.nextRetryAt.After(now) {
+				continue
+			}
+			out = append(out, s)
 		}
 	}
 	return out
+}
+
+// NextRetryReadyAt returns the earliest instant at which a currently
+// deferred pending segment becomes ready (i.e. `next_retry_at > now`
+// today, but `<= now` after the returned time has passed). Returns
+// the zero time if nothing is deferred — the orchestrator interprets
+// that as "no deferred work left, you can exit".
+//
+// Recovery-vol gating mirrors PendingSegments so the orchestrator
+// doesn't sleep waiting for vols it isn't supposed to fetch.
+func (j *Job) NextRetryReadyAt(now time.Time) time.Time {
+	var earliest time.Time
+	for _, f := range j.files {
+		if f.isRecoveryVol && !j.fetchRecoveryVols {
+			continue
+		}
+		for _, s := range f.segments {
+			if s.state != SegmentStatePending {
+				continue
+			}
+			if s.nextRetryAt.IsZero() || !s.nextRetryAt.After(now) {
+				continue
+			}
+			if earliest.IsZero() || s.nextRetryAt.Before(earliest) {
+				earliest = s.nextRetryAt
+			}
+		}
+	}
+	return earliest
+}
+
+// MarkSegmentForRetry flips a segment back to pending with a future
+// next_retry_at, so the orchestrator's poll loop will skip it until
+// `at` has passed — even across a process restart. Used when a fetch
+// attempt failed with a transient error (conn-limit, 5xx, network
+// hiccup) and we've decided to defer rather than burn the segment's
+// remaining retry budget right now.
+//
+// Returns an error if the id isn't part of this job. The segment must
+// not already be in a terminal state — terminal-state segments don't
+// re-enter the retry queue (use MarkSegmentMissing/MarkSegmentFailed
+// for those instead).
+func (j *Job) MarkSegmentForRetry(segID SegmentID, at time.Time, errMsg string) error {
+	_, s := j.SegmentByID(segID)
+	if s == nil {
+		return fmt.Errorf("segment %d not in job %d", segID, j.id)
+	}
+	if s.state.IsTerminal() {
+		return nil
+	}
+	s.MarkPendingRetry(at, errMsg)
+	return nil
 }
 
 // allSegmentsResolved reports whether every segment has reached a
