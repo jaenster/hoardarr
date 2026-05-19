@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -63,17 +64,82 @@ func listDataFiles(dir string) ([]dirEntry, error) {
 	return out, nil
 }
 
-// deobfuscateRename is the no-PAR2 safety net: when a release lands
-// with an obfuscated largest file (e.g. 32-hex name) and we have no
-// PAR2 metadata to tell us the original, rename to the job's NZB-
-// derived name. Multiple guards (excluded ext, disc-structure,
-// minimum size, ratio over second-largest, regex obfuscation match)
-// prevent this from ever firing on a hand-named release.
+// par2SetName extracts the release-name prefix that a PAR2 set's
+// filenames share. Given e.g. ["Chicago.Med.S11E21.XviD-AFG.par2",
+// "Chicago.Med.S11E21.XviD-AFG.vol-01.par2", ...] this returns
+// "Chicago.Med.S11E21.XviD-AFG".
+//
+// Obfuscated releases routinely have an obfuscated NZB-level name
+// (the bot that posted them strips meaningful text from the file
+// names of the binary parts) BUT keep the canonical release name in
+// the PAR2 set filenames — the latter encode the recovery-set name
+// the producer used at par2create time, which is the human label.
+// SAB exploits this; we do too. Falls back to "" if the input list
+// has no .par2 entries or their prefixes don't agree.
+func par2SetName(par2Filenames []string) string {
+	var names []string
+	for _, n := range par2Filenames {
+		s := strings.TrimSuffix(strings.ToLower(filepath.Base(n)), ".par2")
+		// Strip the SAB-style .vol-NN[-MM]/.volNN+MM suffixes.
+		s = trimVolSuffix(s)
+		if s == "" {
+			continue
+		}
+		names = append(names, s)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	// All entries must agree, else we don't trust the inference.
+	prefix := names[0]
+	for _, n := range names[1:] {
+		if n != prefix {
+			return ""
+		}
+	}
+	// Return with original case if possible — find a par2Filename
+	// whose lowered+trimmed form matches prefix and return its
+	// pre-lower base name minus the suffix.
+	for _, n := range par2Filenames {
+		base := strings.TrimSuffix(filepath.Base(n), ".par2")
+		baseTrim := trimVolSuffix(base)
+		if strings.ToLower(baseTrim) == prefix {
+			return baseTrim
+		}
+	}
+	return prefix
+}
+
+// volSuffixRe matches every PAR2 recovery-vol naming convention we've
+// seen in the wild: "foo.vol000+01", "foo.vol000-001", "foo.vol-01",
+// "foo.vol01". Strips them so the leading file basename surfaces.
+var volSuffixRe = regexp.MustCompile(`\.vol\d+([+-]\d+)?$|\.vol-?\d+$`)
+
+func trimVolSuffix(s string) string {
+	return volSuffixRe.ReplaceAllString(s, "")
+}
+
+// deobfuscateRename is the safety net for releases that land with an
+// obfuscated largest file (e.g. 32-hex name). Picks the best
+// human-readable target name and renames the largest data file to
+// it, guarded by:
+//
+//   - excluded extensions (sample / proof / archive parts skipped)
+//   - disc-structure detection (VIDEO_TS dirs left alone)
+//   - 10 MiB minimum size (sidecars never get renamed)
+//   - 3x ratio over second-largest (multi-data-file releases pass through)
+//   - obfuscation heuristic on the current name (hand-named files pass)
+//
+// Name preference, in order: the PAR2 set name (if not itself
+// obfuscated), then the NZB-derived job name. Obfuscated releases
+// frequently have an obfuscated NZB-level name AND obfuscated data
+// filenames, but keep the canonical release name in their
+// "<release>.vol-NN.par2" filenames — that's the most reliable
+// label when present. SAB exploits this; we do too.
 //
 // Returns the new path if a rename happened (for logging), or "" if
-// no rename was warranted. Errors only on filesystem failure during
-// the rename itself; "decided not to rename" is not an error.
-func deobfuscateRename(dir, jobName string, logger *slog.Logger) (string, error) {
+// no rename was warranted.
+func deobfuscateRename(dir, jobName, parSetName string, logger *slog.Logger) (string, error) {
 	if isDiscStructure(dir) {
 		logger.Debug("deobfuscate: disc structure detected, skipping", "dir", dir)
 		return "", nil
@@ -122,8 +188,16 @@ func deobfuscateRename(dir, jobName string, logger *slog.Logger) (string, error)
 		return "", nil
 	}
 
+	// Pick the rename target: PAR2 set name (more reliable on
+	// obfuscated releases) wins over the NZB-derived job name as
+	// long as it's a recognisable hand-shaped name itself.
+	targetName := jobName
+	if parSetName != "" && !isProbablyObfuscated(parSetName) {
+		targetName = parSetName
+	}
+
 	ext := filepath.Ext(largest.path)
-	target := filepath.Join(filepath.Dir(largest.path), sanitizeFilename(jobName)+ext)
+	target := filepath.Join(filepath.Dir(largest.path), sanitizeFilename(targetName)+ext)
 	if target == largest.path {
 		return "", nil
 	}

@@ -347,7 +347,16 @@ func (s *Service) runDelivery(ctx context.Context, jobID download.JobID) error {
 	// the original layout), then strip samples (frees up the "single
 	// non-sample folder" shape collapse looks for), then collapse a
 	// redundant outer wrap.
-	if _, err := deobfuscateRename(targetDir, job.Name(), s.logger); err != nil {
+	// Build the PAR2 set name from job's par2 filenames so the
+	// deobfuscate rename can prefer it over an obfuscated job.Name().
+	var par2Names []string
+	for _, f := range job.Files() {
+		if f.IsPar2() {
+			par2Names = append(par2Names, f.Filename())
+		}
+	}
+	parSet := par2SetName(par2Names)
+	if _, err := deobfuscateRename(targetDir, job.Name(), parSet, s.logger); err != nil {
 		s.logger.Warn("deliver: deobfuscate rename failed",
 			"job_id", jobID, "dir", targetDir, "err", err)
 	}

@@ -33,7 +33,7 @@ func TestDeobfuscateRename_RenamesObfuscatedLargest(t *testing.T) {
 	// Tiny sidecar that won't compete for largest.
 	writeFile(t, filepath.Join(dir, "info.txt"), 200)
 
-	newPath, err := deobfuscateRename(dir, "Great.Movie.2020", newQuietLogger())
+	newPath, err := deobfuscateRename(dir, "Great.Movie.2020", "", newQuietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestDeobfuscateRename_SkipsHandNamedLargest(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "Some.Movie.2020.1080p.x264.mkv"), 12*1024*1024)
 
-	newPath, err := deobfuscateRename(dir, "Other.Name", newQuietLogger())
+	newPath, err := deobfuscateRename(dir, "Other.Name", "", newQuietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestDeobfuscateRename_SkipsDiscStructure(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(dir, "VIDEO_TS", "abcdef1234567890abcdef1234567890.vob"), 12*1024*1024)
 
-	newPath, err := deobfuscateRename(dir, "Original.Movie", newQuietLogger())
+	newPath, err := deobfuscateRename(dir, "Original.Movie", "", newQuietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestDeobfuscateRename_SkipsWhenComparableSiblings(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "abcdef1234567890abcdef1234567890.mkv"), 12*1024*1024)
 	writeFile(t, filepath.Join(dir, "fedcba0987654321fedcba0987654321.mkv"), 11*1024*1024)
 
-	newPath, err := deobfuscateRename(dir, "Series.Pack", newQuietLogger())
+	newPath, err := deobfuscateRename(dir, "Series.Pack", "", newQuietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +96,90 @@ func TestDeobfuscateRename_SkipsTooSmall(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "abcdef1234567890abcdef1234567890.mkv"), 5*1024*1024) // under 10 MiB
 
-	newPath, err := deobfuscateRename(dir, "Tiny", newQuietLogger())
+	newPath, err := deobfuscateRename(dir, "Tiny", "", newQuietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if newPath != "" {
 		t.Fatalf("under-min-size file should not be renamed")
+	}
+}
+
+func TestPar2SetName(t *testing.T) {
+	cases := map[string]struct {
+		in   []string
+		want string
+	}{
+		"sab style vol-NN": {
+			in: []string{
+				"Chicago.Med.S11E21.XviD-AFG.par2",
+				"Chicago.Med.S11E21.XviD-AFG.vol-01.par2",
+				"Chicago.Med.S11E21.XviD-AFG.vol-02.par2",
+				"Chicago.Med.S11E21.XviD-AFG.vol-07.par2",
+			},
+			want: "Chicago.Med.S11E21.XviD-AFG",
+		},
+		"par2cmdline style vol+NN": {
+			in: []string{
+				"Some.Release.par2",
+				"Some.Release.vol000+01.par2",
+				"Some.Release.vol001+02.par2",
+			},
+			want: "Some.Release",
+		},
+		"par2cmdline style vol-NN range": {
+			in: []string{
+				"Movie.2020.par2",
+				"Movie.2020.vol000-001.par2",
+				"Movie.2020.vol002-007.par2",
+			},
+			want: "Movie.2020",
+		},
+		"disagreeing prefixes returns empty": {
+			in: []string{
+				"Show.A.par2",
+				"Show.B.vol-01.par2",
+			},
+			want: "",
+		},
+		"empty input returns empty": {
+			in:   nil,
+			want: "",
+		},
+		"obfuscated set name returns the obfuscated string (caller filters)": {
+			in: []string{
+				"abcdef1234567890abcdef1234567890.par2",
+				"abcdef1234567890abcdef1234567890.vol-01.par2",
+			},
+			want: "abcdef1234567890abcdef1234567890",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := par2SetName(tc.in)
+			if got != tc.want {
+				t.Errorf("par2SetName(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeobfuscateRename_PrefersPar2SetName(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "abcdef1234567890abcdef1234567890.mkv"), 12*1024*1024)
+
+	// jobName is obfuscated; parSetName is the real release name.
+	newPath, err := deobfuscateRename(
+		dir,
+		"xB9UmnVrVGWCcoAXsTktt8alQBewFvZH", // obfuscated NZB-level name
+		"Chicago.Med.S11E21.XviD-AFG",      // PAR2 set name (hand-named)
+		newQuietLogger(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(newPath) != "Chicago.Med.S11E21.XviD-AFG.mkv" {
+		t.Fatalf("renamed to %q, expected Chicago.Med.S11E21.XviD-AFG.mkv", filepath.Base(newPath))
 	}
 }
 
