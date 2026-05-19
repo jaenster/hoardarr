@@ -1,4 +1,6 @@
 // Package slack implements notify.Sender for Slack incoming webhooks.
+// The bus envelope is normalised by internal/adapter/notify/render and
+// poured into Slack's block-kit shape.
 //
 // Spec reference: https://api.slack.com/messaging/webhooks
 //
@@ -14,8 +16,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/jaenster/hoardarr/internal/adapter/notify/render"
 	"github.com/jaenster/hoardarr/internal/domain/event"
 	"github.com/jaenster/hoardarr/internal/domain/notify"
 )
@@ -41,7 +45,7 @@ func NewWithClient(c *http.Client) *Sender {
 
 // Send formats env as Slack blocks and POSTs it to sub.URL.
 func (s *Sender) Send(ctx context.Context, sub *notify.Subscription, env event.Envelope) error {
-	body, err := json.Marshal(slackPayload(sub, env))
+	body, err := json.Marshal(buildPayload(sub, env))
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
@@ -66,77 +70,133 @@ func (s *Sender) Send(ctx context.Context, sub *notify.Subscription, env event.E
 	return errors.New("slack: status " + resp.Status)
 }
 
-func slackPayload(sub *notify.Subscription, env event.Envelope) map[string]any {
-	title := titleFor(env.Topic)
-	body := summarise(env)
-	// `text` is fallback for notifications / mobile push (block_kit
-	// docs require it for accessibility).
-	fallback := fmt.Sprintf("%s — %s", title, body)
-	return map[string]any{
-		"text": fallback,
-		"blocks": []map[string]any{
-			{
-				"type": "section",
-				"text": map[string]any{
-					"type": "mrkdwn",
-					"text": fmt.Sprintf("*%s*\n%s", title, body),
-				},
+// buildPayload turns a bus envelope into Slack's webhook body. We emit
+// header + section (with the verb + release) + a 2-col fields section
+// + a context footer. Slack doesn't support per-message colour without
+// the deprecated `attachments` shape, so the colour comes through as a
+// leading emoji in the header.
+func buildPayload(sub *notify.Subscription, env event.Envelope) map[string]any {
+	v := render.From(env)
+
+	title := v.CleanTitle
+	if title == "" {
+		title = v.Verb
+	}
+	header := outcomeEmoji(v.Outcome) + " " + title
+
+	// `text` is the fallback for notifications / mobile push (block_kit
+	// docs require it for accessibility). Render a one-line summary.
+	fallback := fmt.Sprintf("%s — %s", v.Verb, v.Release)
+	if v.Release == "" {
+		fallback = v.Verb
+	}
+
+	blocks := []map[string]any{
+		{
+			"type": "header",
+			"text": map[string]any{
+				"type": "plain_text",
+				"text": truncate(header, 150),
 			},
-			{
-				"type": "context",
-				"elements": []map[string]any{
-					{"type": "mrkdwn", "text": "`" + env.Topic + "`"},
-					{"type": "mrkdwn", "text": "hoardarr • " + sub.Name()},
-				},
+		},
+		{
+			"type": "section",
+			"text": map[string]any{
+				"type": "mrkdwn",
+				"text": sectionBody(v),
 			},
 		},
 	}
-}
+	if fields := slackFields(v); len(fields) > 0 {
+		blocks = append(blocks, map[string]any{
+			"type":   "section",
+			"fields": fields,
+		})
+	}
+	if v.ErrorMsg != "" {
+		blocks = append(blocks, map[string]any{
+			"type": "section",
+			"text": map[string]any{
+				"type": "mrkdwn",
+				"text": "*Error*\n```" + truncate(v.ErrorMsg, 1000) + "```",
+			},
+		})
+	}
+	blocks = append(blocks, map[string]any{
+		"type": "context",
+		"elements": []map[string]any{
+			{"type": "mrkdwn", "text": "`" + env.Topic + "`"},
+			{"type": "mrkdwn", "text": "hoardarr • " + sub.Name() + " • " + env.OccurredAt.Format(time.RFC3339)},
+		},
+	})
 
-// titleFor / summarise duplicate Discord's mappings; copying inline
-// is cheaper than a notify-helpers package given there are only two
-// adapters that need this today.
-func titleFor(topic string) string {
-	switch topic {
-	case "download.job.completed":
-		return "Job completed"
-	case "download.job.failed", "download.job.download_failed":
-		return "Job failed"
-	case "verify.repair_needed":
-		return "Repair needed"
-	case "verify.ok":
-		return "Verify ok"
-	case "verify.failed":
-		return "Verify failed"
-	case "repair.ok":
-		return "Repair ok"
-	case "repair.failed":
-		return "Repair failed"
-	case "deliver.complete":
-		return "Delivered"
-	case "deliver.failed":
-		return "Delivery failed"
-	case "extract.complete":
-		return "Extract complete"
-	case "extract.failed":
-		return "Extract failed"
-	case "notify.test":
-		return "Test notification"
-	default:
-		return topic
+	return map[string]any{
+		"text":   fallback,
+		"blocks": blocks,
 	}
 }
 
-func summarise(env event.Envelope) string {
-	var p map[string]any
-	_ = json.Unmarshal(env.Payload, &p)
-	for _, k := range []string{"name", "filename", "release"} {
-		if v, ok := p[k].(string); ok && v != "" {
-			return v
+// sectionBody is the main section: bold verb, then the raw release in
+// a code block for copyability.
+func sectionBody(v render.View) string {
+	body := "*" + v.Verb + "*"
+	if v.Release != "" {
+		body += "\n```" + v.Release + "```"
+	}
+	return body
+}
+
+// slackFields returns the 2-col grid of Source/Category/Size/etc as
+// Slack mrkdwn fields. Empty values are skipped.
+func slackFields(v render.View) []map[string]any {
+	type kv struct{ key, val string }
+	pairs := []kv{
+		{"Source", v.Source},
+		{"Category", v.Category},
+		{"Size", v.SizeHuman},
+		{"Files", fileCountStr(v.FileCount)},
+		{"Quality", v.Quality},
+		{"State", v.State},
+	}
+	out := make([]map[string]any, 0, len(pairs))
+	for _, p := range pairs {
+		if p.val == "" {
+			continue
 		}
+		out = append(out, map[string]any{
+			"type": "mrkdwn",
+			"text": "*" + p.key + "*\n" + p.val,
+		})
 	}
-	if errMsg, ok := p["err"].(string); ok && errMsg != "" {
-		return errMsg
+	return out
+}
+
+func fileCountStr(n int) string {
+	if n <= 0 {
+		return ""
 	}
-	return "Aggregate " + env.AggregateID
+	return strconv.Itoa(n)
+}
+
+// outcomeEmoji is the leading marker used in the Slack header. Slack
+// has no per-message colour without `attachments`, so emoji is the
+// next-best signalling channel.
+func outcomeEmoji(o render.Outcome) string {
+	switch o {
+	case render.OutcomeOK:
+		return "✅"
+	case render.OutcomeFail:
+		return "❌"
+	case render.OutcomeWarn:
+		return "⚠️"
+	default:
+		return "ℹ️"
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
