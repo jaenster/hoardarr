@@ -36,12 +36,15 @@ func jobToSABSlotWithETA(j *download.Job, perJobBytesPerSec int64) map[string]an
 	if perJobBytesPerSec > 0 && bytesLeft > 0 && j.State() == download.JobStateDownloading {
 		secs := bytesLeft / perJobBytesPerSec
 		timeLeft = formatSABHMS(secs)
-		etaStr = time.Now().Add(time.Duration(secs) * time.Second).Format("Mon 15:04")
+		// Real SAB v3 ETA format: "15:04 Mon 02 Jan". Sonarr's parser
+		// expects this exact shape. The old "Mon 15:04" form parses to
+		// a zero time and Sonarr's stuck-download heuristic kicks in.
+		etaStr = time.Now().Add(time.Duration(secs) * time.Second).Format("15:04 Mon 02 Jan")
 	}
 
 	return map[string]any{
 		"index":         0,
-		"nzo_id":        nzoID(j.ID()),
+		"nzo_id":        nzoIDWithHash(j.ID(), j.NZBHash()),
 		"unpackopts":    "3",
 		"priority":      priorityToSAB(j.Priority()),
 		"script":        "None",
@@ -62,7 +65,7 @@ func jobToSABSlotWithETA(j *download.Job, perJobBytesPerSec int64) map[string]an
 		"labels":        []string{},
 		"password":      "",
 		"direct_unpack": nil, // SAB: int progress or null
-		"time_added":    formatTimeISO(j.AddedAt()),
+		"time_added":    sabTimeAdded(j.AddedAt()),
 		"_doneMB":       doneMB,
 	}
 }
@@ -91,7 +94,7 @@ func jobToSABHistorySlot(j *download.Job, completeDir string) map[string]any {
 	}
 	return map[string]any{
 		"id":            int64(j.ID()),
-		"nzo_id":        nzoID(j.ID()),
+		"nzo_id":        nzoIDWithHash(j.ID(), j.NZBHash()),
 		"name":          j.Name(),
 		"nzb_name":      j.Name() + ".nzb",
 		"category":      catOrStar(j.Category()),
@@ -123,21 +126,44 @@ func jobToSABHistorySlot(j *download.Job, completeDir string) map[string]any {
 		"loaded":         false,
 		"retry":          false,
 		"archive":        false,
-		"time_added":     formatTimeISO(j.AddedAt()),
+		"time_added":     sabTimeAdded(j.AddedAt()),
 	}
 }
 
+// priorityToSAB maps our integer priority to the *string name* real
+// SAB v3.7.x returns in queue.slot.priority. SAB clients (the *arr
+// suite included) parse this string-side; returning "0"/"1"/"-1"
+// like we used to confuses Sonarr's queue tracker badly enough that
+// it issues a queue.delete on the just-grabbed entry within seconds.
+//
+// SAB's integer-to-name table (from sabnzbd/constants.py):
+//   DEFAULT_PRIORITY = -100  → "Default"
+//   PAUSED_PRIORITY  = -2    → "Paused"
+//   STOP_PRIORITY    = -4    → "Stop"
+//   DUP_PRIORITY     = -3    → "Duplicate"
+//   REPAIR_PRIORITY  = -2    → "Repair"
+//   LOW_PRIORITY     = -1    → "Low"
+//   NORMAL_PRIORITY  = 0     → "Normal"
+//   HIGH_PRIORITY    = 1     → "High"
+//   FORCE_PRIORITY   = 2     → "Force"
 func priorityToSAB(p int) string {
-	// SAB ints: -100=Default, -3=Stop, -2=Repair, -1=Force, 0=Normal,
-	// 1=High, 2=High++. Our scale matches the standard normal/high split
-	// directly enough for *arr's default priority=normal.
 	switch {
+	case p <= -100:
+		return "Default"
+	case p == -4:
+		return "Stop"
+	case p == -3:
+		return "Duplicate"
+	case p == -2:
+		return "Repair"
 	case p < 0:
-		return "-1"
-	case p > 0:
-		return "1"
+		return "Low"
+	case p == 0:
+		return "Normal"
+	case p == 1:
+		return "High"
 	default:
-		return "0"
+		return "Force"
 	}
 }
 
@@ -268,12 +294,22 @@ func unixOrZero(t time.Time) int64 {
 	return t.Unix()
 }
 
-// formatTimeISO emits an RFC3339 string for SAB's `time_added` slot
-// field. Returns an empty string for the zero time so consumers can
-// distinguish "never set".
+// formatTimeISO is kept for any callers still wanting RFC3339;
+// SAB-shaped responses should use sabTimeAdded instead.
 func formatTimeISO(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
 	return t.Format(time.RFC3339)
+}
+
+// sabTimeAdded emits the wire shape SAB v3.7.x uses for `time_added`
+// in queue + history slots: a unix-seconds *number* (not a string,
+// not ISO). Some Sonarr versions silently treat an ISO string here
+// as zero and trip downstream stuck-download heuristics.
+func sabTimeAdded(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
 }

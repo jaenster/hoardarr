@@ -25,6 +25,7 @@
 package sab
 
 import (
+	"context"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
@@ -209,7 +210,7 @@ func (h *Handler) modeAddFile(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  true,
-		"nzo_ids": []string{nzoID(id)},
+		"nzo_ids": []string{h.nzoIDForJob(r.Context(), id)},
 	})
 }
 
@@ -477,7 +478,7 @@ func (h *Handler) modeAddURL(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":  true,
-		"nzo_ids": []string{nzoID(id)},
+		"nzo_ids": []string{h.nzoIDForJob(r.Context(), id)},
 	})
 }
 
@@ -643,17 +644,64 @@ func firstFormFile(r *http.Request, names ...string) (file interface {
 	return nil, "", errors.New("no nzb file part (expected name= or nzbfile=)")
 }
 
+// nzoIDForJob is the addfile / addurl response helper. Looks up the
+// just-saved Job to pick up its NZB hash, so the returned nzo_id is
+// unique per creation even when SQLite reuses a previous id slot.
+// Falls back to bare-id encoding if the lookup fails for any reason
+// (the client still gets a valid SAB-shaped nzo_id; it'll just lose
+// the per-creation disambiguator, which only matters for Sonarr's
+// stale-grab-deletes — a rare edge case).
+func (h *Handler) nzoIDForJob(ctx context.Context, id download.JobID) string {
+	if id == 0 {
+		return nzoID(id)
+	}
+	if h.Queue == nil {
+		return nzoID(id)
+	}
+	j, err := h.Queue.Get(ctx, id)
+	if err != nil || j == nil {
+		return nzoID(id)
+	}
+	return nzoIDWithHash(id, j.NZBHash())
+}
+
 // nzoID encodes a JobID into SAB's opaque "SABnzbd_nzo_<base32>" format.
 // We use base32 (no padding) because SAB nzo_ids are typed and pasted
 // freely; '+' / '/' from base64 would cause URL-encoding hassles.
+//
+// Encoding shape: base32("<jobID>:<first-8-of-nzbHash>"). The hash
+// suffix makes the nzo_id unique per *creation*, not per id. SQLite's
+// INTEGER PRIMARY KEY without AUTOINCREMENT reuses deleted ids; with
+// the bare id-only encoding, Sonarr's per-grab history (keyed on
+// downloadId) would match a stale failed entry to the new fresh job
+// and call DownloadEventHub.RemoveItem on it within seconds. Adding
+// the hash makes each creation distinct.
+//
+// Backwards-compat: jobIDFromNZO accepts both shapes so existing
+// in-flight grabs and bookmarked nzo_ids keep working after upgrade.
 func nzoID(id download.JobID) string {
-	b := []byte(strconv.FormatInt(int64(id), 10))
-	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)
+	return nzoIDWithHash(id, "")
+}
+
+// nzoIDWithHash is the canonical encoder. hash may be empty (rare —
+// only for tests / fallback paths); when non-empty the first 8 chars
+// are appended to disambiguate from prior creations with the same id.
+func nzoIDWithHash(id download.JobID, hash string) string {
+	payload := strconv.FormatInt(int64(id), 10)
+	if h := strings.ToLower(strings.TrimSpace(hash)); h != "" {
+		if len(h) > 8 {
+			h = h[:8]
+		}
+		payload = payload + ":" + h
+	}
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(payload))
 	return "SABnzbd_nzo_" + enc
 }
 
 // jobIDFromNZO is the inverse of nzoID. Returns an error for inputs
-// that don't match the expected prefix or fail to decode.
+// that don't match the expected prefix or fail to decode. Tolerates
+// both the new "<id>:<hash8>" and the old "<id>" shapes so an upgrade
+// doesn't invalidate in-flight grabs.
 func jobIDFromNZO(s string) (download.JobID, error) {
 	const prefix = "SABnzbd_nzo_"
 	if !strings.HasPrefix(s, prefix) {
@@ -664,7 +712,12 @@ func jobIDFromNZO(s string) (download.JobID, error) {
 	if err != nil {
 		return 0, fmt.Errorf("base32: %w", err)
 	}
-	id, err := strconv.ParseInt(string(b), 10, 64)
+	// Split on ":" to drop the optional hash suffix.
+	idStr := string(b)
+	if i := strings.IndexByte(idStr, ':'); i >= 0 {
+		idStr = idStr[:i]
+	}
+	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("parse: %w", err)
 	}
