@@ -22,6 +22,15 @@ PUID=${PUID:-1000}
 PGID=${PGID:-1000}
 TZ=${TZ:-Etc/UTC}
 
+# If the container was started already non-root (e.g. compose's
+# `user: "1026:100"`), the operator has opted into explicit-uid
+# bind-mount semantics and the linuxserver-style shim is moot —
+# none of the root-only setup below works without root, and the
+# trailing su-exec would fail. Hand straight off to the binary.
+if [ "$(id -u)" != "0" ]; then
+    exec /usr/local/bin/hoardarr "$@"
+fi
+
 # Set the container timezone so Go's `time` package picks it up,
 # slog timestamps render correctly, and webhook payloads ship
 # operator-local times.
