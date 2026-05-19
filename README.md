@@ -9,10 +9,73 @@
 Point Sonarr / Radarr / Lidarr / Readarr / Prowlarr at `/sabnzbd/api`
 and they don't know the difference.
 
+## What it does
+
+- **Drop-in SABnzbd replacement.** Implements the SAB v3 API the *arr
+  suite calls. Change the host in Sonarr's download-client settings
+  and you're done; no other client-side config changes.
+- **Sonarr/Radarr-style UI.** Dark theme, drag-reorder queue, live
+  per-segment progress over SSE, per-job timeline, per-file explorer.
+  No SABnzbd 2010-era page reloads.
+- **Wire-level from scratch.** NNTP, yEnc, NZB parsing and PAR2
+  (verify + Reed-Solomon repair over GF(2^16)) are all native Go.
+  The only external dep in the data path is `nwaples/rardecode` for
+  multi-part RAR.
+- **Pure-Go single binary.** `CGO_ENABLED=0`, `modernc.org/sqlite`,
+  embedded React frontend. One ~12 MB binary, one container image.
+- **Multi-server with priority tiers + metered providers.** Block
+  accounts kick in only after a missing-article 430 from primaries;
+  byte counters persist across restarts so monthly caps are honoured.
+- **Operator-friendly.** Health-check banner, scheduled tasks, on-demand
+  Commands, durable scheduled backups, log-file rotation + download,
+  per-path disk-space surface. Sonarr's `Settings → System` feature set
+  on day one.
+- **Webhooks + notifications.** Outbox-backed event bus delivers to
+  Discord / Slack / Pushover / generic webhook with HMAC + retry.
+- **Reverse-proxy aware.** URL-base sentinel rewrite means one binary
+  works at `/`, `/hoardarr`, or any other mount path without a rebuild.
+- **Verifiable releases.** Every image and tarball is signed with
+  sigstore-keyless via GitHub Actions provenance (SLSA build level 3).
+
 ![Settings](docs/img/settings-servers.png)
 ![Job detail](docs/img/job-detail.png)
 ![Activity](docs/img/activity.png)
 ![History](docs/img/history.png)
+
+## How does it compare to SABnzbd and NZBGet?
+
+Honest positioning — pick the row that matches what you actually care about.
+
+| | hoardarr | SABnzbd | NZBGet |
+|-|-|-|-|
+| Language | Go (pure, no cgo) | Python | C++ |
+| Binary size | ~12 MB | ~50 MB + Python runtime | ~5 MB |
+| Memory at idle | ~30 MB | ~80 MB | ~20 MB |
+| UI | Sonarr/Radarr-style, dark, live SSE | Original 2010s template | Bootstrap, dated |
+| SAB API drop-in | Yes (`/sabnzbd/api`) | Native | Compat shim |
+| Sonarr/Radarr | Drop-in | Native | Drop-in |
+| PAR2 verify + repair | Native Go | par2cmdline (external) | Built-in C++ |
+| RAR extraction | `nwaples/rardecode` (Go) | `unrar` (external) | Built-in C++ |
+| Per-segment retry budget | Yes (durable across restart) | Global queue retry | Per-job retry |
+| Multi-server priority + backup | Yes | Yes | Yes |
+| Metered providers (byte caps) | Yes (persisted) | No | No |
+| Webhooks | Native (HMAC + outbox retry) | Notification scripts | RPC |
+| Auth | Bcrypt sessions + API key + CSRF + rate-limit | Username/password | Username/password |
+| Reverse-proxy URL base | Live-editable from UI | Restart required | Restart required |
+| Database | SQLite (WAL, transactional outbox) | SQLite | SQLite |
+| Backups | Built-in scheduled `VACUUM INTO` + UI | Manual | Manual |
+| Health checks | Sonarr-style banner | None | None |
+| Release signing | Sigstore-keyless (SLSA L3) | None | None |
+| License | MIT | GPL-2.0 | GPL-2.0 |
+| Maturity | Pre-1.0, production-tested against *arr suite | Mature, since 2007 | Mature, since 2004 |
+
+Pick **SABnzbd** if you want the most mature option with the largest
+script ecosystem and you don't mind the Python deploy footprint.
+Pick **NZBGet** if you want minimal RAM/CPU above all else and the
+older UI doesn't bother you.
+Pick **hoardarr** if you want a modern *arr-aesthetic UI, a one-binary
+container deploy with no external tools, and don't need third-party
+post-processing scripts (yet — script hooks are on the roadmap).
 
 ## Supported architectures
 
@@ -134,6 +197,13 @@ gh attestation verify hoardarr_0.1.2_linux_amd64.tar.gz \
 A pass means the artifact was built by hoardarr's own GitHub Actions
 workflow from the matching git tag.
 
+## REST API
+
+The full `/api/v1/*` surface (auth, queue, history, servers, system,
+commands, webhooks, SSE topics) is documented at
+[`docs/api.md`](docs/api.md). The SAB-compat shim at `/sabnzbd/api` is
+covered there too.
+
 ## Reverse proxy
 
 hoardarr speaks plain HTTP by design. For HTTPS, put nginx / Caddy /
@@ -182,6 +252,60 @@ empty URL Base makes the `Test` button fail with a misleading
 Full walk-through (per-app categories, common test-failure diagnostics,
 running side-by-side with SABnzbd, etc.):
 [**`docs/coming-from-sabnzbd.md`**](docs/coming-from-sabnzbd.md).
+
+## FAQ
+
+**Will Sonarr / Radarr / Lidarr / Readarr / Prowlarr actually work with this?**
+Yes — the SAB v3 API surface they use (`addfile`, `queue`, `history`,
+`get_config`, `get_cats`, `addurl`, `eval_sort`, etc.) is implemented at
+`/sabnzbd/api`. The end-to-end test suite drives the real *arr clients
+against a live hoardarr in CI.
+
+**Can I import my SABnzbd config?**
+Not automatically. You'll need to re-add usenet servers and categories
+in the UI (or via the REST API). NZB queue/history is provider-state,
+not transferable.
+
+**Can I run hoardarr alongside SABnzbd?**
+Yes — they bind to different ports by default (`8085` vs `8080`). Useful
+for evaluation: point one Sonarr instance at hoardarr, leave the other
+*arrs on SAB, switch once you're confident.
+
+**Does it support post-processing scripts?**
+Not yet. SAB's hook script protocol is on the roadmap as an outbox event
+subscriber. In the meantime, the webhook subscribers (Discord / Slack /
+Pushover / generic HMAC POST) cover the notification half; full
+"transform the release before delivery" hooks land later.
+
+**Is auth required?**
+Yes. First boot prompts for an admin password. Sessions are bcrypt +
+HTTP-only cookies, rate-limited, with CSRF on mutating endpoints. The
+*arr suite authenticates via API key (rotatable from Settings).
+
+**Pure Go means no cgo means…?**
+The binary is statically linked and cross-compiles cleanly to any
+`GOOS/GOARCH` combo Go supports. No glibc dependency, no
+`apt install par2cmdline`, no `unrar` on the host. The container is
+alpine + the binary + a tiny entrypoint shim.
+
+**Where does state live?**
+Everything except the actual downloaded bytes lives in
+`<data_dir>/hoardarr.db` (SQLite with WAL). Jobs, segments, servers,
+categories, sessions, scheduled tasks, commands, webhook subscribers,
+the outbox — one file. Back up `data/` and you've backed up hoardarr.
+
+**Does it work behind a reverse proxy at a subpath?**
+Yes — set `HOARDARR_URL_BASE=/hoardarr` (or change it live from
+`Settings → General` after first boot). The URL base is a sentinel
+replaced in every served asset, so one binary works at `/`, `/hoardarr`,
+or any other prefix without a rebuild. See `docs/reverse-proxy.md`.
+
+**Is the SQLite single-writer a problem at scale?**
+No, for the scale hoardarr targets. WAL + a 100 ms batched-commit
+drainer keeps writes far under SQLite's contention floor. The
+persistence layer is adapter-pluggable so a Postgres adapter could
+land later, but the bottleneck in practice is NNTP throughput, not
+database I/O.
 
 ## Status
 
