@@ -11,6 +11,8 @@ package system
 import (
 	"context"
 	"log/slog"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -26,6 +28,17 @@ import (
 type Status struct {
 	Service   string
 	Version   string
+	Commit    string
+	BuildDate string
+
+	// Runtime / environment.
+	RuntimeVersion   string // Go version (runtime.Version())
+	OS               string // runtime.GOOS
+	Arch             string // runtime.GOARCH
+	IsDocker         bool
+	DatabaseType     string // "sqlite" today; pluggable in future
+	MigrationVersion int    // highest applied migration id
+
 	StartedAt time.Time
 	Uptime    time.Duration
 
@@ -37,18 +50,18 @@ type Status struct {
 
 // PoolStatus is one Usenet server's pool snapshot.
 type PoolStatus struct {
-	ServerID    domainserver.ServerID
-	ServerName  string
-	Host        string
-	Port        int
-	MaxConns    int
-	InUse       int
-	Idle        int
-	Enabled     bool
-	Backup      bool
-	BillingMode string
-	QuotaBytes  int64
-	UsedBytes   int64
+	ServerID    domainserver.ServerID `json:"server_id"`
+	ServerName  string                `json:"server_name"`
+	Host        string                `json:"host"`
+	Port        int                   `json:"port"`
+	MaxConns    int                   `json:"max_conns"`
+	InUse       int                   `json:"in_use"`
+	Idle        int                   `json:"idle"`
+	Enabled     bool                  `json:"enabled"`
+	Backup      bool                  `json:"backup"`
+	BillingMode string                `json:"billing_mode"`
+	QuotaBytes  int64                 `json:"quota_bytes"`
+	UsedBytes   int64                 `json:"used_bytes"`
 }
 
 // ServerStatRepo is the slice of the server repo system.Service needs
@@ -61,9 +74,12 @@ type ServerStatRepo interface {
 
 // Service composes Status snapshots from authoritative sources.
 type Service struct {
-	version    string
-	startedAt  time.Time
-	jobs       download.JobRepository
+	version          string
+	commit           string
+	buildDate        string
+	migrationVersion int
+	startedAt        time.Time
+	jobs             download.JobRepository
 	// poolsSource returns a fresh pool snapshot on every call.
 	// Reads from the orchestrator's live map so servers added at
 	// runtime show up immediately on /api/v1/system/status — the
@@ -84,9 +100,12 @@ type Service struct {
 
 // Params gathers Service dependencies.
 type Params struct {
-	Version   string
-	StartedAt time.Time
-	Jobs      download.JobRepository
+	Version          string
+	Commit           string
+	BuildDate        string
+	MigrationVersion int
+	StartedAt        time.Time
+	Jobs             download.JobRepository
 	// PoolsSource is a callback that returns the live pool map. Wire
 	// it to OrchestratorService.PoolsSnapshot so hot-wired servers
 	// surface on the System page.
@@ -118,15 +137,18 @@ func New(p Params) *Service {
 		p.Logger = slog.Default()
 	}
 	return &Service{
-		version:     p.Version,
-		startedAt:   p.StartedAt,
-		jobs:        p.Jobs,
-		poolsSource: p.PoolsSource,
-		servers:     p.Servers,
-		throughput:  p.Throughput,
-		bus:         p.Bus,
-		logger:      p.Logger,
-		now:         p.Now,
+		version:          p.Version,
+		commit:           p.Commit,
+		buildDate:        p.BuildDate,
+		migrationVersion: p.MigrationVersion,
+		startedAt:        p.StartedAt,
+		jobs:             p.Jobs,
+		poolsSource:      p.PoolsSource,
+		servers:          p.Servers,
+		throughput:       p.Throughput,
+		bus:              p.Bus,
+		logger:           p.Logger,
+		now:              p.Now,
 	}
 }
 
@@ -346,12 +368,28 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	}
 
 	return Status{
-		Service:     "hoardarr",
-		Version:     s.version,
-		StartedAt:   s.startedAt,
-		Uptime:      now.Sub(s.startedAt),
-		QueueActive: activeCount,
-		QueueTotal:  totalCount,
-		Pools:       pools,
+		Service:          "hoardarr",
+		Version:          s.version,
+		Commit:           s.commit,
+		BuildDate:        s.buildDate,
+		RuntimeVersion:   runtime.Version(),
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		IsDocker:         detectDocker(),
+		DatabaseType:     "sqlite",
+		MigrationVersion: s.migrationVersion,
+		StartedAt:        s.startedAt,
+		Uptime:           now.Sub(s.startedAt),
+		QueueActive:      activeCount,
+		QueueTotal:       totalCount,
+		Pools:            pools,
 	}, nil
+}
+
+// detectDocker uses the presence of /.dockerenv as the cheap signal.
+// Not bulletproof (Podman-without-it slips through; rootless skips
+// the marker on some setups) but matches Sonarr/Radarr's own check.
+func detectDocker() bool {
+	_, err := os.Stat("/.dockerenv")
+	return err == nil
 }

@@ -10,6 +10,7 @@
 package bootstrap
 
 import (
+	"path/filepath"
 	"context"
 	"errors"
 	"fmt"
@@ -30,7 +31,11 @@ import (
 	appauth "github.com/jaenster/hoardarr/internal/app/auth"
 	appdeliver "github.com/jaenster/hoardarr/internal/app/deliver"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
+	appbackup "github.com/jaenster/hoardarr/internal/app/backup"
+	appcommand "github.com/jaenster/hoardarr/internal/app/command"
+	"github.com/jaenster/hoardarr/internal/app/diskspace"
 	appextract "github.com/jaenster/hoardarr/internal/app/extract"
+	apphealth "github.com/jaenster/hoardarr/internal/app/health"
 	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
 	apprepair "github.com/jaenster/hoardarr/internal/app/repair"
 	appschedule "github.com/jaenster/hoardarr/internal/app/schedule"
@@ -50,6 +55,7 @@ import (
 	"github.com/jaenster/hoardarr/internal/metrics"
 	"github.com/jaenster/hoardarr/internal/config"
 	domainschedule "github.com/jaenster/hoardarr/internal/domain/schedule"
+	domainhealth "github.com/jaenster/hoardarr/internal/domain/health"
 	domainserver "github.com/jaenster/hoardarr/internal/domain/server"
 	"github.com/jaenster/hoardarr/internal/server"
 )
@@ -94,6 +100,8 @@ type App struct {
 	QueueService  *appdownload.QueueService
 	AuthService   *appauth.Service
 	SystemService *appsystem.Service
+	HealthService  *apphealth.Service
+	CommandService *appcommand.Service
 
 	StartedAt time.Time
 
@@ -131,6 +139,7 @@ type buildOptions struct {
 	version    string
 	commit     string
 	buildDate  string
+	logDir     string
 }
 
 // WithNNTPDialer overrides the default network dialer used by all
@@ -158,6 +167,13 @@ func WithLogHub(h *loghub.Hub) BuildOption {
 // to disk. Tests that don't care about persistence can omit this.
 func WithConfigPath(path string) BuildOption {
 	return func(o *buildOptions) { o.configPath = path }
+}
+
+// WithLogDir tells bootstrap where the rotating log files live so
+// the REST handler can serve list + download for them. cmd/hoardarr
+// passes the same dir it opened logfile.Writer against.
+func WithLogDir(dir string) BuildOption {
+	return func(o *buildOptions) { o.logDir = dir }
 }
 
 // WithBuildInfo plumbs the binary's identification (version, commit,
@@ -396,10 +412,29 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		logger.Warn("schedule: ensure sqlite.optimize", "err", err)
 	}
 
+	// Weekly clean-copy backup of the SQLite db. VACUUM INTO produces
+	// a defrag'd snapshot under <data_dir>/backups/ with rotation.
+	backupSvc := appbackup.New(db, filepath.Join(cfg.Server.DataDir, "backups"), 14)
+	scheduler.Register("backup", func(ctx context.Context, _ []byte) error {
+		return backupSvc.Run(ctx)
+	})
+	if _, err := scheduler.EnsureTask(ctx, domainschedule.NewParams{
+		Name:     "backup",
+		Kind:     domainschedule.KindRecurring,
+		Cadence:  7 * 24 * time.Hour,
+		FirstRun: time.Now().UTC().Add(time.Minute), // run shortly after first boot
+	}); err != nil {
+		logger.Warn("schedule: ensure backup", "err", err)
+	}
+
 	startedAt := time.Now().UTC()
+	migVer, _ := db.CurrentVersion(ctx)
 	systemSvc := appsystem.New(appsystem.Params{
-		Version:   bo.version,
-		StartedAt: startedAt,
+		Version:          bo.version,
+		Commit:           bo.commit,
+		BuildDate:        bo.buildDate,
+		MigrationVersion: migVer,
+		StartedAt:        startedAt,
 		Jobs:      jobRepo,
 		// Read the live pool map every time — captures hot-wired
 		// servers added at runtime so /api/v1/system/status reflects
@@ -412,6 +447,33 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Bus:    bus,
 		Logger: logger,
 	})
+
+	diskSources := []diskspace.Source{
+		{Label: "Incomplete", Path: cfg.Paths.IncompleteDir},
+		{Label: "Complete", Path: cfg.Paths.CompleteDir},
+		{Label: "Data", Path: cfg.Server.DataDir},
+	}
+	healthSvc := apphealth.New(apphealth.Params{
+		Logger: logger,
+		Checks: []domainhealth.CheckFunc{
+			apphealth.ServersConfiguredCheck(serverRepo),
+			apphealth.DirWritableCheck("IncompleteDirCheck", "Incomplete directory", cfg.Paths.IncompleteDir),
+			apphealth.DirWritableCheck("CompleteDirCheck", "Complete directory", cfg.Paths.CompleteDir),
+			apphealth.DiskSpaceCheck(diskSources, 1<<30), // 1 GiB warning floor
+		},
+	})
+
+	cmdRepo := sqlite.NewCommandRepo(db)
+	commandSvc := appcommand.New(appcommand.Params{
+		Logger: logger,
+		Repo:   cmdRepo,
+	})
+	commandSvc.Register("Ping", appcommand.PingHandler())
+	commandSvc.Register("HealthRecheck", appcommand.HealthRecheckHandler(healthSvc))
+	commandSvc.Register("RetryFailedSegments", appcommand.RetryFailedSegmentsHandler(jobRepo, logger))
+	commandSvc.Register("ReprobeAllServers", appcommand.ReprobeAllServersHandler(serverRepo, logger))
+	commandSvc.Register("PauseAll", appcommand.PauseAllHandler(queueService, logger))
+	commandSvc.Register("ResumeAll", appcommand.ResumeAllHandler(queueService, logger))
 
 	liveHub, err := sse.NewHub(bus, sse.DefaultTopics, logger)
 	if err != nil {
@@ -430,6 +492,12 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		Categories: categoryRepo,
 		Auth:       authSvc,
 		System:     systemSvc,
+		Health:     healthSvc,
+		Schedule:   scheduleRepo,
+		DiskSources: diskSources,
+		LogDir:      bo.logDir,
+		Commands:    commandSvc,
+		Backup:      backupSvc,
 		Subscriptions: notifyFacade,
 		Outbox:        bus,
 		Paths: &rest.PathsView{
@@ -507,6 +575,8 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		LogHub:        bo.logHub,
 		AuthService:   authSvc,
 		SystemService: systemSvc,
+		HealthService:  healthSvc,
+		CommandService: commandSvc,
 		StartedAt:     startedAt,
 		LiveHub:       liveHub,
 		HTTP:          srv,
@@ -612,6 +682,10 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.SystemService.Start(ctx); err != nil {
 		return fmt.Errorf("start system: %w", err)
 	}
+	a.HealthService.Start(ctx)
+	if err := a.CommandService.Start(ctx); err != nil {
+		return fmt.Errorf("start commands: %w", err)
+	}
 	if err := a.Scheduler.Start(ctx); err != nil {
 		return fmt.Errorf("start scheduler: %w", err)
 	}
@@ -660,6 +734,10 @@ func (a *App) Shutdown() error {
 		}
 		if err := a.SystemService.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("stop system: %w", err)
+		}
+		a.HealthService.Stop()
+		if err := a.CommandService.Stop(); err != nil && a.shutdownErr == nil {
+			a.shutdownErr = fmt.Errorf("stop commands: %w", err)
 		}
 		if err := a.Notify.Stop(); err != nil && a.shutdownErr == nil {
 			a.shutdownErr = fmt.Errorf("notify stop: %w", err)

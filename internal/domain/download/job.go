@@ -482,6 +482,39 @@ func (j *Job) ResetInflightToPending() int {
 	return n
 }
 
+// ResetFailedToPending flips every `failed` and `missing` segment back
+// to `pending`, clearing per-segment error + attempt state so the
+// orchestrator picks them up fresh. The operator-facing trigger is
+// the RetryFailedSegments command; the typical workflow is "the
+// release was temporarily unavailable; please try again".
+//
+// File-level state is recomputed by reset of segment counters at the
+// repo layer the next time we save, so we don't touch File state here.
+//
+// Returns the number of segments reset.
+func (j *Job) ResetFailedToPending() int {
+	n := 0
+	for _, f := range j.files {
+		for _, s := range f.segments {
+			if s.state == SegmentStateFailed || s.state == SegmentStateMissing {
+				s.state = SegmentStatePending
+				s.attempts = 0
+				s.lastError = ""
+				n++
+			}
+		}
+	}
+	// If the job itself terminated, kick it back to queued so the
+	// orchestrator considers it again. Active jobs keep their state.
+	switch j.state {
+	case JobStateFailed, JobStateAborted:
+		j.state = JobStateQueued
+		j.finishedAt = time.Time{}
+		j.errorMsg = ""
+	}
+	return n
+}
+
 // PendingSegments returns segments awaiting dispatch whose retry
 // window has elapsed (`next_retry_at <= now`). Segments whose
 // `next_retry_at` is still in the future are *deferred* — they remain

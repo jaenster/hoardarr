@@ -68,6 +68,19 @@ func (db *DB) ensureMigrationsTable(ctx context.Context) error {
 	return err
 }
 
+// CurrentVersion returns the highest applied migration version, or
+// 0 if no migrations are recorded. Useful for /api/v1/system/status
+// surfaces so operators can sanity-check that an upgraded binary
+// actually applied its schema changes.
+func (db *DB) CurrentVersion(ctx context.Context) (int, error) {
+	var v int
+	row := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`)
+	if err := row.Scan(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
 func (db *DB) appliedVersions(ctx context.Context) (map[int]bool, error) {
 	rows, err := db.QueryContext(ctx, `SELECT version FROM schema_migrations`)
 	if err != nil {

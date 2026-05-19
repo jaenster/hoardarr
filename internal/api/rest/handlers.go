@@ -5,17 +5,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jaenster/hoardarr/internal/adapter/nntptest"
 	"github.com/jaenster/hoardarr/internal/adapter/sqlite"
+	"github.com/jaenster/hoardarr/internal/app/backup"
+	"github.com/jaenster/hoardarr/internal/app/diskspace"
 	appdownload "github.com/jaenster/hoardarr/internal/app/download"
+	"github.com/jaenster/hoardarr/internal/logfile"
 	appnotify "github.com/jaenster/hoardarr/internal/app/notify"
 	"github.com/jaenster/hoardarr/internal/domain/event"
+	domaincommand "github.com/jaenster/hoardarr/internal/domain/command"
+	domainhealth "github.com/jaenster/hoardarr/internal/domain/health"
+	domainschedule "github.com/jaenster/hoardarr/internal/domain/schedule"
 	"github.com/jaenster/hoardarr/internal/loghub"
 	appserver "github.com/jaenster/hoardarr/internal/app/server"
 	appsystem "github.com/jaenster/hoardarr/internal/app/system"
@@ -31,7 +39,13 @@ type Handlers struct {
 	Servers       *appserver.Service
 	Categories    *sqlite.CategoryRepo
 	Auth          Auther         // optional; nil disables /api/v1/auth/*
-	System        SystemStatuser // optional; nil disables /api/v1/system/status
+	System        SystemStatuser   // optional; nil disables /api/v1/system/status
+	Health        HealthSnapshotter // optional; nil disables /api/v1/system/health
+	Schedule      ScheduleAdmin    // optional; nil disables /api/v1/system/tasks
+	DiskSources   []diskspace.Source // empty disables /api/v1/system/diskspace
+	LogDir        string             // empty disables /api/v1/system/logs/files
+	Commands      CommandAdmin       // optional; nil disables /api/v1/commands
+	Backup        BackupAdmin        // optional; nil disables /api/v1/system/backups
 	Paths         *PathsView     // optional; nil disables /api/v1/config/paths
 	General       *GeneralView   // optional; nil disables /api/v1/config/general
 	Bandwidth     BandwidthAdmin // optional; nil disables /api/v1/config/bandwidth
@@ -141,6 +155,40 @@ type SystemStatuser interface {
 	Throughput() *appsystem.Throughput
 }
 
+// BackupAdmin is the slice of app/backup.Service the REST handler
+// needs. List + on-demand Run + SafePath enforcement for downloads.
+type BackupAdmin interface {
+	List() []backup.FileInfo
+	Run(ctx context.Context) error
+	SafePath(name string) (string, error)
+}
+
+// CommandAdmin is the slice of app/command.Service the REST handler
+// needs. Defined as an interface so a fake can be plugged in tests.
+type CommandAdmin interface {
+	Submit(ctx context.Context, name string, body []byte, trigger domaincommand.Trigger) (domaincommand.CommandID, error)
+	List(ctx context.Context, limit int) ([]*domaincommand.Command, error)
+	ByID(ctx context.Context, id domaincommand.CommandID) (*domaincommand.Command, error)
+	Names() []string
+}
+
+// ScheduleAdmin is the slice of the schedule repo + service the REST
+// handler needs to surface the Tasks page.
+type ScheduleAdmin interface {
+	List(ctx context.Context) ([]*domainschedule.Task, error)
+	ByID(ctx context.Context, id domainschedule.TaskID) (*domainschedule.Task, error)
+	Save(ctx context.Context, t *domainschedule.Task) error
+}
+
+// HealthSnapshotter is the slice of app/health.Service the REST
+// handler needs. Returns the current issue snapshot + the timestamp
+// of the last check run (so the UI can show "checked Xs ago" and
+// detect a stuck check loop).
+type HealthSnapshotter interface {
+	Snapshot() ([]domainhealth.Issue, time.Time)
+	Refresh()
+}
+
 // Mount registers the /api/v1/* routes on mux. The caller is responsible
 // for wrapping individual routes with the api-key middleware (the
 // `protect` helper passed in). /api/v1/health is NOT registered here —
@@ -192,6 +240,32 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	if h.System != nil {
 		register("GET", "/api/v1/system/status", h.systemStatus)
 		register("GET", "/api/v1/system/throughput", h.systemThroughput)
+	}
+	if h.Health != nil {
+		register("GET", "/api/v1/system/health", h.systemHealth)
+		register("POST", "/api/v1/system/health/refresh", h.systemHealthRefresh)
+	}
+	if h.Schedule != nil {
+		register("GET", "/api/v1/system/tasks", h.systemTasks)
+		register("POST", "/api/v1/system/tasks/{id}/run-now", h.systemTaskRunNow)
+	}
+	if len(h.DiskSources) > 0 {
+		register("GET", "/api/v1/system/diskspace", h.systemDiskspace)
+	}
+	if h.LogDir != "" {
+		register("GET", "/api/v1/system/logs/files", h.systemLogFiles)
+		register("GET", "/api/v1/system/logs/files/{name}", h.systemLogFileDownload)
+	}
+	if h.Commands != nil {
+		register("GET", "/api/v1/commands", h.listCommands)
+		register("POST", "/api/v1/commands", h.submitCommand)
+		register("GET", "/api/v1/commands/{id}", h.getCommand)
+		register("GET", "/api/v1/commands/names", h.commandNames)
+	}
+	if h.Backup != nil {
+		register("GET", "/api/v1/system/backups", h.listBackups)
+		register("POST", "/api/v1/system/backups", h.runBackup)
+		register("GET", "/api/v1/system/backups/{name}", h.downloadBackup)
 	}
 	if h.LogHub != nil {
 		register("GET", "/api/v1/system/logs", h.systemLogsSnapshot)
@@ -299,10 +373,18 @@ func (h *Handlers) addNZB(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, appdownload.ErrDuplicateNZB):
-			writeJSON(w, http.StatusOK, map[string]any{
+			// Look up the existing job's state so the UI can phrase
+			// the toast — "already in queue" vs "already completed".
+			// Fall back to just the id if the lookup fails.
+			out := map[string]any{
 				"job_id":    int64(id),
 				"duplicate": true,
-			})
+			}
+			if j, lerr := h.Queue.Get(ctx, id); lerr == nil && j != nil {
+				out["state"] = string(j.State())
+				out["name"] = j.Name()
+			}
+			writeJSON(w, http.StatusOK, out)
 			return
 		default:
 			h.writeError(w, http.StatusBadRequest, err)
@@ -795,10 +877,18 @@ func (h *Handlers) systemStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"service":    st.Service,
-		"version":    st.Version,
-		"started_at": st.StartedAt.Format(time.RFC3339),
-		"uptime_ms":  st.Uptime.Milliseconds(),
+		"service":           st.Service,
+		"version":           st.Version,
+		"commit":            st.Commit,
+		"build_date":        st.BuildDate,
+		"runtime_version":   st.RuntimeVersion,
+		"os":                st.OS,
+		"arch":              st.Arch,
+		"is_docker":         st.IsDocker,
+		"database_type":     st.DatabaseType,
+		"migration_version": st.MigrationVersion,
+		"started_at":        st.StartedAt.Format(time.RFC3339),
+		"uptime_ms":         st.Uptime.Milliseconds(),
 		"queue": map[string]any{
 			"active": st.QueueActive,
 			"total":  st.QueueTotal,
@@ -1215,4 +1305,311 @@ func isClientDisconnect(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "context canceled") ||
 		strings.Contains(s, "context deadline exceeded")
+}
+
+// --- health ---------------------------------------------------------
+
+// systemHealth returns the current Issue snapshot from the health
+// service. Snapshot is sub-millisecond — no need to gate behind a
+// long polling interval. Sort errors before warnings so the UI can
+// render them in priority order.
+func (h *Handlers) systemHealth(w http.ResponseWriter, _ *http.Request) {
+	issues, lastRun := h.Health.Snapshot()
+	errs := make([]domainhealth.Issue, 0, len(issues))
+	warns := make([]domainhealth.Issue, 0, len(issues))
+	for _, i := range issues {
+		if i.Severity == domainhealth.SeverityError {
+			errs = append(errs, i)
+		} else {
+			warns = append(warns, i)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"issues":   append(errs, warns...),
+		"last_run": lastRun.UTC().Format(time.RFC3339),
+	})
+}
+
+// systemHealthRefresh requests the service to re-run checks now and
+// then returns the next snapshot. Useful as the "I fixed the thing,
+// recheck now" button in the UI rather than waiting for the tick.
+func (h *Handlers) systemHealthRefresh(w http.ResponseWriter, r *http.Request) {
+	h.Health.Refresh()
+	// Brief settle window so the re-run lands before we read the
+	// snapshot back. Bounded so a slow checker can't stall the
+	// request indefinitely.
+	select {
+	case <-time.After(200 * time.Millisecond):
+	case <-r.Context().Done():
+		return
+	}
+	h.systemHealth(w, r)
+}
+
+// --- tasks (scheduled jobs) -----------------------------------------
+
+// systemTasks lists every recurring + oneshot task with the fields
+// operators care about: when it last ran, when it's next due, the
+// most recent error if any, and whether it's currently running.
+func (h *Handlers) systemTasks(w http.ResponseWriter, r *http.Request) {
+	tasks, err := h.Schedule.List(r.Context())
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, taskToDTO(t))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tasks": out})
+}
+
+// systemTaskRunNow pulls the task's next-run-at forward to now so the
+// scheduler's next tick (≤ 1s away) picks it up. Doesn't actually run
+// the handler inline — that would block the HTTP request on a
+// possibly-long-running task and bypass the claim model. The
+// scheduler's normal dispatch handles concurrency + retries cleanly.
+func (h *Handlers) systemTaskRunNow(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("bad id: %w", err))
+		return
+	}
+	t, err := h.Schedule.ByID(r.Context(), domainschedule.TaskID(id))
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if t == nil {
+		h.writeError(w, http.StatusNotFound, fmt.Errorf("task %d not found", id))
+		return
+	}
+	now := time.Now().UTC()
+	t.Reschedule(now, now)
+	if err := h.Schedule.Save(r.Context(), t); err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"task": taskToDTO(t)})
+}
+
+// --- commands -------------------------------------------------------
+
+// listCommands returns the N most recent commands, newest-first.
+// Default and max page size are baked in; we don't need cursor
+// pagination for an operator-driven feed.
+func (h *Handlers) listCommands(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+	cmds, err := h.Commands.List(r.Context(), limit)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(cmds))
+	for _, c := range cmds {
+		out = append(out, commandToDTO(c))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"commands": out})
+}
+
+// submitCommand body: {name, body?}. Returns the queued command's
+// dto so the caller can poll it.
+func (h *Handlers) submitCommand(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string          `json:"name"`
+		Body json.RawMessage `json:"body"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	id, err := h.Commands.Submit(r.Context(), req.Name, req.Body, domaincommand.TriggerManual)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	c, err := h.Commands.ByID(r.Context(), id)
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"command": commandToDTO(c)})
+}
+
+// getCommand returns a single command by id — used by the UI to
+// poll progress on a recently-submitted command.
+func (h *Handlers) getCommand(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("bad id: %w", err))
+		return
+	}
+	c, err := h.Commands.ByID(r.Context(), domaincommand.CommandID(id))
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if c == nil {
+		h.writeError(w, http.StatusNotFound, fmt.Errorf("command %d not found", id))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"command": commandToDTO(c)})
+}
+
+// commandNames lists every registered handler name so the UI can
+// populate a "trigger command" dropdown.
+func (h *Handlers) commandNames(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"names": h.Commands.Names()})
+}
+
+func commandToDTO(c *domaincommand.Command) map[string]any {
+	dto := map[string]any{
+		"id":        int64(c.ID()),
+		"name":      c.Name(),
+		"trigger":   string(c.Trigger()),
+		"status":    string(c.Status()),
+		"queued_at": c.QueuedAt().UTC().Format(time.RFC3339),
+	}
+	if !c.StartedAt().IsZero() {
+		dto["started_at"] = c.StartedAt().UTC().Format(time.RFC3339)
+	}
+	if !c.EndedAt().IsZero() {
+		dto["ended_at"] = c.EndedAt().UTC().Format(time.RFC3339)
+	}
+	if c.Result() != "" {
+		dto["result"] = string(c.Result())
+	}
+	if c.Error() != "" {
+		dto["error"] = c.Error()
+	}
+	if d := c.Duration(); d > 0 {
+		dto["duration_ms"] = d.Milliseconds()
+	}
+	if len(c.Body()) > 0 {
+		dto["body"] = json.RawMessage(c.Body())
+	}
+	return dto
+}
+
+// --- backups --------------------------------------------------------
+
+func (h *Handlers) listBackups(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"backups": h.Backup.List()})
+}
+
+// runBackup runs the backup synchronously. SQLite VACUUM INTO is
+// usually sub-second on hoardarr-sized databases (≤ tens of MB) so
+// blocking the request is fine; if the operator is staring at the UI
+// they get immediate confirmation. For larger DBs in the future,
+// route this through Commands.
+func (h *Handlers) runBackup(w http.ResponseWriter, r *http.Request) {
+	if err := h.Backup.Run(r.Context()); err != nil {
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"backups": h.Backup.List()})
+}
+
+func (h *Handlers) downloadBackup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	path, err := h.Backup.SafePath(name)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			h.writeError(w, http.StatusNotFound, err)
+			return
+		}
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, name))
+	if _, err := io.Copy(w, f); err != nil {
+		h.Logger.Warn("backup: copy to client failed", "name", name, "err", err)
+	}
+}
+
+// --- log files ------------------------------------------------------
+
+// systemLogFiles lists every log file in LogDir, newest-first.
+func (h *Handlers) systemLogFiles(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"files": logfile.List(h.LogDir),
+	})
+}
+
+// systemLogFileDownload streams the named log file as text/plain.
+// logfile.SafePath enforces the "must be a hoardarr log filename, no
+// traversal" rule so the path parameter can't be used to read
+// arbitrary files under LogDir's parent.
+func (h *Handlers) systemLogFileDownload(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	path, err := logfile.SafePath(h.LogDir, name)
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			h.writeError(w, http.StatusNotFound, err)
+			return
+		}
+		h.writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, name))
+	if _, err := io.Copy(w, f); err != nil {
+		h.Logger.Warn("logfile: copy to client failed", "name", name, "err", err)
+	}
+}
+
+// --- diskspace ------------------------------------------------------
+
+// systemDiskspace runs statfs(2) against each configured path and
+// returns the entries verbatim. Sub-millisecond; no caching layer.
+func (h *Handlers) systemDiskspace(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": diskspace.Snapshot(h.DiskSources),
+	})
+}
+
+// taskToDTO renders a schedule.Task into the wire shape the frontend
+// expects. Durations are emitted in seconds because frontend code
+// formats them with humaniseDuration.
+func taskToDTO(t *domainschedule.Task) map[string]any {
+	dto := map[string]any{
+		"id":                   int64(t.ID()),
+		"name":                 t.Name(),
+		"kind":                 string(t.Kind()),
+		"cadence_seconds":      int64(t.Cadence().Seconds()),
+		"next_run_at":          t.NextRunAt().UTC().Format(time.RFC3339),
+		"enabled":              t.Enabled(),
+		"status":               string(t.Status()),
+		"consecutive_failures": t.ConsecutiveFailures(),
+	}
+	if !t.LastRunAt().IsZero() {
+		dto["last_run_at"] = t.LastRunAt().UTC().Format(time.RFC3339)
+	}
+	if t.LastError() != "" {
+		dto["last_error"] = t.LastError()
+	}
+	if !t.ClaimedAt().IsZero() {
+		dto["claimed_at"] = t.ClaimedAt().UTC().Format(time.RFC3339)
+	}
+	return dto
 }
