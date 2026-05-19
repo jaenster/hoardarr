@@ -75,7 +75,21 @@ func classifyGreeting(code int, msg string) error {
 
 // classifyResponse maps a *ProtocolError to a sentinel where one fits.
 // Returns the original error if no sentinel applies.
+//
+// Connection-limit detection runs first because providers send "too
+// many connections" on a variety of codes (Eweka 502, some on 400,
+// occasional 481 on AUTHINFO PASS when the slot's already taken).
+// Matching the message text catches all of them and routes the error
+// to the pool's back-off / tier-fall-through path instead of the
+// generic auth-failed / transient-retry path that burns the segment
+// retry budget.
 func classifyResponse(pe *ProtocolError) error {
+	low := strings.ToLower(pe.Message)
+	if strings.Contains(low, "too many connection") ||
+		strings.Contains(low, "max connections") ||
+		strings.Contains(low, "connection limit") {
+		return fmt.Errorf("%w: %d %s", ErrTooManyConnections, pe.Code, pe.Message)
+	}
 	switch pe.Code {
 	case 430:
 		return fmt.Errorf("%w: %s", ErrArticleMissing, pe.Message)
