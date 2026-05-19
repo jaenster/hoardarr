@@ -261,9 +261,27 @@ func buildFiles(d *nzb.Document) ([]download.NewFileParams, int64) {
 		if len(f.Segments) == 0 {
 			continue
 		}
+		// Real NZBs occasionally contain duplicate <segment> entries
+		// within a single file — usually because the poster re-uploaded
+		// a missed article and the indexer aggregated both copies into
+		// the .nzb. SAB silently dedupes; we do too. Keep the first
+		// occurrence by (number, message_id) — same segment number
+		// with a different message_id is also a duplicate (the second
+		// post supersedes the first; we trust the first since it's the
+		// one most likely to still be on retention).
+		seenNum := make(map[int]struct{}, len(f.Segments))
+		seenMsg := make(map[string]struct{}, len(f.Segments))
 		var segParams []download.NewSegmentParams
 		var size int64
 		for _, s := range f.Segments {
+			if _, dup := seenNum[s.Number]; dup {
+				continue
+			}
+			if _, dup := seenMsg[s.MessageID]; dup {
+				continue
+			}
+			seenNum[s.Number] = struct{}{}
+			seenMsg[s.MessageID] = struct{}{}
 			segParams = append(segParams, download.NewSegmentParams{
 				SeqIndex:  s.Number,
 				MessageID: s.MessageID,
