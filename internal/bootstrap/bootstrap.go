@@ -132,14 +132,15 @@ type App struct {
 type BuildOption func(*buildOptions)
 
 type buildOptions struct {
-	nntpDialer nntp.Dialer
-	extractor  extract.Extractor
-	logHub     *loghub.Hub
-	configPath string
-	version    string
-	commit     string
-	buildDate  string
-	logDir     string
+	nntpDialer        nntp.Dialer
+	extractor         extract.Extractor
+	logHub            *loghub.Hub
+	configPath        string
+	version           string
+	commit            string
+	buildDate         string
+	logDir            string
+	outboxPollInterval time.Duration
 }
 
 // WithNNTPDialer overrides the default network dialer used by all
@@ -174,6 +175,14 @@ func WithConfigPath(path string) BuildOption {
 // passes the same dir it opened logfile.Writer against.
 func WithLogDir(dir string) BuildOption {
 	return func(o *buildOptions) { o.logDir = dir }
+}
+
+// WithOutboxPollInterval overrides the dispatch poll interval each
+// subscription's outbox loop uses. Tests pass a small value (~50ms)
+// so retry-timing flows complete in test wall-clock; production lets
+// the OutboxBus default (5s) apply.
+func WithOutboxPollInterval(d time.Duration) BuildOption {
+	return func(o *buildOptions) { o.outboxPollInterval = d }
 }
 
 // WithBuildInfo plumbs the binary's identification (version, commit,
@@ -230,7 +239,10 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 	}
 
 	txm := sqlite.NewTxManager(db)
-	bus := sqlite.NewOutboxBus(db, sqlite.OutboxOptions{Logger: logger})
+	bus := sqlite.NewOutboxBus(db, sqlite.OutboxOptions{
+		Logger:       logger,
+		PollInterval: bo.outboxPollInterval, // zero -> OutboxBus default
+	})
 
 	serverRepo := sqlite.NewServerRepo(db)
 	jobRepo := sqlite.NewJobRepo(db)

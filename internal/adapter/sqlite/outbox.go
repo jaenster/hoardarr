@@ -108,7 +108,20 @@ type OutboxOptions struct {
 
 func (o OutboxOptions) withDefaults() OutboxOptions {
 	if o.PollInterval == 0 {
-		o.PollInterval = 250 * time.Millisecond
+		// Each subscription runs its own dispatch poll. With ~14 live
+		// subscriptions in a typical bootstrap, a 250ms tick translated
+		// to ~56 SELECT queries/second hitting the outbox table even
+		// when no events were pending — visible in production CPU
+		// profiles as 30%+ of the post-fix runtime. The wake channel
+		// (Publish → wakeMatching → sub.wake) delivers live events
+		// instantly, so the tick is only a safety net for missed wakes
+		// and for re-checking next_retry_at on delivery failures.
+		// 5s keeps both of those responsive enough without burning CPU
+		// at idle. The e2e suite (which exercises pause/resume retry
+		// timing in real-time) overrides this to ~50ms via the
+		// bootstrap test helper to keep test wall-clock low without
+		// affecting production defaults.
+		o.PollInterval = 5 * time.Second
 	}
 	if o.BatchSize == 0 {
 		o.BatchSize = 64

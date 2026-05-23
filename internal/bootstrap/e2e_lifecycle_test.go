@@ -72,7 +72,12 @@ func TestM2_E2E_PauseResume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	app, err := bootstrap.Build(ctx, cfg, nil, nil)
+	app, err := bootstrap.Build(ctx, cfg, nil, nil,
+		// Production polls outbox every 5s; lifecycle tests exercise
+		// pause/resume retry timing in real-time so they need fast
+		// dispatcher reaction.
+		bootstrap.WithOutboxPollInterval(50*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -173,7 +178,12 @@ func TestM2_E2E_RemoveMidFlight(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	app, err := bootstrap.Build(ctx, cfg, nil, nil)
+	app, err := bootstrap.Build(ctx, cfg, nil, nil,
+		// Production polls outbox every 5s; lifecycle tests exercise
+		// pause/resume retry timing in real-time so they need fast
+		// dispatcher reaction.
+		bootstrap.WithOutboxPollInterval(50*time.Millisecond),
+	)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
