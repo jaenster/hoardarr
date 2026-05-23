@@ -75,3 +75,42 @@ func BenchmarkDecode_MultiPart(b *testing.B) {
 		}
 	}
 }
+
+// Scan-and-decode variant — same fixtures, alternative implementation
+// (DecodeScan). Kept side-by-side so we can attribute throughput deltas
+// to the inner-loop strategy, not machine noise.
+func benchmarkDecodeScan(b *testing.B, size int) {
+	enc := makeBench(b, size)
+	b.SetBytes(int64(size))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, err := DecodeScan(bytes.NewReader(enc))
+		if err != nil {
+			b.Fatalf("DecodeScan: %v", err)
+		}
+	}
+}
+
+func BenchmarkDecodeScan_1MiB(b *testing.B)   { benchmarkDecodeScan(b, 1024*1024) }
+func BenchmarkDecodeScan_750KiB(b *testing.B) { benchmarkDecodeScan(b, 750*1024) }
+func BenchmarkDecodeScan_256KiB(b *testing.B) { benchmarkDecodeScan(b, 256*1024) }
+func BenchmarkDecodeScan_4KiB(b *testing.B)   { benchmarkDecodeScan(b, 4*1024) }
+
+// Inner-loop microbench: subCopy42 on its own. Isolates SWAR
+// subtract throughput from everything else. The buffer is a 64 KiB
+// scratch so the working set stays in L1.
+func BenchmarkSubCopy42(b *testing.B) {
+	const n = 64 * 1024
+	src := make([]byte, n)
+	dst := make([]byte, n)
+	if _, err := rand.Read(src); err != nil {
+		b.Fatalf("rand: %v", err)
+	}
+	b.SetBytes(int64(n))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		subCopy42(dst, src)
+	}
+}

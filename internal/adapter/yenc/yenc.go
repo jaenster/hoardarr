@@ -83,6 +83,13 @@ var (
 	prefixYEnd   = []byte("=yend")
 )
 
+// maxLineOverhead bounds the extra bytes a single encoded line can
+// hold over its decoded length. yEnc lines are typically 128 chars
+// wrapped (line=128); doubling that gives plenty of slack for
+// pathological escape density, and the cost is negligible vs the
+// declared output size.
+const maxLineOverhead = 256
+
 // inputPool recycles the read-all input buffer across decode calls.
 // yEnc articles cluster around 750 KiB encoded; a 1 MiB starting cap
 // fits the overwhelming majority without a grow. Pool-hit Decode calls
@@ -152,6 +159,7 @@ func Decode(r io.Reader) ([]byte, Header, Trailer, error) {
 		gotBegin bool
 		gotEnd   bool
 		out      []byte
+		outLen   int
 	)
 
 	bufp, err := readAllSized(r)
@@ -194,11 +202,13 @@ func Decode(r io.Reader) ([]byte, Header, Trailer, error) {
 				return nil, hdr, trl, err
 			}
 			gotBegin = true
-			// Pre-allocate the output buffer. For multi-part we don't
-			// yet know the per-part size (it comes on =ypart); fall back
-			// to a small default and let append grow it.
+			// Pre-allocate the output buffer to the declared decoded
+			// size + a small overhead. The hot loop's safety check
+			// compares against encoded line length, which is slightly
+			// larger than decoded due to escape pairs, so a single
+			// max-line-worth of headroom prevents the last-line grow.
 			if hdr.Size > 0 && hdr.Total == 0 {
-				out = make([]byte, 0, hdr.Size)
+				out = make([]byte, hdr.Size+maxLineOverhead)
 			}
 
 		case isControl && bytes.HasPrefix(line, prefixYPart):
@@ -210,7 +220,7 @@ func Decode(r io.Reader) ([]byte, Header, Trailer, error) {
 			}
 			if out == nil {
 				if sz := hdr.End - hdr.Begin + 1; sz > 0 {
-					out = make([]byte, 0, sz)
+					out = make([]byte, sz+maxLineOverhead)
 				}
 			}
 
@@ -228,12 +238,20 @@ func Decode(r io.Reader) ([]byte, Header, Trailer, error) {
 				// Pre-header noise (NNTP-stuffed dots, blank lines).
 				continue
 			}
-			out, err = decodeLineAppend(out, line)
+			// Ensure capacity: if hdr.Size was wrong / absent, grow.
+			needed := outLen + len(line)
+			if needed > len(out) {
+				grown := make([]byte, needed)
+				copy(grown, out[:outLen])
+				out = grown
+			}
+			outLen, err = decodeLineInto(out, outLen, line)
 			if err != nil {
 				return nil, hdr, trl, err
 			}
 		}
 	}
+	out = out[:outLen]
 
 	if !gotBegin {
 		return nil, hdr, trl, errors.New("yenc: no =ybegin")
@@ -268,33 +286,66 @@ func Decode(r io.Reader) ([]byte, Header, Trailer, error) {
 	return out, hdr, trl, nil
 }
 
-// decodeLineAppend decodes one body line and appends the bytes to out,
-// returning the grown slice. The line has already had its trailing
-// CR/LF stripped.
+// decodeLineInto decodes one body line directly into out starting at
+// position j, returning the new j. The line has already had its
+// trailing CR/LF stripped. out must have enough capacity for the
+// decoded bytes (decoded length ≤ len(line)).
 //
-// Hot path: find the next '=' with bytes.IndexByte (SIMD asm — portable
-// fast path on amd64 and arm64), then transform the unescaped run from
-// src to out via subSpread, which subtracts 42 from 8 bytes at a time
-// using portable uint64 SWAR. Read-once / write-once per byte: no
-// intermediate buffer between the line and out.
-func decodeLineAppend(out, line []byte) ([]byte, error) {
-	for len(line) > 0 {
-		eq := bytes.IndexByte(line, '=')
-		if eq < 0 {
-			// No more escapes. Transform the rest into out.
-			return appendSub42(out, line), nil
+// Hot path: walk the line in 8-byte chunks. SWAR check for '=' via
+// hasZeroByte(chunk ^ rep8Eq) — 4 ops; if clear, SWAR-subtract 42
+// over the chunk and store 8 bytes. Chunks that contain a '=' fall
+// through to a scalar window that handles the escape pair (which may
+// straddle the chunk boundary). No function calls per escape segment,
+// no append capacity checks per write — both of which dominated the
+// previous profile.
+func decodeLineInto(out []byte, j int, line []byte) (int, error) {
+	n := len(line)
+	i := 0
+	for i+8 <= n {
+		chunk := binary.LittleEndian.Uint64(line[i:])
+		if hasZeroByte(chunk^rep8Eq) != 0 {
+			// '=' inside this 8-byte window — scalar fallback for these
+			// 8 bytes. The escape pair may end at i+8 (straddling), so
+			// the inner loop is allowed to advance past `end` by one.
+			end := i + 8
+			for i < end {
+				c := line[i]
+				if c == '=' {
+					i++
+					if i >= n {
+						return j, errors.New("yenc: dangling escape at line end")
+					}
+					out[j] = line[i] - 64 - 42
+				} else {
+					out[j] = c - 42
+				}
+				j++
+				i++
+			}
+			continue
 		}
-		if eq > 0 {
-			out = appendSub42(out, line[:eq])
-		}
-		// Decode the escape itself: '=' + (raw + 42 + 64).
-		if eq+1 >= len(line) {
-			return out, errors.New("yenc: dangling escape at line end")
-		}
-		out = append(out, line[eq+1]-64-42)
-		line = line[eq+2:]
+		// Clean chunk: SWAR subtract-42.
+		result := ((chunk & subLo7) + subLowAdd) ^ (subHi1 &^ chunk)
+		binary.LittleEndian.PutUint64(out[j:], result)
+		i += 8
+		j += 8
 	}
-	return out, nil
+	// Scalar tail for the last <8 bytes.
+	for i < n {
+		c := line[i]
+		if c == '=' {
+			i++
+			if i >= n {
+				return j, errors.New("yenc: dangling escape at line end")
+			}
+			out[j] = line[i] - 64 - 42
+		} else {
+			out[j] = c - 42
+		}
+		j++
+		i++
+	}
+	return j, nil
 }
 
 // SWAR constants for byte-wise subtract-42 across 8 packed bytes.
@@ -317,23 +368,6 @@ const (
 	subLo7    = uint64(0x7F7F7F7F7F7F7F7F)
 	subHi1    = uint64(0x8080808080808080)
 )
-
-// appendSub42 appends each byte of src to out with 42 subtracted,
-// growing out via append when needed. The bulk loop processes 8 bytes
-// per iteration via SWAR; a scalar tail handles the remainder.
-func appendSub42(out, src []byte) []byte {
-	n := len(out)
-	// Ensure capacity. One grow per call at most; pre-allocation in
-	// Decode means we usually skip this entirely.
-	if cap(out)-n < len(src) {
-		out = append(out, src...)[:n] // grow to fit, keep len
-		out = out[:n+len(src)]        // restore extended view
-	} else {
-		out = out[:n+len(src)]
-	}
-	subCopy42(out[n:], src)
-	return out
-}
 
 // subCopy42 writes dst[i] = src[i] - 42 for i in [0, len(src)).
 // Requires len(dst) >= len(src). Uses uint64 SWAR for the bulk and a
@@ -464,14 +498,13 @@ func splitKV(kv []byte) (string, string, bool) {
 }
 
 // decodeLine is kept for the direct unit tests in yenc_test.go. New
-// code should use decodeLineAppend on the hot path.
+// code goes through Decode → decodeLineInto.
 func decodeLine(line []byte, buf *bytes.Buffer) error {
-	out, err := decodeLineAppend(buf.Bytes(), line)
+	tmp := make([]byte, len(line))
+	j, err := decodeLineInto(tmp, 0, line)
 	if err != nil {
 		return err
 	}
-	// Replace the buffer contents with the grown slice.
-	buf.Reset()
-	buf.Write(out)
+	buf.Write(tmp[:j])
 	return nil
 }
