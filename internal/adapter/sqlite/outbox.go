@@ -273,15 +273,53 @@ func (b *OutboxBus) prune() {
 			break
 		}
 	}
-	// Note: we deliberately don't sweep orphan outbox rows here.
-	// The LEFT JOIN-style query is O(outbox × outbox_subs) without
-	// a covering index — on the live container that took the writer
-	// lock long enough to wedge every other transaction with
-	// SQLITE_BUSY. Subs-only prune is what keeps the dispatcher's
-	// working set lean; outbox rows are tiny and accumulate slowly,
-	// and the upcoming durable-scheduler task can age them out on
-	// a much cheaper "id <= cutoff" query (UUID v7 ids are time-
-	// ordered, so a single index lookup answers it).
+	// Phase 3: outbox rows past retention with no remaining
+	// outbox_subs references.
+	//
+	// Phases 1+2 already reaped delivered subs (older than retention)
+	// and stale-undelivered subs (older than 10 min). Any outbox row
+	// whose subs were never created (no subscriber matched the topic)
+	// or whose subs were all reaped is safe to delete once past
+	// retention. NOT EXISTS uses the outbox_subs_event_id covering
+	// index added in migration 015, so the per-candidate check is
+	// effectively O(1) — the earlier "LEFT JOIN is O(N×M)" warning
+	// applied to the un-indexed version.
+	//
+	// Without this phase, outbox rows accumulate forever. On the
+	// production container we observed 2.1M rows after ~13 days of
+	// uptime, dragging the DB file to 670 MiB and every dispatch
+	// SELECT through a massive table.
+	for {
+		res, err := b.db.ExecContext(b.ctx, `
+			DELETE FROM outbox
+			WHERE id IN (
+				SELECT id FROM outbox
+				WHERE occurred_at < ?
+				  AND NOT EXISTS (SELECT 1 FROM outbox_subs WHERE event_id = outbox.id)
+				LIMIT 5000
+			)
+		`, cutoff)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			b.logger.Warn("outbox prune orphan", "err", err)
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			break
+		}
+		// Yield briefly between batches so a long backfill sweep
+		// (millions of accumulated rows on first run after this
+		// change ships) doesn't monopolise the writer lock and
+		// stall ambient transactions.
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // Publish persists each event to the outbox along with a per-subscriber
