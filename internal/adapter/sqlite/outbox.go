@@ -388,15 +388,21 @@ func (b *OutboxBus) Publish(ctx context.Context, evts ...event.Event) error {
 		if err := publish(ctx); err != nil {
 			return err
 		}
+		// Inside an ambient TX: the INSERTs above are not yet visible
+		// to other connections, so waking dispatchers now would have
+		// them SELECT, see nothing, and go back to sleep — they would
+		// then wait for the next poll tick (5s) to discover the rows
+		// after the outer commit lands. Defer the wake to post-commit.
+		OnTxCommit(ctx, func() { b.wakeMatching(evts) })
 	} else {
 		txm := NewTxManager(b.db)
 		if err := txm.InTx(ctx, publish); err != nil {
 			return err
 		}
+		// Standalone TX: it committed inside InTx; wake immediately.
+		b.wakeMatching(evts)
 	}
 
-	// Wake matching dispatchers so they pick up the new rows quickly.
-	b.wakeMatching(evts)
 	return nil
 }
 

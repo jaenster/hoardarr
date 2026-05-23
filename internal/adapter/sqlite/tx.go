@@ -41,6 +41,16 @@ type ctxKey struct{}
 
 var txKey ctxKey
 
+// txState carries the *sql.Tx plus a list of post-commit hooks. Hooks
+// fire AFTER the outer TX commits successfully — used to defer
+// observable side-effects (e.g. waking outbox dispatchers) so they
+// only happen when other readers can see the inserted rows. A
+// rolled-back TX runs no hooks.
+type txState struct {
+	tx          *sql.Tx
+	commitHooks []func()
+}
+
 // TxManager is the SQLite implementation of tx.TransactionManager.
 //
 // It begins a transaction on InTx entry, attaches the *sql.Tx to the
@@ -105,13 +115,14 @@ func (m *TxManager) runTx(ctx context.Context, fn func(ctx context.Context) erro
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
+	state := &txState{tx: sqlTx}
 	defer func() {
 		if p := recover(); p != nil {
 			_ = sqlTx.Rollback()
 			panic(p)
 		}
 	}()
-	if err := fn(context.WithValue(ctx, txKey, sqlTx)); err != nil {
+	if err := fn(context.WithValue(ctx, txKey, state)); err != nil {
 		if rbErr := sqlTx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			return fmt.Errorf("rollback after %v: %w", err, rbErr)
 		}
@@ -119,6 +130,12 @@ func (m *TxManager) runTx(ctx context.Context, fn func(ctx context.Context) erro
 	}
 	if err := sqlTx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+	// Fire post-commit hooks. We deliberately run them after a
+	// successful commit so observers (e.g. outbox dispatchers being
+	// nudged) see the just-inserted rows when they query.
+	for _, hook := range state.commitHooks {
+		hook()
 	}
 	return nil
 }
@@ -152,8 +169,26 @@ func isRetryableBusy(err error) bool {
 // queries to the ambient transaction. If nil, the caller should fall
 // back to db-level Exec/Query (single-statement, auto-committed).
 func TxFromContext(ctx context.Context) *sql.Tx {
-	v, _ := ctx.Value(txKey).(*sql.Tx)
-	return v
+	if st, ok := ctx.Value(txKey).(*txState); ok && st != nil {
+		return st.tx
+	}
+	return nil
+}
+
+// OnTxCommit registers fn to run after the ambient transaction
+// commits successfully. If ctx carries no transaction, fn runs
+// immediately. fn does not run if the transaction is rolled back.
+//
+// Used for side-effects that observers (other goroutines) must not
+// see before the TX is durable — most notably the outbox bus waking
+// up dispatcher goroutines, which would otherwise SELECT and find
+// nothing while the INSERT is still pending in an uncommitted TX.
+func OnTxCommit(ctx context.Context, fn func()) {
+	if st, ok := ctx.Value(txKey).(*txState); ok && st != nil {
+		st.commitHooks = append(st.commitHooks, fn)
+		return
+	}
+	fn()
 }
 
 // ExecContext runs the query inside the ambient transaction if one is

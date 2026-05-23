@@ -69,6 +69,22 @@ type Job struct {
 	segIdx     map[SegmentID]segmentRef
 	segIdxOnce sync.Once
 
+	// unresolvedNonRecoveryVol counts segments in non-recovery-vol files
+	// that have NOT yet reached a terminal state (Done/Missing/Failed).
+	// unresolvedRecoveryVol counts the same for recovery-vol files.
+	// Maintained incrementally on every state transition so
+	// allSegmentsResolved is O(1) — the original scan over every
+	// file × every segment was the second-largest IsTerminal()
+	// caller in production profiles.
+	//
+	// Why two counters: when fetchRecoveryVols is false the resolved
+	// check ignores recovery-vol segments, so we need to count
+	// "non-recovery still pending" separately from total unresolved.
+	// When fetchRecoveryVols is toggled to true (RequestRecoveryVols)
+	// the recovery counter is consulted from then on without a recount.
+	unresolvedNonRecoveryVol int
+	unresolvedRecoveryVol    int
+
 	events []event.Event
 }
 
@@ -129,6 +145,17 @@ func NewJob(p NewJobParams, now time.Time) (*Job, error) {
 		j.files = append(j.files, f)
 		j.totalBytes += f.sizeBytes
 	}
+	// Every freshly-constructed segment starts as Pending (non-terminal),
+	// so the initial unresolved counts are just the file's segment count
+	// bucketed by recovery-vol status.
+	for _, f := range j.files {
+		n := len(f.segments)
+		if f.isRecoveryVol {
+			j.unresolvedRecoveryVol += n
+		} else {
+			j.unresolvedNonRecoveryVol += n
+		}
+	}
 
 	j.events = append(j.events, JobCreated{
 		ID:         0,
@@ -166,7 +193,7 @@ type HydrateJobParams struct {
 // HydrateJob reconstructs a Job from persistence. No events are
 // emitted.
 func HydrateJob(p HydrateJobParams) *Job {
-	return &Job{
+	j := &Job{
 		id:                p.ID,
 		nzbHash:           p.NZBHash,
 		name:              p.Name,
@@ -186,6 +213,21 @@ func HydrateJob(p HydrateJobParams) *Job {
 		files:             p.Files,
 		fetchRecoveryVols: p.FetchRecoveryVols,
 	}
+	// Count non-terminal segments per recovery-vol bucket so the
+	// O(1) allSegmentsResolved check has a correct seed for a Job
+	// resurrected from disk mid-download.
+	for _, f := range j.files {
+		for _, s := range f.segments {
+			if !s.state.IsTerminal() {
+				if f.isRecoveryVol {
+					j.unresolvedRecoveryVol++
+				} else {
+					j.unresolvedNonRecoveryVol++
+				}
+			}
+		}
+	}
+	return j
 }
 
 // Accessors.
@@ -387,7 +429,11 @@ func (j *Job) MarkSegmentDone(r SegmentResult, now time.Time) error {
 	if s.state == SegmentStateDone {
 		return nil
 	}
+	wasTerminal := s.state.IsTerminal() // false here unless Done early-returned, but be defensive
 	s.state = SegmentStateDone
+	if !wasTerminal {
+		j.adjustUnresolved(f, -1)
+	}
 	s.lastError = ""
 	s.fileOffset = r.FileOffset
 	j.doneBytes += r.BytesOnDisk
@@ -425,6 +471,7 @@ func (j *Job) MarkSegmentMissing(segID SegmentID, now time.Time) error {
 		return nil
 	}
 	s.state = SegmentStateMissing
+	j.adjustUnresolved(f, -1)
 	s.lastError = "article missing on all servers"
 	j.failedBytes += s.bytes
 	j.events = append(j.events, SegmentMissing{
@@ -447,6 +494,7 @@ func (j *Job) MarkSegmentFailed(segID SegmentID, errMsg string, now time.Time) e
 		return nil
 	}
 	s.state = SegmentStateFailed
+	j.adjustUnresolved(f, -1)
 	s.lastError = errMsg
 	j.failedBytes += s.bytes
 	j.events = append(j.events, SegmentFailed{
@@ -549,6 +597,9 @@ func (j *Job) ResetFailedToPending() int {
 		for _, s := range f.segments {
 			if s.state == SegmentStateFailed || s.state == SegmentStateMissing {
 				s.state = SegmentStatePending
+				// terminal -> non-terminal: the segment is back in
+				// the pending pool and contributes to "unresolved".
+				j.adjustUnresolved(f, +1)
 				s.attempts = 0
 				s.lastError = ""
 				n++
@@ -657,17 +708,29 @@ func (j *Job) MarkSegmentForRetry(segID SegmentID, at time.Time, errMsg string) 
 // terminal state. Recovery-vol segments are ignored when the job has
 // not opted in to fetching them (mirrors PendingSegments).
 func (j *Job) allSegmentsResolved() bool {
-	for _, f := range j.files {
-		if f.isRecoveryVol && !j.fetchRecoveryVols {
-			continue
-		}
-		for _, s := range f.segments {
-			if !s.state.IsTerminal() {
-				return false
-			}
-		}
+	if j.unresolvedNonRecoveryVol > 0 {
+		return false
+	}
+	if j.fetchRecoveryVols && j.unresolvedRecoveryVol > 0 {
+		return false
 	}
 	return true
+}
+
+// adjustUnresolved mutates the per-bucket "unresolved segments" counter
+// when a segment in file f crosses the terminal boundary.
+//
+//	delta = -1: just became terminal (Done/Missing/Failed)
+//	delta = +1: just became non-terminal again (e.g. ResetFailedToPending)
+//
+// The two buckets exist so allSegmentsResolved can honour recovery-vol
+// gating without rescanning.
+func (j *Job) adjustUnresolved(f *File, delta int) {
+	if f.isRecoveryVol {
+		j.unresolvedRecoveryVol += delta
+	} else {
+		j.unresolvedNonRecoveryVol += delta
+	}
 }
 
 // FetchRecoveryVols reports whether this Job's orchestrator should
