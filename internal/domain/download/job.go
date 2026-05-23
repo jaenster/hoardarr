@@ -12,6 +12,7 @@ package download
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jaenster/hoardarr/internal/domain/event"
@@ -58,7 +59,25 @@ type Job struct {
 
 	files []*File
 
+	// segIdx is a lazy O(1) lookup table for SegmentByID. The orchestrator
+	// runs attemptSegment goroutines concurrently per Job, all calling
+	// SegmentByID on the same aggregate — the original O(F × S) linear
+	// scan showed up clearly in production profiles. segIdxOnce gates
+	// the first build so concurrent callers race only on the once, not
+	// on the map. RebuildSegmentIndex resets the once when the repo has
+	// assigned fresh IDs (post-insert).
+	segIdx     map[SegmentID]segmentRef
+	segIdxOnce sync.Once
+
 	events []event.Event
+}
+
+// segmentRef pairs a segment with its owning file — both are what
+// SegmentByID returns, so caching the pair lets us answer in one map
+// lookup with no further iteration.
+type segmentRef struct {
+	file *File
+	seg  *Segment
 }
 
 // NewJobParams gathers the inputs to construct a fresh Job.
@@ -303,15 +322,47 @@ func (j *Job) MarkRemoved(now time.Time) {
 
 // SegmentByID looks up a segment within the aggregate. Returns nil if
 // the id is not part of this job.
+//
+// Concurrent-safe: the first caller builds the index under sync.Once;
+// subsequent callers do a lock-free map read. The index is stable for
+// the lifetime of the Job once built — segment IDs are immutable
+// after the repo's INSERT completes. If the repo assigns fresh IDs
+// to an already-indexed Job (insert path), it must call
+// RebuildSegmentIndex.
 func (j *Job) SegmentByID(id SegmentID) (*File, *Segment) {
-	for _, f := range j.files {
-		for _, s := range f.segments {
-			if s.id == id {
-				return f, s
-			}
-		}
+	j.segIdxOnce.Do(j.buildSegmentIndex)
+	if ref, ok := j.segIdx[id]; ok {
+		return ref.file, ref.seg
 	}
 	return nil, nil
+}
+
+// RebuildSegmentIndex resets the lazy SegmentByID cache so the next
+// lookup rebuilds it. The persistence layer calls this after assigning
+// IDs to fresh segments during insert; the rebuild is cheap (one pass
+// over files × segments) and avoids stale-ID lookups.
+//
+// Not safe to call concurrently with SegmentByID — but the insert
+// path is the only call site, and it runs before the Job is handed
+// off to the orchestrator's worker goroutines, so contention does
+// not arise in practice.
+func (j *Job) RebuildSegmentIndex() {
+	j.segIdx = nil
+	j.segIdxOnce = sync.Once{}
+}
+
+func (j *Job) buildSegmentIndex() {
+	// Pre-size to avoid grow-and-rehash during build.
+	n := 0
+	for _, f := range j.files {
+		n += len(f.segments)
+	}
+	j.segIdx = make(map[SegmentID]segmentRef, n)
+	for _, f := range j.files {
+		for _, s := range f.segments {
+			j.segIdx[s.id] = segmentRef{file: f, seg: s}
+		}
+	}
 }
 
 // SegmentResult is the outcome of one fetch attempt fed back into the

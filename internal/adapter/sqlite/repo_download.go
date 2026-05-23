@@ -74,6 +74,10 @@ func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
 			return err
 		}
 	}
+	// Segment IDs were 0 when SegmentByID first cached anything (e.g.
+	// during construction); now that every segment has its real DB id
+	// invalidate so the next lookup rebuilds the map with correct keys.
+	j.RebuildSegmentIndex()
 	return nil
 }
 

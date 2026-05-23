@@ -163,10 +163,23 @@ func NewOrchestrator(
 		opts.Now = func() time.Time { return time.Now().UTC() }
 	}
 	if opts.FlushInterval == 0 {
-		opts.FlushInterval = 100 * time.Millisecond
+		// 1s is the right knob for the V1500B-class hardware this runs
+		// on: the original 100ms was driving the SQLite VDBE (already
+		// the dominant CPU consumer at ~50% during downloads) ten times
+		// harder than necessary. On crash we lose at most one second of
+		// segment progress — the orchestrator re-dispatches those
+		// segments cleanly on restart from the persisted "pending"
+		// state, so the user-visible impact is at most a handful of
+		// re-fetched articles per crash. SSE progress updates ride on
+		// the same flush; 1Hz is still smoother than a typical
+		// download client UI and below most users' perception of "live".
+		opts.FlushInterval = 1 * time.Second
 	}
 	if opts.FlushBatchMax == 0 {
-		opts.FlushBatchMax = 256
+		// 1024 is generous enough that the batch-cap rarely flushes
+		// early. At ~10-100 segments/sec across all in-flight downloads
+		// we hit the ticker, not the cap.
+		opts.FlushBatchMax = 1024
 	}
 	if opts.MaxAttempts == 0 {
 		opts.MaxAttempts = 3
