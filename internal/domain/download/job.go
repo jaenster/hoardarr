@@ -85,6 +85,16 @@ type Job struct {
 	unresolvedNonRecoveryVol int
 	unresolvedRecoveryVol    int
 
+	// stateDirty is set whenever a field that's part of the "full
+	// UPDATE jobs" row has changed since the last Save (anything
+	// other than the running done_bytes / failed_bytes counters).
+	// The orchestrator's flush path uses this to pick between a full
+	// 12-column save (state transitions) and a cheap 2-column
+	// counter-only update (the common steady-state case during an
+	// active download). Cleared by ClearStateDirty after the repo
+	// completes a full Save.
+	stateDirty bool
+
 	events []event.Event
 }
 
@@ -231,6 +241,23 @@ func HydrateJob(p HydrateJobParams) *Job {
 }
 
 // Accessors.
+// IsStateDirty reports whether any non-counter Job field has changed
+// since the last full Save. Counters (done_bytes, failed_bytes)
+// change every flush during active download and are tracked
+// separately — the orchestrator persists them via a cheap UPDATE
+// regardless of stateDirty.
+func (j *Job) IsStateDirty() bool { return j.stateDirty }
+
+// ClearStateDirty marks the job's non-counter fields as in sync with
+// the persistence layer. Called by the repo after a successful full
+// Save.
+func (j *Job) ClearStateDirty() { j.stateDirty = false }
+
+// markStateDirty is the internal helper called by every state-
+// transitioning mutator. Marker for "the next flush needs a full
+// UPDATE jobs to persist these field changes".
+func (j *Job) markStateDirty() { j.stateDirty = true }
+
 func (j *Job) ID() JobID         { return j.id }
 func (j *Job) NZBHash() string   { return j.nzbHash }
 func (j *Job) Name() string      { return j.name }
@@ -276,7 +303,11 @@ func (j *Job) SetID(id JobID) {
 // Terminal jobs aren't filtered here; QueueService.Reorder is
 // responsible for not feeding terminal IDs into the operation.
 func (j *Job) SetQueueOrder(order int64) {
+	if j.queueOrder == order {
+		return
+	}
 	j.queueOrder = order
+	j.markStateDirty()
 }
 
 // PullEvents returns and clears the pending event list.
@@ -294,6 +325,7 @@ func (j *Job) MarkStarted(now time.Time) {
 	}
 	j.state = JobStateDownloading
 	j.startedAt = now
+	j.markStateDirty()
 	j.events = append(j.events, JobStarted{ID: j.id, At: now})
 }
 
@@ -304,6 +336,7 @@ func (j *Job) Pause(now time.Time) {
 	switch j.state {
 	case JobStateQueued, JobStateDownloading:
 		j.state = JobStatePaused
+		j.markStateDirty()
 		j.events = append(j.events, JobPaused{ID: j.id, At: now})
 	}
 }
@@ -320,6 +353,7 @@ func (j *Job) Resume(now time.Time) {
 	} else {
 		j.state = JobStateDownloading
 	}
+	j.markStateDirty()
 	j.events = append(j.events, JobResumed{ID: j.id, At: now})
 }
 
@@ -335,6 +369,7 @@ func (j *Job) MarkWaitingForServer(reason string, now time.Time) {
 		return
 	}
 	j.state = JobStateWaitingForServer
+	j.markStateDirty()
 	j.events = append(j.events, JobWaitingForServer{
 		JobID:  j.id,
 		Reason: reason,
@@ -352,6 +387,7 @@ func (j *Job) ResumeFromWait(now time.Time) {
 		return
 	}
 	j.state = JobStateQueued
+	j.markStateDirty()
 	j.events = append(j.events, JobResumed{ID: j.id, At: now})
 }
 
@@ -536,6 +572,7 @@ func (j *Job) AbortIfHopeless(threshold float64, now time.Time) bool {
 	j.state = JobStateFailed
 	j.errorMsg = reason
 	j.finishedAt = now
+	j.markStateDirty()
 	j.events = append(j.events,
 		JobDownloadFailed{JobID: j.id, Err: reason, At: now},
 		JobFailed{JobID: j.id, Err: reason, At: now},
@@ -613,6 +650,7 @@ func (j *Job) ResetFailedToPending() int {
 		j.state = JobStateQueued
 		j.finishedAt = time.Time{}
 		j.errorMsg = ""
+		j.markStateDirty()
 	}
 	return n
 }
@@ -773,6 +811,7 @@ func (j *Job) RequestRecoveryVols(now time.Time) error {
 		return errors.New("download: no deferred recovery vol segments")
 	}
 	j.fetchRecoveryVols = true
+	j.markStateDirty()
 	// Reopen the active phase so the orchestrator's per-job runner
 	// will pick up the now-visible pending segments. Anything past
 	// download_complete (verifying/repairing/etc.) is moved back to
@@ -806,6 +845,7 @@ func (j *Job) completeDownloadPhase(now time.Time) {
 		j.state = JobStateFailed
 		j.errorMsg = reason
 		j.finishedAt = now
+		j.markStateDirty()
 		j.events = append(j.events, JobDownloadFailed{
 			JobID: j.id,
 			Err:   reason,
@@ -819,6 +859,7 @@ func (j *Job) completeDownloadPhase(now time.Time) {
 		return
 	}
 	j.state = JobStateDownloadComplete
+	j.markStateDirty()
 	j.events = append(j.events, JobDownloadComplete{
 		JobID:           j.id,
 		MissingSegments: j.countMissingSegments(),
@@ -835,6 +876,7 @@ func (j *Job) MarkCompleted(now time.Time) {
 	}
 	j.state = JobStateCompleted
 	j.finishedAt = now
+	j.markStateDirty()
 	j.events = append(j.events, JobCompleted{
 		JobID: j.id,
 		At:    now,
@@ -850,6 +892,7 @@ func (j *Job) MarkFailed(reason string, now time.Time) {
 	j.state = JobStateFailed
 	j.errorMsg = reason
 	j.finishedAt = now
+	j.markStateDirty()
 	j.events = append(j.events, JobFailed{
 		JobID: j.id,
 		Err:   reason,

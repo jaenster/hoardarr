@@ -46,6 +46,15 @@ type JobRepository interface {
 	// UpdateSegmentBatch applies many small segment-completion updates
 	// in a single tx. Used by the orchestrator's 100ms drainer.
 	UpdateSegmentBatch(ctx context.Context, updates []SegmentUpdate) error
+
+	// UpdateCounters writes only the two running progress counters
+	// (done_bytes, failed_bytes) for an active job. Cheaper than Save
+	// because it touches just the columns that actually change
+	// between flushes during a download. The orchestrator uses it on
+	// the common steady-state path; Save still runs whenever the
+	// job's IsStateDirty bit is set (state transitions, queue order,
+	// terminal-state metadata).
+	UpdateCounters(ctx context.Context, j *Job) error
 }
 
 // HistoryQuery filters terminal-state jobs returned by JobRepository.History.

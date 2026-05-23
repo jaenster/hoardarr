@@ -35,9 +35,19 @@ func NewJobRepo(db *DB) *JobRepo {
 // job-level columns only.
 func (r *JobRepo) Save(ctx context.Context, j *download.Job) error {
 	if j.ID() == 0 {
-		return r.insert(ctx, j)
+		if err := r.insert(ctx, j); err != nil {
+			return err
+		}
+		j.ClearStateDirty()
+		return nil
 	}
-	return r.update(ctx, j)
+	if err := r.update(ctx, j); err != nil {
+		return err
+	}
+	// A full UPDATE persists every column; the job's non-counter
+	// fields are now in sync with the DB.
+	j.ClearStateDirty()
+	return nil
 }
 
 func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
@@ -78,6 +88,26 @@ func (r *JobRepo) insert(ctx context.Context, j *download.Job) error {
 	// during construction); now that every segment has its real DB id
 	// invalidate so the next lookup rebuilds the map with correct keys.
 	j.RebuildSegmentIndex()
+	return nil
+}
+
+// UpdateCounters persists only the two counter columns
+// (done_bytes, failed_bytes) for an active job. Cheaper than a full
+// Save because it binds 3 values instead of 13 and touches only
+// columns that actually change between flushes during a download.
+//
+// The orchestrator's drainer uses this when the job's state-level
+// fields are clean (no transitions, no name/queue/error changes
+// since the last full Save). The full Save path still runs whenever
+// IsStateDirty reports true.
+func (r *JobRepo) UpdateCounters(ctx context.Context, j *download.Job) error {
+	_, err := r.db.ExecCtx(ctx,
+		`UPDATE jobs SET done_bytes = ?, failed_bytes = ? WHERE id = ?`,
+		j.DoneBytes(), j.FailedBytes(), int64(j.ID()),
+	)
+	if err != nil {
+		return fmt.Errorf("update counters: %w", err)
+	}
 	return nil
 }
 

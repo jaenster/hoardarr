@@ -632,6 +632,16 @@ func (o *Orchestrator) flushBatch(ctx context.Context, job *download.Job, batch 
 
 // flushAggregate persists the current job state and publishes pending
 // events, plus any segment-level updates implied by batch.
+//
+// Two persist paths to keep the steady-state download flush cheap:
+//
+//   - If the Job's non-counter fields changed since the last save
+//     (state transition, queue order edit, terminal-state metadata,
+//     etc.), do a full Save — rewrites all 12 columns of the jobs row.
+//   - Otherwise the only thing that moved is done_bytes/failed_bytes;
+//     a targeted UpdateCounters rewrites just those two columns.
+//
+// The per-batch UpdateSegmentBatch + Publish steps are unchanged.
 func (o *Orchestrator) flushAggregate(ctx context.Context, job *download.Job, batch []segmentResult) error {
 	updates := buildSegmentUpdates(job, batch)
 	return o.tx.InTx(ctx, func(ctx context.Context) error {
@@ -640,8 +650,14 @@ func (o *Orchestrator) flushAggregate(ctx context.Context, job *download.Job, ba
 				return fmt.Errorf("update segments: %w", err)
 			}
 		}
-		if err := o.repo.Save(ctx, job); err != nil {
-			return fmt.Errorf("save job: %w", err)
+		if job.IsStateDirty() {
+			if err := o.repo.Save(ctx, job); err != nil {
+				return fmt.Errorf("save job: %w", err)
+			}
+		} else {
+			if err := o.repo.UpdateCounters(ctx, job); err != nil {
+				return fmt.Errorf("update job counters: %w", err)
+			}
 		}
 		return o.bus.Publish(ctx, job.PullEvents()...)
 	})
