@@ -190,22 +190,36 @@ func validateMessageID(mid string) error {
 }
 
 // parseFilenameFromSubject tries to recover the filename from a Usenet
-// subject line. Convention is to wrap it in double quotes:
+// subject line.
+//
+// Canonical convention is double-quoted:
 //
 //	[Group] [1/15] - "filename.rar" - [4194304/4194304] yEnc (1/8)
 //
-// We take the first quoted token. If no quotes, we fall back to the
-// last whitespace-delimited token that looks like a filename
-// (contains a "."), which is the convention some posters use.
+// Several private indexers use obfuscated formats where the filename
+// is embedded in a bracket group instead, and the quote slot is empty:
+//
+//	[PRiVATE]-[WtFnZb]-[Monster.2022.S02E09.mkv]-[1/2] - "" yEnc  7337... (1/10237)
+//
+// The bracket pass handles those. A token-scan fallback covers the
+// case where the poster used neither convention but slipped the name
+// in as a bare whitespace-delimited token.
 func parseFilenameFromSubject(subject string) string {
+	// 1. Canonical: quoted token with at least one character.
 	if m := firstQuotedRE.FindStringSubmatch(subject); m != nil {
 		return strings.TrimSpace(m[1])
 	}
-	// Fallback heuristic.
+	// 2. Obfuscated: any [...] group whose contents end in `.ext`
+	// (1–5 alphanumeric) and contain no nested brackets or path
+	// separators. yEnc filenames are well-behaved enough to fit this.
+	if m := bracketFilenameRE.FindStringSubmatch(subject); m != nil {
+		return strings.TrimSpace(m[1])
+	}
+	// 3. Last-token heuristic. Strip surrounding punctuation and
+	// accept anything containing a "." without a path separator.
 	tokens := strings.Fields(subject)
 	for i := len(tokens) - 1; i >= 0; i-- {
 		t := tokens[i]
-		// Trim trailing punctuation that often appears.
 		t = strings.TrimRight(t, ",;)]}\"'")
 		t = strings.TrimLeft(t, "([{\"'")
 		if strings.Contains(t, ".") && !strings.ContainsAny(t, "/\\") {
@@ -215,7 +229,10 @@ func parseFilenameFromSubject(subject string) string {
 	return ""
 }
 
-var firstQuotedRE = regexp.MustCompile(`"([^"]+)"`)
+var (
+	firstQuotedRE      = regexp.MustCompile(`"([^"]+)"`)
+	bracketFilenameRE  = regexp.MustCompile(`\[([^\[\]/\\]+\.[a-zA-Z0-9]{1,5})\]`)
+)
 
 // charsetReader handles non-UTF-8 NZBs. The most common alternative
 // in the wild is iso-8859-1 (the DTD's declared default). Anything

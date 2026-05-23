@@ -124,6 +124,21 @@ func TestParseFilenameFromSubject(t *testing.T) {
 		{`"file.rar" yEnc (1/3)`, "file.rar"},
 		{`Foo Bar - file.rar - more`, "file.rar"},
 		{``, ""},
+		// Obfuscated subject lines from private indexers — filename
+		// is wrapped in []s and the quote slot is empty. The bracket
+		// extractor catches these.
+		{
+			`[N3wZ] \jmAl6g259274\::[PRiVATE]-[WtFnZb]-[Monster.2022.S02E09.mkv]-[1/2] - "" yEnc  7337320579 (1/10237)`,
+			"Monster.2022.S02E09.mkv",
+		},
+		{
+			`[PRiVATE]-[WtFnZb]-[Release.Name.2160p.HDR.mkv]-[1/2] - "" yEnc 1234`,
+			"Release.Name.2160p.HDR.mkv",
+		},
+		{
+			`Foo - [release.par2]-[1/1] - "" yEnc (1/1)`,
+			"release.par2",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.subject, func(t *testing.T) {
