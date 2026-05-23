@@ -89,6 +89,13 @@ type Service struct {
 	throughput  *Throughput
 	now         func() time.Time
 
+	// history is optional long-term throughput persistence. nil-safe;
+	// when nil the historyLoop is skipped and /speed-history serves
+	// only what's in the in-memory ring.
+	history       SpeedHistoryStore
+	peakSave      func(v int64) (int64, error)
+	retentionDays int
+
 	// bus + ticker plumbing for SSE-push of throughput / pools.
 	// Wired by Start(); nil-safe (status endpoints still work even
 	// when the service isn't pushing).
@@ -112,6 +119,17 @@ type Params struct {
 	PoolsSource func() map[domainserver.ServerID]*nntp.Pool
 	Servers     ServerStatRepo
 	Throughput  *Throughput
+	// History persists a downsampled (1 row per minute) throughput
+	// record for /speed-history queries beyond the in-memory ring.
+	// Optional — nil disables persistence (the long-range slice of
+	// the API then returns only the in-memory window).
+	History SpeedHistoryStore
+	// PeakSave persists the all-time peak when a new high-water mark
+	// is observed. Optional. Receives bytes/sec; should be bumps-only.
+	PeakSave func(v int64) (int64, error)
+	// RetentionDays caps how far back History samples survive. 0 ⇒
+	// keep 30 days (default).
+	RetentionDays int
 	// Bus, if supplied, receives periodic system.throughput and
 	// system.pools envelopes once Start() is called. SSE clients pick
 	// these up via the hub so the frontend doesn't need to poll
@@ -136,6 +154,10 @@ func New(p Params) *Service {
 	if p.Logger == nil {
 		p.Logger = slog.Default()
 	}
+	retention := p.RetentionDays
+	if retention <= 0 {
+		retention = 30
+	}
 	return &Service{
 		version:          p.Version,
 		commit:           p.Commit,
@@ -146,24 +168,46 @@ func New(p Params) *Service {
 		poolsSource:      p.PoolsSource,
 		servers:          p.Servers,
 		throughput:       p.Throughput,
+		history:          p.History,
+		peakSave:         p.PeakSave,
+		retentionDays:    retention,
 		bus:              p.Bus,
 		logger:           p.Logger,
 		now:              p.Now,
 	}
 }
 
-// Start kicks off the periodic throughput + pool emitters. Idempotent.
-// No-op if the service has no bus configured.
+// History exposes the persistent speed-history store. Returns nil if
+// no store was supplied (the speed-history endpoint then serves only
+// the in-memory ring).
+func (s *Service) History() SpeedHistoryStore { return s.history }
+
+// Start kicks off the periodic background loops: SSE throughput +
+// pool emitters (when a bus is wired) and the history flusher /
+// peak persister (when a history store is wired). Idempotent.
 func (s *Service) Start(_ context.Context) error {
-	if s.bus == nil || s.cancel != nil {
+	if s.cancel != nil {
+		return nil
+	}
+	if s.bus == nil && s.history == nil && s.peakSave == nil {
 		return nil
 	}
 	rootCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.wg.Add(2)
-	go s.throughputLoop(rootCtx)
-	go s.poolsLoop(rootCtx)
-	s.logger.Info("system service started", "topics", []string{"system.throughput", "system.pools"})
+	if s.bus != nil {
+		s.wg.Add(2)
+		go s.throughputLoop(rootCtx)
+		go s.poolsLoop(rootCtx)
+	}
+	if s.history != nil || s.peakSave != nil {
+		s.wg.Add(1)
+		go s.historyLoop(rootCtx)
+	}
+	s.logger.Info("system service started",
+		"has_bus", s.bus != nil,
+		"has_history", s.history != nil,
+		"retention_days", s.retentionDays,
+	)
 	return nil
 }
 
@@ -202,7 +246,7 @@ func (s *Service) throughputLoop(ctx context.Context) {
 				Avg10sBytesPerSec:  snap.Avg10sBytesPerSec,
 				Avg60sBytesPerSec:  snap.Avg60sBytesPerSec,
 				TotalBytes:         snap.Total,
-				WindowSeconds:      WindowSize,
+				WindowSeconds:      snap.WindowSeconds,
 			}
 			if err := s.bus.Publish(ctx, ev); err != nil {
 				// Bus full or shutdown — best-effort; the next tick will
@@ -210,6 +254,97 @@ func (s *Service) throughputLoop(ctx context.Context) {
 				_ = err
 			}
 		}
+	}
+}
+
+// historyLoop persists one downsampled throughput sample per minute
+// and periodically prunes rows older than the retention window. Same
+// goroutine also writes the all-time peak whenever it bumps so a
+// fresh start picks up the historical maximum.
+//
+// Aligns its first tick to the next wall-clock minute boundary so
+// stored bucket_at values are predictable (helps debugging and means
+// the API can stitch in-memory + DB samples without overlap-checks).
+func (s *Service) historyLoop(ctx context.Context) {
+	defer s.wg.Done()
+
+	// Align to the next minute.
+	now := s.now()
+	delay := time.Duration(60-now.Second())*time.Second - time.Duration(now.Nanosecond())
+	if delay < time.Second {
+		delay += time.Minute
+	}
+	first := time.NewTimer(delay)
+	defer first.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-first.C:
+	}
+
+	// Track the last persisted peak so we don't hammer the settings
+	// table writing the same value every minute.
+	var lastPeak int64
+	if s.throughput != nil {
+		lastPeak = s.throughput.AllTimePeak()
+	}
+
+	// Purge once at startup so retention is enforced even on long-
+	// idling instances.
+	s.purgeHistory(ctx)
+
+	flush := time.NewTicker(time.Minute)
+	defer flush.Stop()
+	purge := time.NewTicker(time.Hour)
+	defer purge.Stop()
+
+	for {
+		s.flushOneMinute(ctx)
+		if s.throughput != nil && s.peakSave != nil {
+			cur := s.throughput.AllTimePeak()
+			if cur > lastPeak {
+				if _, err := s.peakSave(cur); err != nil {
+					s.logger.Warn("persist all-time peak", "err", err)
+				} else {
+					lastPeak = cur
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-purge.C:
+			s.purgeHistory(ctx)
+		case <-flush.C:
+		}
+	}
+}
+
+// flushOneMinute writes one history row holding the Avg60s value at
+// the previous minute boundary. No-op when history is unset.
+func (s *Service) flushOneMinute(ctx context.Context) {
+	if s.history == nil || s.throughput == nil {
+		return
+	}
+	// Bucket = the start of the previous wall-clock minute. We've
+	// just crossed into a new minute, so Avg60s captures the one we
+	// just finished.
+	bucket := s.now().UTC().Truncate(time.Minute).Add(-time.Minute)
+	snap := s.throughput.Sample()
+	if err := s.history.Append(ctx, SpeedSample{At: bucket, BytesPerSec: snap.Avg60sBytesPerSec}); err != nil {
+		s.logger.Warn("append speed history", "err", err)
+	}
+}
+
+func (s *Service) purgeHistory(ctx context.Context) {
+	if s.history == nil {
+		return
+	}
+	cutoff := s.now().UTC().Add(-time.Duration(s.retentionDays) * 24 * time.Hour)
+	if n, err := s.history.Purge(ctx, cutoff); err != nil {
+		s.logger.Warn("purge speed history", "err", err)
+	} else if n > 0 {
+		s.logger.Info("speed history purged", "rows", n, "before", cutoff)
 	}
 }
 

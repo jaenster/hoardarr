@@ -1289,10 +1289,78 @@ a:hover {
   color: var(--text);
 }
 
-/* sparkline + log viewer (System page) */
+/* speed chart + log viewer (System page) */
 
-.sparkline {
-  vertical-align: middle;
+.speed-chart {
+  display: block;
+  margin-top: 0.25rem;
+}
+
+.speed-ranges {
+  display: inline-flex;
+  gap: 0.25rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+.speed-range-btn {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.speed-range-btn:hover {
+  color: var(--text);
+}
+.speed-range-btn.is-active {
+  background: var(--bg-elev-2);
+  color: var(--text);
+}
+
+.speed-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+.speed-stats {
+  display: flex;
+  gap: 1.5rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.speed-stats strong {
+  color: var(--text);
+  font-weight: 600;
+  margin-right: 0.35rem;
+}
+.speed-throttle {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+}
+.speed-throttle label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.75rem;
+  color: var(--muted);
+  gap: 0.2rem;
+}
+.speed-throttle input {
+  width: 6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font: inherit;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
 }
 .log-viewer {
   font-family: ui-monospace, SFMono-Regular, monospace;

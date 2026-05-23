@@ -1,12 +1,24 @@
 import { useEffect, useRef, useState } from "react";
-import { Database, Pause, Play, PlayCircle, RefreshCw, Send } from "lucide-react";
+import { Database, Gauge, Pause, Play, PlayCircle, RefreshCw, Send } from "lucide-react";
 import Page from "../components/Page";
 import Panel from "../components/Panel";
 import Button from "../components/Button";
+import SpeedChart from "../components/SpeedChart";
 import StatusBadge from "../components/StatusBadge";
 import { useToasts } from "../components/Toasts";
 import { api, logStreamURL } from "../api/client";
-import type { BackupFile, Command, DiskEntry, LogEntry, LogFile, ScheduledTask, SystemStatus, Throughput } from "../api/types";
+import type {
+  BackupFile,
+  Command,
+  DiskEntry,
+  LogEntry,
+  LogFile,
+  ScheduledTask,
+  SpeedHistory,
+  SpeedHistoryRange,
+  SystemStatus,
+  Throughput,
+} from "../api/types";
 
 export default function System() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
@@ -51,6 +63,8 @@ export default function System() {
         </Button>
       }
     >
+      <SpeedPanel throughput={throughput} />
+
       <Panel
         title="Status"
         meta={
@@ -100,13 +114,10 @@ export default function System() {
               {status.queue.active} active / {status.queue.total} total
             </dd>
             <dt>Throughput</dt>
-            <dd>
-              <Sparkline data={throughput?.series ?? []} />
-              <span className="muted" style={{ marginLeft: "0.5rem" }}>
-                {throughput
-                  ? `${formatBytes(throughput.current_bytes_per_sec)}/s now • ${formatBytes(throughput.total_bytes)} last 5m`
-                  : "—"}
-              </span>
+            <dd className="muted">
+              {throughput
+                ? `${formatBytes(throughput.current_bytes_per_sec)}/s now • peak ${formatBytes(throughput.peak_alltime_bytes_per_sec)}/s`
+                : "—"}
             </dd>
           </dl>
         ) : null}
@@ -191,6 +202,133 @@ export default function System() {
       <LogFilesPanel />
     </Page>
   );
+}
+
+// SpeedPanel renders the full-width throughput chart, range picker,
+// peak stats, and a quick throttle slider that PUTs the global cap
+// without a trip to Settings. The chart polls /system/speed-history
+// at a cadence proportional to the chosen range (5m views poll fast,
+// 7d views poll once a minute — no point thrashing the DB).
+function SpeedPanel({ throughput }: { throughput: Throughput | null }) {
+  const [range, setRange] = useState<SpeedHistoryRange>("5m");
+  const [history, setHistory] = useState<SpeedHistory | null>(null);
+  const [draftCap, setDraftCap] = useState<string>("");
+  const [savingCap, setSavingCap] = useState(false);
+  const toast = useToasts();
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const h = await api.speedHistory(range);
+        if (!cancelled) setHistory(h);
+      } catch {
+        /* ignore — chart simply doesn't update */
+      }
+    };
+    void load();
+    const interval = range === "5m" || range === "1h" ? 5_000 : 30_000;
+    const id = setInterval(() => void load(), interval);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [range]);
+
+  // Seed the cap input from the live throughput response so the
+  // operator sees the current value without needing to load Settings.
+  useEffect(() => {
+    if (throughput && draftCap === "") {
+      const mb = throughput.global_cap_bytes_per_sec / (1024 * 1024);
+      setDraftCap(mb > 0 ? String(round1(mb)) : "0");
+    }
+  }, [throughput]);
+
+  const submitCap = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const mb = Number(draftCap);
+    if (!Number.isFinite(mb) || mb < 0) {
+      toast.error("Speed must be a non-negative number (MB/s)");
+      return;
+    }
+    setSavingCap(true);
+    try {
+      const bytes = Math.round(mb * 1024 * 1024);
+      await api.setBandwidth({ global_bytes_per_sec: bytes });
+      toast.success(mb > 0 ? `Throttle set to ${mb} MB/s` : "Throttle disabled");
+    } catch (err) {
+      toast.error("Could not save cap", { message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setSavingCap(false);
+    }
+  };
+
+  const cap = history?.global_cap_bytes_per_sec ?? throughput?.global_cap_bytes_per_sec ?? 0;
+  const peakAllTime = history?.peak_alltime_bytes_per_sec ?? throughput?.peak_alltime_bytes_per_sec ?? 0;
+  const peakWindow = history?.peak_window_bytes_per_sec ?? throughput?.peak_window_bytes_per_sec ?? 0;
+  const samples = history?.samples ?? [];
+  const resolution = history?.resolution_seconds ?? 1;
+
+  return (
+    <Panel
+      title="Download speed"
+      meta={
+        <StatusBadge tone={cap > 0 ? "warn" : "ok"} dot>
+          <Gauge size={12} />
+          {cap > 0 ? `${formatBytes(cap)}/s cap` : "uncapped"}
+        </StatusBadge>
+      }
+      actions={
+        <div className="speed-ranges">
+          {(["5m", "1h", "6h", "24h", "7d"] as SpeedHistoryRange[]).map((r) => (
+            <button
+              key={r}
+              type="button"
+              className={"speed-range-btn" + (r === range ? " is-active" : "")}
+              onClick={() => setRange(r)}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+      }
+    >
+      <SpeedChart
+        samples={samples}
+        capBytesPerSec={cap}
+        peakAllTimeBytesPerSec={peakAllTime}
+        peakWindowBytesPerSec={peakWindow}
+        resolutionSeconds={resolution}
+      />
+      <div className="speed-footer">
+        <div className="speed-stats">
+          <span><strong>Now</strong> {formatBytes(throughput?.current_bytes_per_sec ?? 0)}/s</span>
+          <span><strong>Peak (window)</strong> {formatBytes(peakWindow)}/s</span>
+          <span><strong>Peak (all-time)</strong> {formatBytes(peakAllTime)}/s</span>
+        </div>
+        <form className="speed-throttle" onSubmit={submitCap}>
+          <label>
+            <span>Throttle MB/s</span>
+            <input
+              type="number"
+              min={0}
+              step={0.5}
+              value={draftCap}
+              onChange={(e) => setDraftCap(e.target.value)}
+              placeholder="0"
+            />
+          </label>
+          <Button variant="primary" type="submit" disabled={savingCap}>
+            {savingCap ? "Saving…" : "Apply"}
+          </Button>
+        </form>
+      </div>
+    </Panel>
+  );
+}
+
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
 }
 
 function BackupsPanel() {
@@ -528,26 +666,6 @@ function DiskSpacePanel() {
 function pct(used: number, total: number): number {
   if (total <= 0) return 0;
   return Math.min(100, Math.max(0, Math.round((used / total) * 100)));
-}
-
-function Sparkline({ data, height = 22, width = 140 }: { data: number[]; height?: number; width?: number }) {
-  if (data.length === 0) {
-    return <svg className="sparkline" width={width} height={height} aria-hidden="true" />;
-  }
-  const max = Math.max(...data, 1);
-  const step = width / Math.max(data.length - 1, 1);
-  const pts = data
-    .map((v, i) => {
-      const x = i * step;
-      const y = height - (v / max) * (height - 2) - 1;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
-  return (
-    <svg className="sparkline" width={width} height={height} aria-label="throughput last 5 minutes">
-      <polyline points={pts} fill="none" stroke="var(--accent)" strokeWidth={1.5} />
-    </svg>
-  );
 }
 
 function LogsPanel() {

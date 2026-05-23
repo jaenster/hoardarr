@@ -26,6 +26,8 @@ import type {
   Paths,
   ScheduledTask,
   Server,
+  SpeedHistory,
+  SpeedHistoryRange,
   Subscription,
   SystemStatus,
   Throughput,
@@ -235,6 +237,9 @@ export const api = {
   },
   throughput(): Promise<Throughput> {
     return req("GET", "/api/v1/system/throughput");
+  },
+  speedHistory(range: SpeedHistoryRange): Promise<SpeedHistory> {
+    return req("GET", `/api/v1/system/speed-history?range=${range}`);
   },
   logSnapshot(): Promise<{ entries: LogEntry[] }> {
     return req("GET", "/api/v1/system/logs");

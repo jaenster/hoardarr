@@ -184,6 +184,25 @@ export type Throughput = {
   current_bytes_per_sec: number;
   avg10s_bytes_per_sec: number;
   avg60s_bytes_per_sec: number;
+  peak_window_bytes_per_sec: number;
+  peak_alltime_bytes_per_sec: number;
+  global_cap_bytes_per_sec: number;
+};
+
+export type SpeedHistoryRange = "5m" | "1h" | "6h" | "24h" | "7d";
+
+export type SpeedHistorySample = {
+  at: string;
+  bytes_per_sec: number;
+};
+
+export type SpeedHistory = {
+  range: SpeedHistoryRange;
+  resolution_seconds: number;
+  samples: SpeedHistorySample[];
+  peak_window_bytes_per_sec: number;
+  peak_alltime_bytes_per_sec: number;
+  global_cap_bytes_per_sec: number;
 };
 
 export type SubscriptionKind = "webhook" | "discord" | "slack";

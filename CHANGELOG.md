@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Full-width download-speed chart on the System page, with the
+  configured global cap drawn as a dashed reference line, window-
+  peak marker, and an all-time-peak hint line. Range picker switches
+  the view between 5 min / 1 h / 6 h / 24 h / 7 d.
+- Persistent throughput history (`speed_history` table, one row per
+  minute, 30-day retention) backs the longer ranges; the in-memory
+  ring widens to one hour and serves the sub-hour ranges at 1-second
+  resolution. New endpoint:
+  `GET /api/v1/system/speed-history?range=5m|1h|6h|24h|7d`.
+- All-time observed throughput peak persists across restarts (new
+  `system.throughput_all_time_peak_bps` setting). `GET /api/v1/system/
+  throughput` now also returns `peak_window_bytes_per_sec`,
+  `peak_alltime_bytes_per_sec`, and `global_cap_bytes_per_sec`.
+- Quick throttle slider on the System page: set the global cap
+  without a trip to `Settings → Bandwidth`.
+
+## [0.2.0] — operator panels + segment retry persistence + SAB compat polish
+
+### Added
+
 - SAB API parity: `mode=addurl`, `mode=eval_sort`, `mode=get_files`,
   `mode=history&name=delete`, `mode=history&name=mark_as_completed`.
   Closes the silently-broken Sonarr "Send NZB" button and the path-
@@ -59,5 +79,6 @@ Pre-1.0 footprint:
   collapse).
 - Durable scheduled tasks subsystem that survives restart.
 
-[Unreleased]: https://github.com/jaenster/hoardarr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jaenster/hoardarr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jaenster/hoardarr/releases/tag/v0.2.0
 [0.1.0]: https://github.com/jaenster/hoardarr/releases/tag/v0.1.0

@@ -153,6 +153,7 @@ type GeneralView struct {
 type SystemStatuser interface {
 	Status(ctx context.Context) (appsystem.Status, error)
 	Throughput() *appsystem.Throughput
+	History() appsystem.SpeedHistoryStore
 }
 
 // BackupAdmin is the slice of app/backup.Service the REST handler
@@ -240,6 +241,7 @@ func (h *Handlers) Mount(mux *http.ServeMux, protect func(http.Handler) http.Han
 	if h.System != nil {
 		register("GET", "/api/v1/system/status", h.systemStatus)
 		register("GET", "/api/v1/system/throughput", h.systemThroughput)
+		register("GET", "/api/v1/system/speed-history", h.systemSpeedHistory)
 	}
 	if h.Health != nil {
 		register("GET", "/api/v1/system/health", h.systemHealth)
@@ -769,26 +771,128 @@ func (h *Handlers) removeServer(w http.ResponseWriter, r *http.Request) {
 // --- system throughput ----------------------------------------------
 
 func (h *Handlers) systemThroughput(w http.ResponseWriter, _ *http.Request) {
+	cap := int64(0)
+	if h.Bandwidth != nil {
+		cap = h.Bandwidth.GlobalCap()
+	}
 	tp := h.System.Throughput()
 	if tp == nil {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"window_seconds":       appsystem.WindowSize,
-			"series":               []int64{},
-			"total_bytes":          0,
-			"current_bytes_per_sec": 0,
-			"avg10s_bytes_per_sec":  0,
-			"avg60s_bytes_per_sec":  0,
+			"window_seconds":             appsystem.DefaultSampleSeconds,
+			"series":                     []int64{},
+			"total_bytes":                0,
+			"current_bytes_per_sec":      0,
+			"avg10s_bytes_per_sec":       0,
+			"avg60s_bytes_per_sec":       0,
+			"peak_window_bytes_per_sec":  0,
+			"peak_alltime_bytes_per_sec": 0,
+			"global_cap_bytes_per_sec":   cap,
 		})
 		return
 	}
 	s := tp.Sample()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"window_seconds":       appsystem.WindowSize,
-		"series":               s.Series,
-		"total_bytes":          s.Total,
-		"current_bytes_per_sec": s.CurrentBytesPerSec,
-		"avg10s_bytes_per_sec":  s.Avg10sBytesPerSec,
-		"avg60s_bytes_per_sec":  s.Avg60sBytesPerSec,
+		"window_seconds":             s.WindowSeconds,
+		"series":                     s.Series,
+		"total_bytes":                s.Total,
+		"current_bytes_per_sec":      s.CurrentBytesPerSec,
+		"avg10s_bytes_per_sec":       s.Avg10sBytesPerSec,
+		"avg60s_bytes_per_sec":       s.Avg60sBytesPerSec,
+		"peak_window_bytes_per_sec":  s.WindowPeakBytesPerSec,
+		"peak_alltime_bytes_per_sec": tp.AllTimePeak(),
+		"global_cap_bytes_per_sec":   cap,
+	})
+}
+
+// --- system speed history -------------------------------------------
+
+// speedHistoryRanges enumerates the allowed ?range values and their
+// total span in seconds. The handler picks an in-memory vs DB source
+// based on whether the span fits inside the throughput ring.
+var speedHistoryRanges = map[string]time.Duration{
+	"5m":  5 * time.Minute,
+	"1h":  time.Hour,
+	"6h":  6 * time.Hour,
+	"24h": 24 * time.Hour,
+	"7d":  7 * 24 * time.Hour,
+}
+
+func (h *Handlers) systemSpeedHistory(w http.ResponseWriter, r *http.Request) {
+	rangeKey := r.URL.Query().Get("range")
+	if rangeKey == "" {
+		rangeKey = "5m"
+	}
+	span, ok := speedHistoryRanges[rangeKey]
+	if !ok {
+		h.writeError(w, http.StatusBadRequest, fmt.Errorf("range %q not one of 5m, 1h, 6h, 24h, 7d", rangeKey))
+		return
+	}
+
+	cap := int64(0)
+	if h.Bandwidth != nil {
+		cap = h.Bandwidth.GlobalCap()
+	}
+
+	tp := h.System.Throughput()
+	now := time.Now().UTC()
+
+	// In-memory ring covers up to 1 hour at 1-second resolution.
+	// Anything longer falls back to the persistent 1-minute store.
+	if span <= time.Duration(appsystem.WindowSize)*time.Second && tp != nil {
+		seconds := int(span / time.Second)
+		s := tp.SampleRange(seconds)
+		samples := make([]appsystem.SpeedSample, len(s.Series))
+		for i, v := range s.Series {
+			samples[i] = appsystem.SpeedSample{
+				At:          now.Add(-time.Duration(len(s.Series)-1-i) * time.Second).Truncate(time.Second),
+				BytesPerSec: v,
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"range":                      rangeKey,
+			"resolution_seconds":         1,
+			"samples":                    samples,
+			"peak_window_bytes_per_sec":  s.WindowPeakBytesPerSec,
+			"peak_alltime_bytes_per_sec": tp.AllTimePeak(),
+			"global_cap_bytes_per_sec":   cap,
+		})
+		return
+	}
+
+	// DB-backed range. Returns 1-minute resolution samples.
+	store := h.System.History()
+	var samples []appsystem.SpeedSample
+	if store != nil {
+		from := now.Add(-span).Truncate(time.Minute)
+		to := now.Truncate(time.Minute)
+		got, err := store.Range(r.Context(), from, to)
+		if err != nil {
+			h.writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		samples = got
+	}
+
+	var windowPeak int64
+	for _, s := range samples {
+		if s.BytesPerSec > windowPeak {
+			windowPeak = s.BytesPerSec
+		}
+	}
+	var allTimePeak int64
+	if tp != nil {
+		allTimePeak = tp.AllTimePeak()
+	}
+	if samples == nil {
+		samples = []appsystem.SpeedSample{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"range":                      rangeKey,
+		"resolution_seconds":         60,
+		"samples":                    samples,
+		"peak_window_bytes_per_sec":  windowPeak,
+		"peak_alltime_bytes_per_sec": allTimePeak,
+		"global_cap_bytes_per_sec":   cap,
 	})
 }
 

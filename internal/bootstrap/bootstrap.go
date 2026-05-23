@@ -265,6 +265,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		_ = db.Close()
 		return nil, fmt.Errorf("build runtime: %w", err)
 	}
+	throughput.SetAllTimePeak(runtime.AllTimeThroughputPeak())
 
 	// Bandwidth limiter: global cap from the runtime (which seeded
 	// from cfg + SQLite settings), per-server caps from the registry.
@@ -429,6 +430,7 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 
 	startedAt := time.Now().UTC()
 	migVer, _ := db.CurrentVersion(ctx)
+	speedHistory := sqlite.NewSpeedHistoryRepo(db)
 	systemSvc := appsystem.New(appsystem.Params{
 		Version:          bo.version,
 		Commit:           bo.commit,
@@ -442,6 +444,8 @@ func Build(ctx context.Context, cfg config.Config, frontendFS fs.FS, logger *slo
 		PoolsSource: orch.PoolsSnapshot,
 		Servers:     serverRepo,
 		Throughput:  throughput,
+		History:     speedHistory,
+		PeakSave:    runtime.SetAllTimeThroughputPeak,
 		// Bus drives the periodic system.throughput + system.pools
 		// SSE pushes so the frontend doesn't poll those endpoints.
 		Bus:    bus,

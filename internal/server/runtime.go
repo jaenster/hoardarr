@@ -30,14 +30,15 @@ type SettingsStore interface {
 // Setting keys. These are the runtime-mutable fields that used to
 // live in config.toml; they now persist in the SQLite settings table.
 const (
-	SettingURLBase              = "server.url_base"
-	SettingMaxConcurrentJobs    = "server.max_concurrent_jobs"
-	SettingFailHopelessRatio    = "server.fail_hopeless_ratio"
-	SettingDeferRecoveryVols    = "server.defer_recovery_vols"
-	SettingBandwidthGlobalBPS   = "bandwidth.global_bytes_per_sec"
-	SettingDeleteSamples        = "deliver.delete_samples"
-	SettingCollapseSingleFolder = "deliver.collapse_single_folder"
-	SettingAPIKey               = "auth.api_key"
+	SettingURLBase                  = "server.url_base"
+	SettingMaxConcurrentJobs        = "server.max_concurrent_jobs"
+	SettingFailHopelessRatio        = "server.fail_hopeless_ratio"
+	SettingDeferRecoveryVols        = "server.defer_recovery_vols"
+	SettingBandwidthGlobalBPS       = "bandwidth.global_bytes_per_sec"
+	SettingDeleteSamples            = "deliver.delete_samples"
+	SettingCollapseSingleFolder     = "deliver.collapse_single_folder"
+	SettingAPIKey                   = "auth.api_key"
+	SettingThroughputAllTimePeakBPS = "system.throughput_all_time_peak_bps"
 )
 
 // Runtime holds runtime-mutable config that the UI can edit at any
@@ -58,6 +59,7 @@ type Runtime struct {
 	deleteSamples        bool
 	collapseSingleFolder bool
 	apiKey               string
+	allTimePeakBPS       int64
 	listeners            []func(maxConcurrent int)
 	bandwidthListeners   []func(bytesPerSec int64)
 }
@@ -111,6 +113,10 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	if err != nil {
 		return nil, err
 	}
+	peakBPS, err := store.GetIntOr(ctx, SettingThroughputAllTimePeakBPS, 0)
+	if err != nil {
+		return nil, err
+	}
 
 	// Idempotent backfill: writing what we just read is a no-op for
 	// existing rows and seeds the row for missing keys. Cheap on every
@@ -139,6 +145,9 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	if err := store.Set(ctx, SettingAPIKey, apiKey); err != nil {
 		logger.Warn("runtime: seed api_key", "err", err)
 	}
+	if err := store.SetInt(ctx, SettingThroughputAllTimePeakBPS, peakBPS); err != nil {
+		logger.Warn("runtime: seed throughput_all_time_peak_bps", "err", err)
+	}
 
 	rt.urlBase = urlBase
 	rt.maxConcurrentJobs = maxConc
@@ -148,7 +157,36 @@ func NewRuntime(ctx context.Context, store SettingsStore, cfg config.Config, log
 	rt.deleteSamples = delSamples
 	rt.collapseSingleFolder = collapse
 	rt.apiKey = apiKey
+	rt.allTimePeakBPS = int64(peakBPS)
 	return rt, nil
+}
+
+// AllTimeThroughputPeak returns the persisted highest 1-second download
+// rate (bytes/sec) ever observed across process lifetimes.
+func (rt *Runtime) AllTimeThroughputPeak() int64 {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.allTimePeakBPS
+}
+
+// SetAllTimeThroughputPeak persists a new peak. Bumps-only — a smaller
+// value is silently ignored so the historical maximum never regresses.
+func (rt *Runtime) SetAllTimeThroughputPeak(v int64) (int64, error) {
+	if v < 0 {
+		v = 0
+	}
+	rt.mu.Lock()
+	if v <= rt.allTimePeakBPS {
+		cur := rt.allTimePeakBPS
+		rt.mu.Unlock()
+		return cur, nil
+	}
+	rt.allTimePeakBPS = v
+	rt.mu.Unlock()
+	if err := rt.store.SetInt(context.Background(), SettingThroughputAllTimePeakBPS, int(v)); err != nil {
+		return 0, fmt.Errorf("persist throughput_all_time_peak_bps: %w", err)
+	}
+	return v, nil
 }
 
 // BandwidthGlobalCap returns the persisted global download cap in
