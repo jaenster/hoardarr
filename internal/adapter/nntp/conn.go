@@ -289,7 +289,14 @@ func (c *Conn) Body(ctx context.Context, messageID string) (io.ReadCloser, error
 	}
 	c.touch()
 
-	br := &bodyReader{r: c.tp.DotReader(), done: make(chan struct{})}
+	// Use our line-batched dot-unstuffing reader instead of the
+	// stdlib's per-byte state machine. Benchmarks show ~17x throughput
+	// on realistic 750 KiB yEnc bodies (live production profile had
+	// textproto.dotReader.Read + bufio.ReadByte at ~70% of CPU
+	// during downloads). c.tp.R is textproto.Reader's exposed
+	// bufio.Reader — the same underlying buffer the stdlib DotReader
+	// would consume from.
+	br := &bodyReader{r: newFastBodyReader(c.tp.R), done: make(chan struct{})}
 	go bodyWatcher(ctx, c, br)
 	return br, nil
 }
