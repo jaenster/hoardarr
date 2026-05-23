@@ -798,6 +798,14 @@ a:hover {
   letter-spacing: 0.02em;
 }
 
+/* The speed/ETA suffix uses .muted for hierarchy elsewhere, but
+   inside a coloured progress bar the muted grey vanishes against
+   the blue fill. Brighten it to near-white so it stays legible
+   while remaining visually softer than the primary label. */
+.progress-label .muted {
+  color: rgba(255, 255, 255, 0.85);
+}
+
 /* settings — tool buttons row (icon stacked above label) */
 
 .tool-buttons {
