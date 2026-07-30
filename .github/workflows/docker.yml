@@ -22,10 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup qemu
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
+      # No QEMU. The builder cross-compiles with -Dtarget on the native
+      # runner and the runtime stage is `scratch` plus one static binary,
+      # so nothing foreign is ever executed. The Go image needed emulation
+      # because its runtime stage ran `apk add`; this one has no shell to
+      # run anything with. That step was the slowest in this workflow.
 
       - name: setup buildx
         uses: docker/setup-buildx-action@v3

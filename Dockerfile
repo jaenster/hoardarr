@@ -1,14 +1,28 @@
 # syntax=docker/dockerfile:1.6
 #
-# Three-stage build:
-#   frontend — node, builds the React bundle. Pinned to BUILDPLATFORM
-#              so arm64 builds don't run npm under QEMU emulation.
-#   builder  — golang:alpine cross-compiles the Go binary with the
-#              embedded frontend (-tags embed).
-#   runtime  — alpine + a tiny entrypoint shim. We pick alpine over
-#              distroless so we can support the linuxserver-style
-#              PUID/PGID/TZ env vars homelab users expect; the cost
-#              is ~20MB of additional image size.
+# Two stages, and the runtime stage is `scratch`.
+#
+# The Go image was alpine + ca-certificates + su-exec + tzdata, ~20 MB of
+# base before the binary. None of that is needed here:
+#
+#   * **No libc.** On Linux the Zig code goes straight to syscalls (see
+#     src/posix/sys.zig), so there is no dynamic loader and nothing to
+#     link against at runtime. Only the vendored SQLite wants a libc, and
+#     musl is linked statically into the binary.
+#   * **No su-exec.** Dropping to PUID:PGID was the entrypoint shim's job
+#     because Go can't setuid reliably from a multithreaded runtime. We
+#     call setgid/setgroups/setuid ourselves before starting the reactor,
+#     which also removes the shell from the image.
+#   * **No ca-certificates.** The CA bundle is compiled into the binary,
+#     so TLS to a provider does not depend on a file existing.
+#   * **No tzdata.** Timestamps are stored and logged in UTC and rendered
+#     in the browser's zone, which is where a user's timezone actually
+#     lives.
+#   * **No frontend directory.** The bundle is embedded, gzipped, at build
+#     time.
+#
+# What's left is one static binary and two empty directories, so the image
+# is the binary plus a few hundred bytes of metadata.
 
 FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
 WORKDIR /src/frontend
@@ -17,57 +31,79 @@ RUN npm install --no-fund --no-audit
 COPY frontend/ ./
 RUN npm run build
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM alpine:3.20 AS builder
+
+# The official tarball rather than the distro package: Alpine 3.20 ships a
+# Zig old enough to reject build.zig.zon's syntax, and pinning the exact
+# compiler with its checksum is what makes this build reproducible.
+ARG ZIG_VERSION=0.16.0
+RUN set -eux; \
+    apk add --no-cache curl xz; \
+    case "$(uname -m)" in \
+      x86_64)  ZARCH=x86_64;  ZSHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;; \
+      aarch64) ZARCH=aarch64; ZSHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;; \
+      *) echo "unsupported build arch: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz"; \
+    echo "${ZSHA}  zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz" | sha256sum -c -; \
+    tar -xJf "zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz" -C /opt; \
+    mv "/opt/zig-${ZARCH}-linux-${ZIG_VERSION}" /opt/zig; \
+    rm "zig-${ZARCH}-linux-${ZIG_VERSION}.tar.xz"
+ENV PATH="/opt/zig:$PATH"
+
 WORKDIR /src
-RUN apk add --no-cache git
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
+COPY build.zig build.zig.zon ./
+COPY src/ ./src/
+COPY c/ ./c/
+COPY tools/ ./tools/
 COPY --from=frontend /src/frontend/dist ./frontend/dist
 
-ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -tags embed \
-        -trimpath \
-        -ldflags="-s -w \
-          -X main.version=${VERSION} \
-          -X main.commit=${COMMIT} \
-          -X main.buildDate=${BUILD_DATE}" \
-        -o /out/hoardarr ./cmd/hoardarr
 
-FROM alpine:3.20
+# ReleaseSmall rather than ReleaseFast for the image: the hot paths are the
+# SIMD codecs, and those are dominated by their vector loops rather than by
+# anything the size/speed tradeoff touches. Measure before changing this —
+# bench/run.sh is the tool.
+RUN case "$TARGETARCH" in \
+      amd64) ZTARGET=x86_64-linux-musl ;; \
+      arm64) ZTARGET=aarch64-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    zig build \
+      --release=small \
+      -Dtarget=$ZTARGET \
+      -Dstrip=true \
+      -Dembed-ui=true \
+      -Dversion="$VERSION" \
+      -Dcommit="$COMMIT" \
+      -Dbuild-date="$BUILD_DATE" \
+      --prefix /out
+
+FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/jaenster/hoardarr"
 LABEL org.opencontainers.image.title="hoardarr"
-LABEL org.opencontainers.image.description="Go-based SABnzbd alternative with a Sonarr/Radarr-style UI"
+LABEL org.opencontainers.image.description="A Usenet downloader with a Sonarr/Radarr-style UI"
 
-# ca-certificates → TLS to Usenet providers + indexers.
-# su-exec → drop privileges to PUID:PGID in the entrypoint without
-#           a fat suid-tool / s6-overlay.
-# tzdata  → so $TZ resolves against /usr/share/zoneinfo.
-RUN apk add --no-cache ca-certificates su-exec tzdata
+COPY --from=builder /out/bin/hoardarr /hoardarr
 
-COPY --from=builder /out/hoardarr /usr/local/bin/hoardarr
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-# /data is the canonical mount point — config.toml, the SQLite DB,
-# sessions, incomplete/, and complete/ all live here. WORKDIR matches
-# the entrypoint's `cd $HOARDARR_DATA_DIR` so a `docker run` without
-# the shim (e.g. `docker run ... hoardarr version` for ad-hoc probes)
-# still picks up the right cwd.
+# `scratch` has no filesystem at all, so the mount points have to be
+# created here. A bind mount would create them implicitly, but a named
+# volume or a plain `docker run` would not.
 WORKDIR /data
+VOLUME ["/data"]
+
 ENV HOARDARR_LISTEN=:8085
 ENV HOARDARR_DATA_DIR=/data
-VOLUME ["/data"]
 
 EXPOSE 8085
 
+# No shell in the image, so this must be the exec form. The binary probes
+# itself over the loopback listener.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["/usr/local/bin/hoardarr", "healthcheck"]
+    CMD ["/hoardarr", "healthcheck"]
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/hoardarr"]
 CMD ["serve"]

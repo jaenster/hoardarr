@@ -46,13 +46,19 @@ echo "==> Dockerfile.zig -> Dockerfile"
 git rm -q --ignore-unmatch Dockerfile
 git mv Dockerfile.zig Dockerfile
 
-echo "==> checking nothing still references Go"
-leftovers=$(grep -rlniE '\bgo\.mod\b|golang|goroutine|CGO_ENABLED|GOOS|modernc' \
-    --include='*.zig' --include='*.yml' --include='*.yaml' \
-    --include='Makefile' --include='Dockerfile' --include='*.md' \
-    . 2>/dev/null | grep -v '^\./PORT.md$' | grep -v '^\./CHANGELOG.md$' || true)
+# Only things that would actually break the build or ship a stale
+# instruction. Prose in .zig comments that *compares against* the Go
+# implementation ("the Go version ran a reaper goroutine; here the timer is
+# armed only while something is idle") is documentation worth keeping —
+# it explains why the code is shaped the way it is, and deleting it would
+# lose the reasoning along with the reference.
+echo "==> checking nothing still builds or invokes Go"
+leftovers=$(grep -rlnE 'CGO_ENABLED|GOOS=|go build|go test|go mod|goreleaser|modernc\.org' \
+    --include='*.yml' --include='*.yaml' --include='Makefile' \
+    --include='Dockerfile' --include='*.sh' --include='*.zig' \
+    . 2>/dev/null | grep -v '^\./PORT.md$' | grep -v '^\./tools/remove-go.sh$' || true)
 if [[ -n "$leftovers" ]]; then
-    echo "still referencing Go (PORT.md and CHANGELOG.md are allowed to):" >&2
+    echo "still building or invoking Go:" >&2
     echo "$leftovers" >&2
     exit 1
 fi
