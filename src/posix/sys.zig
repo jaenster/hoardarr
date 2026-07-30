@@ -319,6 +319,25 @@ pub fn bind(fd: Fd, addr: *const Sockaddr) Error!void {
     }
 }
 
+/// The address a socket is actually bound to. Needed whenever the kernel
+/// picked the port for us (`bind` to port 0), which is how tests get a
+/// port without racing another process for a fixed one.
+pub fn getsockname(fd: Fd) Error!Sockaddr {
+    var storage: SockaddrIn6 = .{};
+    var len: u32 = @sizeOf(SockaddrIn6);
+    if (is_linux) {
+        _ = try linuxUnwrap(linux.getsockname(fd, @ptrCast(&storage), &len));
+    } else {
+        _ = try cUnwrap(std.c.getsockname(fd, @ptrCast(&storage), &len));
+    }
+    // Re-read the family from the struct the kernel filled in rather than
+    // trusting the caller to know it. The field sits at the same offset in
+    // both v4 and v6 layouts on each platform, so one cast reads either.
+    const fam: u32 = @as(*const SockaddrIn, @ptrCast(&storage)).family;
+    if (fam == AF_INET6) return .{ .in6 = storage };
+    return .{ .in = @as(*const SockaddrIn, @ptrCast(&storage)).* };
+}
+
 pub fn listen(fd: Fd, backlog: u31) Error!void {
     if (is_linux) {
         _ = try linuxUnwrap(linux.listen(fd, backlog));

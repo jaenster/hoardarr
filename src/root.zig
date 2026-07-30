@@ -27,6 +27,17 @@ pub const codec = struct {
     };
 };
 
+pub const domain = struct {
+    pub const download = struct {
+        pub const state = @import("domain/download/state.zig");
+        pub const segment = @import("domain/download/segment.zig");
+        pub const file = @import("domain/download/file.zig");
+        pub const events = @import("domain/download/events.zig");
+        pub const job = @import("domain/download/job.zig");
+        pub const ports = @import("domain/download/ports.zig");
+    };
+};
+
 pub const nntp = struct {
     pub const protocol = @import("nntp/protocol.zig");
 };
@@ -52,6 +63,12 @@ test {
     _ = codec.par2.par2;
     _ = codec.par2.rs;
     _ = codec.par2.verifier;
+    _ = domain.download.state;
+    _ = domain.download.segment;
+    _ = domain.download.file;
+    _ = domain.download.events;
+    _ = domain.download.job;
+    _ = domain.download.ports;
     _ = nntp.protocol;
     _ = store.sqlite_c;
     _ = posix.sys;
