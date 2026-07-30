@@ -67,15 +67,26 @@ const repo_speed_history = @import("store/repo_speed_history.zig");
 const devents = @import("domain/download/events.zig");
 const dauth_domain = @import("domain/auth.zig");
 const dserver = @import("domain/server.zig");
+const dverify = @import("domain/verify.zig");
+const drepair = @import("domain/repair.zig");
+const dextract = @import("domain/extract.zig");
+const ddeliver = @import("domain/deliver.zig");
 
 const app_ports = @import("app/ports.zig");
 const queue_svc = @import("app/download/queue.zig");
 const add_job_svc = @import("app/download/add_job.zig");
 const bandwidth = @import("app/download/bandwidth.zig");
+const byte_accounter = @import("app/download/byte_accounter.zig");
+const dl_service = @import("app/download/service.zig");
 const throughput_mod = @import("app/system/throughput.zig");
 const system_svc = @import("app/system/service.zig");
 const command_svc = @import("app/command/service.zig");
 const auth_svc = @import("app/auth.zig");
+const verify_app = @import("app/verify.zig");
+const repair_app = @import("app/repair.zig");
+const extract_app = @import("app/extract.zig");
+const deliver_app = @import("app/deliver/service.zig");
+const dns = @import("net/dns.zig");
 
 const sse = @import("api/sse.zig");
 const metrics = @import("api/metrics.zig");
@@ -89,6 +100,8 @@ const settings = @import("bootstrap/settings.zig");
 const rest_ports = @import("bootstrap/rest.zig");
 const sab_ports = @import("bootstrap/sab.zig");
 const files = @import("bootstrap/files.zig");
+const pipeline = @import("bootstrap/pipeline.zig");
+const runtime_mod = @import("bootstrap/runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const Api = rest_api.Api;
@@ -137,6 +150,21 @@ pub const App = struct {
     txm: infra.TxManager = undefined,
     download_publisher: infra.Publisher(devents.Event, "job_id") = undefined,
     runtime: settings.Runtime = undefined,
+    categories: infra.CategoryLookup = undefined,
+
+    /// Turns a provider's hostname into an address. Callback-based on the
+    /// reactor, driven from a job's fiber.
+    resolver: dns.Resolver = undefined,
+    resolver_ready: bool = false,
+
+    /// The four post-download contexts publish on their own event
+    /// unions, so each needs its own publisher. `aggregate_key` is null
+    /// for all four: their payloads already carry `job_id`, which is what
+    /// the per-job timeline and the pipeline's routing both key on.
+    verify_publisher: infra.Publisher(dverify.Event, null) = undefined,
+    repair_publisher: infra.Publisher(drepair.Event, null) = undefined,
+    extract_publisher: infra.Publisher(dextract.Event, null) = undefined,
+    deliver_publisher: infra.Publisher(ddeliver.Event, null) = undefined,
 
     log_ring: logring.Ring = undefined,
     registry: metrics.Registry = undefined,
@@ -154,6 +182,10 @@ pub const App = struct {
     user_store: stores.UserStore = undefined,
     session_store: stores.SessionStore = undefined,
     command_store: stores.CommandStore = undefined,
+    verify_store: pipeline.VerifyStore = undefined,
+    repair_store: pipeline.RepairStore = undefined,
+    extract_store: pipeline.ExtractStore = undefined,
+    deliver_store: pipeline.DeliverStore = undefined,
 
     // -- services ------------------------------------------------------
 
@@ -164,6 +196,26 @@ pub const App = struct {
     command_service: command_svc.Service = undefined,
     pool_stats: PoolStats = undefined,
     speed_history: SpeedHistory = undefined,
+
+    // -- the download engine and the pipeline over it ------------------
+
+    verifier: pipeline.Verifier = undefined,
+    repairer: pipeline.Repairer = undefined,
+    extractor: pipeline.Extractor = undefined,
+
+    verify_service: verify_app.Service = undefined,
+    repair_service: repair_app.Service = undefined,
+    extract_service: extract_app.Service = undefined,
+    deliver_service: deliver_app.Service = undefined,
+
+    accounter: byte_accounter.Accounter = undefined,
+    server_bytes: ServerBytes = undefined,
+    byte_flusher: byte_accounter.Flusher = undefined,
+
+    scheduler: dl_service.Service = undefined,
+    engine: runtime_mod.Runtime = undefined,
+    engine_ready: bool = false,
+    probe: runtime_mod.Probe = undefined,
 
     // -- REST ports ----------------------------------------------------
 
@@ -215,6 +267,26 @@ pub const App = struct {
         self.events_hub.closeAll(.shutdown);
         self.logs_hub.closeAll(.shutdown);
 
+        // The download engine comes down before anything it touches.
+        //
+        // Its fibers hold a loaded job aggregate and, mid-fetch, a
+        // checked-out provider connection; `Runtime.deinit` cancels each
+        // one so it unwinds through its own `defer`s and gives both back
+        // — which needs the database, the bus and the loop still alive.
+        // Freeing a parked fiber instead, or closing the sockets first,
+        // is a leak and a use-after-free respectively.
+        if (self.engine_ready) {
+            self.engine.deinit();
+            self.engine_ready = false;
+        }
+        // After the engine, because a fiber unwinding mid-resolve is a
+        // query this has to answer.
+        if (self.resolver_ready) {
+            self.resolver.deinit();
+            self.resolver_ready = false;
+        }
+        self.scheduler.deinit();
+
         if (self.heartbeat.isArmed()) self.loop.cancelTimer(&self.heartbeat);
         if (self.ticker.isArmed()) self.loop.cancelTimer(&self.ticker);
         if (self.signals_installed) {
@@ -223,14 +295,21 @@ pub const App = struct {
             self.signals_installed = false;
         }
 
-        // The bus owns dispatcher threads, and every one of them holds a
-        // connection to the same database file. Joining them before the
+        // The bus still owns the pruner thread, which holds its own
+        // connection to the same database file. Joining it before the
         // database closes is the whole reason this is not a `defer`.
+        // The dispatchers are reactor sources, and the engine's teardown
+        // above has already dropped them.
         self.bus.deinit();
 
         self.api.deinit();
+        self.verify_store.deinit();
+        self.repair_store.deinit();
+        self.extract_store.deinit();
+        self.deliver_store.deinit();
         self.job_store.deinit();
         self.command_service.deinit();
+        self.accounter.deinit();
         self.limiter.deinit();
         self.events_hub.deinit();
         self.logs_hub.deinit();
@@ -345,7 +424,7 @@ pub const App = struct {
             .clock = clock,
         };
 
-        self.pool_stats = .{ .gpa = gpa, .conn = self.db };
+        self.pool_stats = .{ .gpa = gpa, .conn = self.db, .engine = &self.engine };
         self.speed_history = .{ .conn = self.db };
 
         self.system_service = .{
@@ -369,6 +448,143 @@ pub const App = struct {
             .clock = clock,
         };
         errdefer self.command_service.deinit();
+
+        // ---- the download engine ----
+        //
+        // Everything from here to the end of this block is what turns a
+        // queued job into bytes on disk. `bootstrap/runtime.zig` owns the
+        // two bridges that make it possible — a fiber per job so the
+        // orchestrator's synchronous fetch can run on a callback
+        // transport, and the outbox dispatchers on the reactor instead of
+        // on threads. Read that file's header before changing any of it.
+
+        self.resolver.initFromSystem(gpa, &self.loop);
+        self.resolver_ready = true;
+        errdefer {
+            self.resolver.deinit();
+            self.resolver_ready = false;
+        }
+
+        self.categories = .{ .gpa = gpa, .conn = self.db };
+
+        self.verify_publisher = .{ .gpa = gpa, .bus = self.bus, .conn = self.db };
+        self.repair_publisher = .{ .gpa = gpa, .bus = self.bus, .conn = self.db };
+        self.extract_publisher = .{ .gpa = gpa, .bus = self.bus, .conn = self.db };
+        self.deliver_publisher = .{ .gpa = gpa, .bus = self.bus, .conn = self.db };
+
+        self.verify_store = .{ .gpa = gpa, .conn = self.db };
+        self.repair_store = .{ .gpa = gpa, .conn = self.db };
+        self.extract_store = .{ .gpa = gpa, .conn = self.db };
+        self.deliver_store = .{ .gpa = gpa, .conn = self.db };
+
+        self.verifier = .{ .gpa = gpa, .logger = &log.default };
+        self.repairer = .{ .logger = &log.default };
+        self.extractor = .{ .gpa = gpa, .logger = &log.default };
+
+        self.verify_service = .{
+            .gpa = gpa,
+            .jobs = self.job_store.port(),
+            .store = self.verify_store.port(),
+            .verifier = self.verifier.port(),
+            .sink = self.verify_publisher.sink(),
+            .txm = self.txm.manager(),
+            .fs = self.fs.filesystem(),
+            .clock = clock,
+            .incomplete_dir = cfg.paths.incomplete_dir,
+        };
+
+        self.repair_service = .{
+            .gpa = gpa,
+            .jobs = self.job_store.port(),
+            .store = self.repair_store.port(),
+            .repairer = self.repairer.port(),
+            .sink = self.repair_publisher.sink(),
+            .downloads = self.download_publisher.sink(),
+            .txm = self.txm.manager(),
+            .fs = self.fs.filesystem(),
+            .clock = clock,
+            .incomplete_dir = cfg.paths.incomplete_dir,
+        };
+
+        self.extract_service = .{
+            .gpa = gpa,
+            .jobs = self.job_store.port(),
+            .store = self.extract_store.port(),
+            .extractor = self.extractor.port(),
+            .categories = self.categories.categories(),
+            .sink = self.extract_publisher.sink(),
+            .downloads = self.download_publisher.sink(),
+            .txm = self.txm.manager(),
+            .fs = self.fs.filesystem(),
+            .clock = clock,
+            .incomplete_dir = cfg.paths.incomplete_dir,
+            .complete_dir = cfg.paths.complete_dir,
+        };
+
+        self.deliver_service = .{
+            .gpa = gpa,
+            .jobs = self.job_store.port(),
+            .store = self.deliver_store.port(),
+            .categories = self.categories.categories(),
+            .sink = self.deliver_publisher.sink(),
+            .downloads = self.download_publisher.sink(),
+            .txm = self.txm.manager(),
+            .fs = self.fs.filesystem(),
+            .clock = clock,
+            .incomplete_dir = cfg.paths.incomplete_dir,
+            .complete_dir = cfg.paths.complete_dir,
+            .delete_samples = self.runtime.toggle(settings.keys.delete_samples),
+            .collapse_single_folder = self.runtime.toggle(settings.keys.collapse_single_folder),
+        };
+
+        // Per-server byte totals are staged in memory and written on the
+        // one-second tick, not per article: `used_bytes = used_bytes + ?`
+        // once per segment was measured as pure SQLite overhead on a
+        // download that already writes a segment row per batch.
+        self.accounter = byte_accounter.Accounter.init(gpa);
+        errdefer self.accounter.deinit();
+        self.server_bytes = .{ .gpa = gpa, .conn = self.db };
+        self.byte_flusher = .{
+            .gpa = gpa,
+            .accounter = &self.accounter,
+            .store = self.server_bytes.port(),
+        };
+
+        self.scheduler = .{
+            .gpa = gpa,
+            .store = self.job_store.port(),
+            .queue = &self.queue_service,
+            .clock = clock,
+            .concurrency_cap = self.runtime.knob(settings.keys.max_concurrent_jobs),
+        };
+        errdefer self.scheduler.deinit();
+
+        self.engine.init(.{
+            .gpa = gpa,
+            .loop = &self.loop,
+            .db = self.db,
+            .bus = self.bus,
+            .job_store = self.job_store.port(),
+            .sink = self.download_publisher.sink(),
+            .txm = self.txm.manager(),
+            .fs = self.fs.filesystem(),
+            .clock = clock,
+            .incomplete_dir = cfg.paths.incomplete_dir,
+            .scheduler = &self.scheduler,
+            .resolver = &self.resolver,
+            .limiter = &self.limiter,
+            .accounter = &self.accounter,
+        });
+        self.engine_ready = true;
+        errdefer {
+            self.engine.deinit();
+            self.engine_ready = false;
+        }
+
+        // The probe shares the engine's trust anchors rather than
+        // reloading them: a `CaStore` is memory with no loop affinity,
+        // and the engine is what owns its lifetime.
+        self.probe = .{ .gpa = gpa, .ca_roots = &self.engine.ca_roots };
 
         // ---- REST ports ----
         self.p_queue = .{
@@ -414,19 +630,16 @@ pub const App = struct {
         self.api.backups = self.p_backups.port();
         self.api.log_files = self.p_log_files.port();
 
+        self.api.probe = self.probe.port();
+
         // Deliberately null, and each for a reason the operator can act
         // on rather than a gap they have to guess at:
         //
-        //   * `probe` — dialling a provider needs the NNTP client driven
-        //     from a fiber, which the orchestrator wiring owns and this
-        //     build does not have yet. `POST /servers/test` answers 503
-        //     instead of blocking the reactor on a connect.
         //   * `health` — there is no health-check service in the app
         //     layer to wire; the port has no implementation to point at.
         //   * `disk` — `statfs` is in neither `posix/sys.zig` nor Zig's
         //     `std.posix`, and reproducing `struct statfs` for two
         //     platforms belongs in the syscall layer, not here.
-        self.api.probe = null;
         self.api.health = null;
         self.api.disk = null;
 
@@ -470,6 +683,54 @@ pub const App = struct {
         try self.loop.addTimer(&self.ticker, tick_interval_ns);
     }
 
+    /// Bring the download pipeline up: pools, subscribers, and whatever
+    /// the database says was in flight when the last process stopped.
+    ///
+    /// Separate from `wire` because `wire` is pure graph construction —
+    /// no sockets, no threads, no side effects — and this is the point at
+    /// which the daemon starts doing things. The e2e suite calls both.
+    ///
+    /// Order is not arbitrary. Pools first, so a job admitted by the
+    /// sweep below finds somewhere to fetch from instead of parking
+    /// itself in `waiting_for_server`. Subscribers second, so no event
+    /// published by the sweep is lost — an `outbox_subs` row is only
+    /// written for a subscription that already exists. The sweep last.
+    pub fn startEngine(self: *App) !void {
+        try self.engine.loadPools();
+        try self.subscribePipeline();
+        try self.engine.start();
+
+        // Jobs whose trigger event was consumed by a previous process
+        // before it wrote the row that would have advanced them. The bus
+        // will not redeliver those, so somebody has to go looking.
+        _ = self.deliver_service.recoverStuck() catch |err| {
+            log.warn("deliver: startup recovery failed", &.{log.str("error", @errorName(err))});
+        };
+    }
+
+    /// The post-download half of `docs/architecture.md`'s event flow,
+    /// as a table.
+    ///
+    /// `verify.ok` has two subscribers on purpose: `app/extract` takes
+    /// archive jobs and `app/deliver` takes everything else, both by
+    /// running the same predicate over the same aggregate. Exactly one of
+    /// them acts, and neither has to know about the other.
+    fn subscribePipeline(self: *App) !void {
+        const Sub = struct {
+            name: []const u8,
+            topic: []const u8,
+            handler: outbox.Handler,
+        };
+        const table = [_]Sub{
+            .{ .name = "verify.on_download_complete", .topic = "download.job.download_complete", .handler = &onVerify },
+            .{ .name = "verify.on_repair_ok", .topic = "repair.ok", .handler = &onReverify },
+            .{ .name = "repair.on_repair_needed", .topic = "verify.repair_needed", .handler = &onRepair },
+            .{ .name = "extract.on_verify_ok", .topic = "verify.ok", .handler = &onExtract },
+            .{ .name = "deliver.on_verify_ok", .topic = "verify.ok", .handler = &onDeliver },
+        };
+        for (table) |s| try self.engine.subscribe(s.name, s.topic, s.handler, @ptrCast(self));
+    }
+
     /// Mirror the resolved API key into the settings table when it has
     /// none.
     ///
@@ -504,7 +765,7 @@ pub const App = struct {
     /// Created at start-up rather than lazily: a permissions problem
     /// should surface while the operator is watching the container come
     /// up, not eight minutes into a download.
-    fn ensureDirs(self: *App) !void {
+    pub fn ensureDirs(self: *App) !void {
         const cfg = self.cfg.config;
         for ([_][]const u8{
             cfg.paths.incomplete_dir,
@@ -519,6 +780,96 @@ pub const App = struct {
                 });
             };
         }
+    }
+};
+
+// ---------------------------------------------------------------------
+// The post-download bus handlers
+// ---------------------------------------------------------------------
+//
+// Each is a one-liner over an application service, and each runs inline
+// on the reactor thread — see `bootstrap/pipeline.zig` on what that
+// costs. Returning `.failed` hands the row back to the outbox's own
+// retry-and-park machinery rather than losing it, which is why none of
+// them swallow an error.
+
+fn runStage(
+    ctx: ?*anyopaque,
+    env: outbox.Envelope,
+    who: []const u8,
+    comptime body: fn (app: *App, id: i64) anyerror!void,
+) outbox.HandlerResult {
+    const app: *App = @ptrCast(@alignCast(ctx.?));
+    const id = runtime_mod.aggregateJobId(env) orelse return .{ .failed = "no job id in the event" };
+    body(app, id) catch |err| {
+        log.err("pipeline stage failed", &.{
+            log.str("stage", who),
+            log.int("job_id", id),
+            log.str("error", @errorName(err)),
+        });
+        return .{ .failed = @errorName(err) };
+    };
+    return .ok;
+}
+
+fn onVerify(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
+    return runStage(ctx, env, "verify", struct {
+        fn run(app: *App, id: i64) anyerror!void {
+            _ = try app.verify_service.run(id);
+        }
+    }.run);
+}
+
+fn onReverify(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
+    return runStage(ctx, env, "verify-after-repair", struct {
+        fn run(app: *App, id: i64) anyerror!void {
+            _ = try app.verify_service.onRepairOk(id);
+        }
+    }.run);
+}
+
+fn onRepair(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
+    return runStage(ctx, env, "repair", struct {
+        fn run(app: *App, id: i64) anyerror!void {
+            _ = try app.repair_service.run(id);
+        }
+    }.run);
+}
+
+fn onExtract(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
+    return runStage(ctx, env, "extract", struct {
+        fn run(app: *App, id: i64) anyerror!void {
+            _ = try app.extract_service.run(id);
+        }
+    }.run);
+}
+
+fn onDeliver(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
+    return runStage(ctx, env, "deliver", struct {
+        fn run(app: *App, id: i64) anyerror!void {
+            _ = try app.deliver_service.run(id);
+        }
+    }.run);
+}
+
+/// `byte_accounter.ServerByteStore` over the servers table.
+pub const ServerBytes = struct {
+    gpa: Allocator,
+    conn: *sqlite.Conn,
+
+    pub fn port(self: *ServerBytes) byte_accounter.ServerByteStore {
+        return .{ .ctx = @ptrCast(self), .incrementFn = &increment };
+    }
+
+    fn increment(
+        ctx: *anyopaque,
+        _: ?*app_ports.Unit,
+        id: dserver.ServerId,
+        n: i64,
+    ) byte_accounter.StoreError!void {
+        const self: *ServerBytes = @ptrCast(@alignCast(ctx));
+        const repo = repo_server.ServerRepo.init(self.gpa, self.conn);
+        repo.incrementUsedBytes(id, n) catch return error.Backend;
     }
 };
 
@@ -544,15 +895,19 @@ fn authSink(app: *App) app_ports.EventSink(dauth_domain.Event) {
     return .{ .ctx = @ptrCast(app), .publishFn = &Impl.publish };
 }
 
-/// `system_svc.PoolStats` over the servers table.
+/// `system_svc.PoolStats` over the servers table, plus live occupancy.
 ///
-/// The live in-use / idle counts belong to the NNTP pools, which are the
-/// orchestrator's to own; until those exist this reports the configured
-/// shape with zero occupancy, which is honest — the System page shows the
-/// servers the operator added and no traffic against them.
+/// The configured shape comes from the row and the in-use / idle counts
+/// come from the `nntp.Pool` the engine built for it. A row with no pool
+/// — TLS with no trust anchors, or a server added since the last restart
+/// — reports zero occupancy rather than being hidden, because "you added
+/// it and nothing is using it" is the answer the System page exists to
+/// give.
 pub const PoolStats = struct {
     gpa: Allocator,
     conn: *sqlite.Conn,
+    /// Null in a graph built without the download engine.
+    engine: ?*runtime_mod.Runtime = null,
 
     pub fn port(self: *PoolStats) system_svc.PoolStats {
         return .{ .ctx = @ptrCast(self), .snapshotFn = &snapshot };
@@ -574,6 +929,13 @@ pub const PoolStats = struct {
                 .quota_bytes = s.quota_bytes,
                 .used_bytes = s.used_bytes,
             };
+            const engine = self.engine orelse continue;
+            const live = engine.occupancy(s.id) orelse continue;
+            out[i].idle = @intCast(@min(live.idle, std.math.maxInt(u16)));
+            // `openCount` is everything against the provider's cap,
+            // established or still connecting; what is not parked is
+            // being used.
+            out[i].in_use = @intCast(live.open -| @as(u32, @intCast(live.idle)));
         }
         return out;
     }
@@ -647,6 +1009,14 @@ fn onTick(t: *reactor.Timer) void {
     };
     _ = app.system_service.purgeHistory(now) catch |err| {
         log.default.warn("throughput history purge failed", &.{log.str("error", @errorName(err))});
+    };
+
+    // Staged per-server byte totals, written at most once every ten
+    // seconds rather than once per article. The counter is what a metered
+    // account's quota is measured against, so it is flushed on a clock
+    // rather than only at shutdown.
+    app.byte_flusher.flushIfDue(null, now) catch |err| {
+        log.default.warn("byte accounting flush failed", &.{log.str("error", @errorName(err))});
     };
 
     app.loop.addTimer(&app.ticker, tick_interval_ns) catch {};
@@ -873,6 +1243,11 @@ pub fn run(gpa: Allocator, env: std.process.Environ) !u8 {
         return fatal("cannot listen on {s}: {t}", .{ cfg.server.listen, err });
     };
     try app.startTimers();
+
+    // ---- 8. downloads ----
+    app.startEngine() catch |err| {
+        return fatal("cannot start the download engine: {t}", .{err});
+    };
 
     log.info("listening", &.{
         log.str("addr", cfg.server.listen),

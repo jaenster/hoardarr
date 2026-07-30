@@ -543,8 +543,14 @@ pub const CategoryLookup = struct {
         if (name.len == 0 or std.mem.eql(u8, name, "*")) return null;
 
         const repo = repo_category.CategoryRepo.init(self.conn);
-        var c = repo.get(self.gpa, name) catch return null;
-        defer c.deinit(self.gpa);
+        // `get` hands back owned strings with no destructor of their own —
+        // `CategoryList` frees them field by field, and a single row has
+        // no list to belong to.
+        const c = repo.get(self.gpa, name) catch return null;
+        defer {
+            self.gpa.free(c.name);
+            self.gpa.free(c.dir);
+        }
         if (c.dir.len > self.buf.len) return null;
         @memcpy(self.buf[0..c.dir.len], c.dir);
         self.len = c.dir.len;

@@ -226,7 +226,16 @@ const Waker = struct {
         var fds = [_]sys.pollfd{.{ .fd = self.read_fd, .events = sys.POLL.IN, .revents = 0 }};
         _ = sys.poll(&fds, timeout_ms) catch return;
         if (fds[0].revents & sys.POLL.IN == 0) return;
-        // Drain fully so a single nudge cannot wake us twice.
+        self.drain();
+    }
+
+    /// Empty the fd so it stops reporting readable.
+    ///
+    /// Mandatory for the reactor-driven dispatcher: the loop's backends
+    /// are level-triggered, so a nudge left unread is a source that
+    /// reports ready on every single tick — exactly the spin the reactor
+    /// exists to avoid.
+    fn drain(self: Waker) void {
         var buf: [64]u8 = undefined;
         while (true) {
             const n = sys.read(self.read_fd, &buf) catch return;
@@ -271,6 +280,60 @@ pub const Subscription = struct {
     }
     pub fn subscriptionTopic(self: *const Subscription) []const u8 {
         return self.topic;
+    }
+
+    // -- the reactor-driven half ---------------------------------------
+    //
+    // A subscription registered with `Bus.subscribeInline` has no thread.
+    // The three calls below are what the composition root drives it with:
+    // register `wakeFd` with the reactor, `drainWake` when it fires, then
+    // `pump`. Same waker, same rows, same at-least-once contract as the
+    // threaded dispatcher — it is only *who* runs the handler that
+    // differs.
+
+    /// The descriptor `publish`'s post-commit hook writes to. Readable
+    /// means "there may be rows for you".
+    pub fn wakeFd(self: *const Subscription) sys.Fd {
+        return self.waker.read_fd;
+    }
+
+    /// Clear the nudge. Call this *before* `pump`, never after: a
+    /// handler that publishes re-signals the fd, and draining afterwards
+    /// would swallow the nudge its own work just produced.
+    pub fn drainWake(self: *Subscription) void {
+        self.waker.drain();
+    }
+
+    /// What one `pump` did.
+    pub const Pumped = struct {
+        attempted: usize = 0,
+        /// Deliveries whose handler reported failure. Non-zero means the
+        /// caller owes a retry timer: nothing will nudge a row that is
+        /// only waiting for its `next_retry_at` to come due.
+        failed: usize = 0,
+    };
+
+    /// Claim and deliver every due row, on the caller's connection and
+    /// the caller's thread.
+    ///
+    /// Bounded at `max_rounds` batches so one pump cannot monopolise the
+    /// reactor: a backlog larger than that is left for the next tick,
+    /// and the fd is still readable (or the caller's retry timer is
+    /// armed), so nothing is dropped.
+    pub fn pump(self: *Subscription, conn: *Conn) Pumped {
+        const max_rounds = 64;
+        var out: Pumped = .{};
+        var rounds: usize = 0;
+        while (rounds < max_rounds) : (rounds += 1) {
+            const ok_before = self.delivered.load(.monotonic);
+            const n = processBatch(self, conn) catch break;
+            if (n == 0) break;
+            const ok: usize = @intCast(self.delivered.load(.monotonic) - ok_before);
+            out.attempted += n;
+            out.failed += n - ok;
+            if (self.stopping.load(.acquire) or self.bus.stopping.load(.acquire)) break;
+        }
+        return out;
     }
 };
 
@@ -478,6 +541,58 @@ pub const Bus = struct {
         handler: Handler,
         handler_ctx: ?*anyopaque,
     ) Error!*Subscription {
+        const sub = try self.register(name, topic, handler, handler_ctx);
+
+        sub.thread = std.Thread.spawn(.{}, dispatchLoop, .{sub}) catch {
+            // Leave the registration in place: `deinit` frees it, and a
+            // subscription with no thread simply never delivers, which
+            // is strictly better than freeing memory a racing publisher
+            // may be reading.
+            return error.SpawnFailed;
+        };
+        try self.startPruner();
+        return sub;
+    }
+
+    /// Register `handler` **without** a dispatcher thread.
+    ///
+    /// The daemon runs its reactor, both SSE hubs and every
+    /// `*sqlite.Conn` on one thread. A dispatcher thread therefore can
+    /// neither touch the application's connection (`SQLITE_THREADSAFE=2`
+    /// forbids sharing one) nor call into a service that owns reactor
+    /// state — so a threaded subscriber could only ever hand work back
+    /// over `Loop.wake()`, which is a queue, a lock and a second copy of
+    /// every event for no gain.
+    ///
+    /// Inline delivery removes all of that. The composition root
+    /// registers `Subscription.wakeFd` as a reactor source and calls
+    /// `drainWake` + `pump` when it fires; the handler runs on the loop
+    /// thread with the application's own connection, so it can publish
+    /// into the same transaction it is reacting to.
+    ///
+    /// What the caller takes on: the *tick* half of the threaded loop.
+    /// `publish` still nudges the waker, but a delivery that failed and
+    /// is waiting for `next_retry_at` has nothing to nudge it — so a
+    /// `pump` that reports failures obliges the caller to arm a timer.
+    pub fn subscribeInline(
+        self: *Bus,
+        name: []const u8,
+        topic: []const u8,
+        handler: Handler,
+        handler_ctx: ?*anyopaque,
+    ) Error!*Subscription {
+        const sub = try self.register(name, topic, handler, handler_ctx);
+        try self.startPruner();
+        return sub;
+    }
+
+    fn register(
+        self: *Bus,
+        name: []const u8,
+        topic: []const u8,
+        handler: Handler,
+        handler_ctx: ?*anyopaque,
+    ) Error!*Subscription {
         if (self.stopping.load(.acquire)) return error.BusClosed;
         if (name.len == 0) return error.EmptyName;
         if (topic.len == 0) return error.EmptyTopic;
@@ -519,27 +634,28 @@ pub const Bus = struct {
         };
         self.registry.unlock();
 
-        sub.thread = std.Thread.spawn(.{}, dispatchLoop, .{sub}) catch {
-            // Leave the registration in place: `deinit` frees it, and a
-            // subscription with no thread simply never delivers, which
-            // is strictly better than freeing memory a racing publisher
-            // may be reading.
+        return sub;
+    }
+
+    /// The pruner keeps its thread even when the dispatchers do not.
+    ///
+    /// It is not a dispatcher: it opens its own connection, hands
+    /// nothing back to the loop, and its pass-3 sweep deliberately
+    /// sleeps between batches so the orchestrator's transactions keep
+    /// flowing. Running that on the reactor would put a 50 ms sleep
+    /// inside the event loop, which is precisely what this daemon does
+    /// not do.
+    fn startPruner(self: *Bus) Error!void {
+        if (!self.opts.prune or self.pruner != null) return;
+        // Lazily started so a bus that never subscribes has no
+        // background threads at all.
+        const w = try Waker.init();
+        self.pruner_waker = w;
+        self.pruner = std.Thread.spawn(.{}, pruneLoop, .{self}) catch {
+            w.deinit();
+            self.pruner_waker = null;
             return error.SpawnFailed;
         };
-
-        if (self.opts.prune and self.pruner == null) {
-            // Lazily started so a bus that never subscribes has no
-            // background threads at all.
-            const w = try Waker.init();
-            self.pruner_waker = w;
-            self.pruner = std.Thread.spawn(.{}, pruneLoop, .{self}) catch {
-                w.deinit();
-                self.pruner_waker = null;
-                return error.SpawnFailed;
-            };
-        }
-
-        return sub;
     }
 
     // -- pruning -------------------------------------------------------

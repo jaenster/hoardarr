@@ -474,6 +474,66 @@ pub fn shutdown(fd: Fd, how: ShutdownHow) void {
     }
 }
 
+/// Receive one datagram and learn who sent it.
+///
+/// Only an unconnected datagram socket needs this — the DNS resolver
+/// `connect`s its sockets so the kernel filters on the peer for it, and
+/// then plain `read` works. A UDP *server*, like the scripted nameserver
+/// in `net/dns.zig`'s tests, has no such luxury: the client's address
+/// arrives with the datagram or not at all.
+pub fn recvfrom(fd: Fd, buf: []u8, from: *Sockaddr) Error!usize {
+    var storage: SockaddrIn6 = .{};
+    var len: u32 = @sizeOf(SockaddrIn6);
+    const n = if (is_linux)
+        try linuxUnwrap(linux.recvfrom(fd, buf.ptr, buf.len, 0, @ptrCast(&storage), &len))
+    else
+        try cUnwrap(std.c.recvfrom(fd, buf.ptr, buf.len, 0, @ptrCast(&storage), &len));
+
+    // Same trick as `getsockname`: read the family back from what the
+    // kernel filled in rather than assuming it.
+    const fam: u32 = @as(*const SockaddrIn, @ptrCast(&storage)).family;
+    from.* = if (fam == AF_INET6)
+        .{ .in6 = storage }
+    else
+        .{ .in = @as(*const SockaddrIn, @ptrCast(&storage)).* };
+    return n;
+}
+
+/// Send one datagram to an explicit address.
+pub fn sendto(fd: Fd, buf: []const u8, to: *const Sockaddr) Error!usize {
+    if (is_linux) {
+        return linuxUnwrap(linux.sendto(fd, buf.ptr, buf.len, 0, @ptrCast(@alignCast(to.ptr())), to.len()));
+    }
+    return cUnwrap(std.c.sendto(fd, buf.ptr, buf.len, 0, @ptrCast(@alignCast(to.ptr())), to.len()));
+}
+
+test "a datagram round-trips over loopback with its sender's address" {
+    const server = try socket(AF_INET, SOCK_DGRAM, 0);
+    defer close(server);
+    var bind_addr = Sockaddr.fromIp(try std.Io.net.IpAddress.parse("127.0.0.1", 0));
+    try bind(server, &bind_addr);
+    const server_port = (try getsockname(server)).port();
+
+    const client = try socket(AF_INET, SOCK_DGRAM, 0);
+    defer close(client);
+    const target = Sockaddr.fromIp(try std.Io.net.IpAddress.parse("127.0.0.1", server_port));
+    try testing.expectEqual(@as(usize, 5), try sendto(client, "hello", &target));
+
+    var buf: [64]u8 = undefined;
+    var from: Sockaddr = undefined;
+    // Loopback is fast but not synchronous; poll rather than assume.
+    var fds = [_]pollfd{.{ .fd = server, .events = POLL.IN, .revents = 0 }};
+    _ = try poll(&fds, 1000);
+    const n = try recvfrom(server, &buf, &from);
+    try testing.expectEqualStrings("hello", buf[0..n]);
+
+    // The reply address is what a UDP server has to answer to, so it must
+    // be the client's ephemeral port and not the one we bound.
+    try testing.expect(from.port() != 0);
+    try testing.expect(from.port() != server_port);
+    _ = try sendto(server, "pong", &from);
+}
+
 // ---------------------------------------------------------------------
 // Credentials
 // ---------------------------------------------------------------------
@@ -1046,11 +1106,32 @@ pub fn joinZ(buf: *[path_max]u8, dir: []const u8, name: []const u8) PathError![:
     return buf[0 .. dir.len + sep + name.len :0];
 }
 
+/// A unique scratch directory for one test.
+///
+/// Fixed `/tmp` paths were a mistake: a test that fails partway leaves the
+/// directory behind, and the *next* run then fails on a stale entry count
+/// rather than on the thing that actually broke — which is exactly how a
+/// real failure ends up looking like a flake. The pid plus a counter makes
+/// each run and each test disjoint.
+var scratch_counter: u32 = 0;
+
+fn scratchDir(buf: *[path_max]u8, comptime tag: []const u8) ![:0]const u8 {
+    scratch_counter += 1;
+    const pid: u32 = @intCast(if (is_linux) linux.getpid() else std.c.getpid());
+    var w = std.Io.Writer.fixed(buf);
+    try w.print("/tmp/hoardarr-{s}-{d}-{d}\x00", .{ tag, pid, scratch_counter });
+    const written = w.buffered();
+    return buf[0 .. written.len - 1 :0];
+}
+
 test "open, write, size, rename, unlink" {
-    var buf: [path_max]u8 = undefined;
-    const dir = "/tmp/hoardarr-systest";
+    // `dir` points into `dir_buf`; joining must write elsewhere or it
+    // overwrites the string it is reading from.
+    var dir_buf: [path_max]u8 = undefined;
+    const dir = try scratchDir(&dir_buf, "systest");
     try mkdirPath(dir);
 
+    var buf: [path_max]u8 = undefined;
     const a = try joinZ(&buf, dir, "a.txt");
     const fd = try open(a, .{ .mode = .write_only, .create = true, .truncate = true });
     try writeAll(fd, "hello");
@@ -1070,28 +1151,31 @@ test "open, write, size, rename, unlink" {
 
     try unlink(b);
     try testing.expect(!exists(b));
-    try rmdir(try pathZ(&buf, dir));
+    try rmdir(dir);
 }
 
 test "mkdirPath creates every level and is idempotent" {
+    var root_buf: [path_max]u8 = undefined;
+    const root = try scratchDir(&root_buf, "systest2");
     var buf: [path_max]u8 = undefined;
-    const deep = "/tmp/hoardarr-systest2/incomplete/nested";
+    const deep = try joinZ(&buf, root, "incomplete/nested");
     try mkdirPath(deep);
-    try testing.expect(exists(try pathZ(&buf, deep)));
+    try testing.expect(exists(deep));
 
     // Called again on every start-up, so it must not fail once the tree
     // is there.
     try mkdirPath(deep);
-    try testing.expect(exists(try pathZ(&buf, deep)));
+    try testing.expect(exists(deep));
 
-    try rmdir(try pathZ(&buf, "/tmp/hoardarr-systest2/incomplete/nested"));
-    try rmdir(try pathZ(&buf, "/tmp/hoardarr-systest2/incomplete"));
-    try rmdir(try pathZ(&buf, "/tmp/hoardarr-systest2"));
+    var b2: [path_max]u8 = undefined;
+    try rmdir(deep);
+    try rmdir(try joinZ(&b2, root, "incomplete"));
+    try rmdir(root);
 }
 
 test "exclusive create is how a lock file is claimed" {
     var buf: [path_max]u8 = undefined;
-    const p = try pathZ(&buf, "/tmp/hoardarr-systest-lock");
+    const p = try scratchDir(&buf, "systest-lock");
     unlink(p) catch {};
 
     const fd = try open(p, .{ .mode = .write_only, .create = true, .exclusive = true });
@@ -1221,8 +1305,8 @@ pub const DirIter = struct {
 };
 
 test "DirIter lists what was created and nothing else" {
-    var buf: [path_max]u8 = undefined;
-    const dir = "/tmp/hoardarr-diritertest";
+    var dir_buf: [path_max]u8 = undefined;
+    const dir = try scratchDir(&dir_buf, "diritertest");
     try mkdirPath(dir);
 
     for ([_][]const u8{ "one.log", "two.log", "three.log" }) |name| {
@@ -1249,12 +1333,12 @@ test "DirIter lists what was created and nothing else" {
         var pb: [path_max]u8 = undefined;
         try unlink(try joinZ(&pb, dir, name));
     }
-    try rmdir(try pathZ(&buf, dir));
+    try rmdir(dir);
 }
 
 test "DirIter over many entries spans several refills" {
-    var buf: [path_max]u8 = undefined;
-    const dir = "/tmp/hoardarr-diriterbig";
+    var dir_buf: [path_max]u8 = undefined;
+    const dir = try scratchDir(&dir_buf, "diriterbig");
     try mkdirPath(dir);
 
     // The read buffer is 4 KiB, so 200 entries force multiple getdents
@@ -1281,7 +1365,7 @@ test "DirIter over many entries spans several refills" {
         const nm = try std.fmt.bufPrint(&name, "entry-{d:0>4}.log", .{i});
         try unlink(try joinZ(&pb, dir, nm));
     }
-    try rmdir(try pathZ(&buf, dir));
+    try rmdir(dir);
 }
 
 test "DirIter on a missing directory is an error, not an empty listing" {
@@ -1344,7 +1428,7 @@ test "IPv6 peers render as a stable key too" {
 
 test "fileSize does not move the cursor out from under a reader" {
     var buf: [path_max]u8 = undefined;
-    const p = try pathZ(&buf, "/tmp/hoardarr-filesize-test");
+    const p = try scratchDir(&buf, "filesize");
     unlink(p) catch {};
 
     const w = try open(p, .{ .mode = .write_only, .create = true, .truncate = true });

@@ -24,7 +24,9 @@ pub const wiring = struct {
     pub const files = @import("bootstrap/files.zig");
     pub const sab = @import("bootstrap/sab.zig");
     pub const runtime = @import("bootstrap/runtime.zig");
+    pub const pipeline = @import("bootstrap/pipeline.zig");
     pub const wiring_test = @import("bootstrap/wiring_test.zig");
+    pub const download_test = @import("bootstrap/download_test.zig");
 };
 
 pub const core = struct {
@@ -83,6 +85,7 @@ pub const domain = struct {
 
 pub const nntp = struct {
     pub const protocol = @import("nntp/protocol.zig");
+    pub const transport = @import("nntp/transport.zig");
     pub const conn = @import("nntp/conn.zig");
     pub const pool = @import("nntp/pool.zig");
 };
@@ -236,7 +239,9 @@ test {
     _ = wiring.files;
     _ = wiring.sab;
     _ = wiring.runtime;
+    _ = wiring.pipeline;
     _ = wiring.wiring_test;
+    _ = wiring.download_test;
     _ = core.crc32;
     _ = core.toml;
     _ = core.config;
@@ -276,6 +281,7 @@ test {
     _ = domain.extract;
     _ = domain.deliver;
     _ = nntp.protocol;
+    _ = nntp.transport;
     _ = nntp.conn;
     _ = nntp.pool;
     _ = store.sqlite_c;

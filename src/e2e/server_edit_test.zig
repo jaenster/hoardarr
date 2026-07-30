@@ -75,6 +75,12 @@ test "servers: add, list, enable, disable and delete over real HTTP" {
     // Both probe routes answer 503 today, and this is the assertion
     // that will fail the moment the probe is wired — at which point the
     // real Go assertions (dial, auth, mode_reader, date) belong here.
+    // The probe port is wired now. This asserted 503 while it was null,
+    // deliberately, so that wiring it would fail loudly rather than leave a
+    // stale expectation passing — which is exactly what happened.
+    //
+    // The fixture's NNTP server is a real one, so an ad-hoc probe against it
+    // should get all the way through the handshake.
     {
         const probe = try std.fmt.allocPrint(gpa,
             \\{{"host":"127.0.0.1","port":{d},"tls":false,"username":"user","password":"pw"}}
@@ -83,14 +89,17 @@ test "servers: add, list, enable, disable and delete over real HTTP" {
 
         var r = try fx.request(.{ .method = .post, .path = "/api/v1/servers/test", .body = probe });
         defer r.deinit();
-        try h.expectStatus(&r, 503, "POST /api/v1/servers/test (probe port is null)");
+        try h.expectStatus(&r, 200, "POST /api/v1/servers/test");
+        // Reaching the greeting is what proves the probe actually dialled
+        // rather than reporting a canned answer.
+        try r.expectField("dial", "true");
     }
     {
         const path = try std.fmt.allocPrint(gpa, "/api/v1/servers/{d}/test", .{id});
         defer gpa.free(path);
         var r = try fx.request(.{ .method = .post, .path = path });
         defer r.deinit();
-        try h.expectStatus(&r, 503, "POST /api/v1/servers/{id}/test (probe port is null)");
+        try h.expectStatus(&r, 200, "POST /api/v1/servers/{id}/test");
     }
 
     // disable / enable round trip.

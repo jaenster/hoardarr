@@ -91,6 +91,14 @@ const assert = std.debug.assert;
 
 pub const Error = socket.Error;
 
+/// Minimum size for **both** ciphertext buffers. `Client` asserts it on
+/// each, and a `flush` with an undersized write buffer panics rather than
+/// erroring — see `Options`.
+///
+/// Kept as the old name for the read side so existing callers still
+/// compile; `min_ciphertext_buffer` is the honest one.
+pub const min_ciphertext_buffer: usize = tls.Client.min_buffer_len;
+
 /// Minimum size of `Options.read_buffer`. `Client` asserts it, because a
 /// TLS record has to be processed contiguously and this is the largest one
 /// the protocol allows.
@@ -98,7 +106,14 @@ pub const min_read_buffer: usize = tls.Client.min_buffer_len;
 
 /// A comfortable write buffer. TLS fragments anything larger, so this is a
 /// throughput knob rather than a correctness one.
-pub const default_write_buffer: usize = 16 * 1024;
+/// Default ciphertext write buffer.
+///
+/// This was 16 KiB, which is *below* `tls.Client.min_buffer_len`, so the
+/// first `flush` hit an assert and panicked. It went unnoticed because
+/// nothing had ever completed a handshake; the first real one crashed
+/// immediately. Sized off the floor now rather than a round number, so it
+/// cannot drift below it again.
+pub const default_write_buffer: usize = min_ciphertext_buffer;
 
 pub const entropy_len = tls.Client.Options.entropy_len;
 
@@ -502,10 +517,27 @@ pub const Options = struct {
     host: []const u8,
     /// No default. See `Trust`.
     trust: Trust,
-    /// At least `min_read_buffer` bytes. Not owned.
+    /// Ciphertext in, from the socket. At least `min_ciphertext_buffer`.
+    /// Not owned.
     read_buffer: []u8,
+    /// Ciphertext out, to the socket. At least `min_ciphertext_buffer`.
     /// Not owned.
     write_buffer: []u8,
+    /// Plaintext in, decrypted. **Must not alias `read_buffer`.**
+    ///
+    /// These were originally one buffer each, handed to both the transport
+    /// and the `Client`. The transport writes ciphertext into it while the
+    /// `Client` writes decrypted plaintext into the same bytes, which
+    /// corrupted the first plaintext byte of every connection. Nothing
+    /// caught it because nothing had ever decrypted a byte.
+    ///
+    /// Null allocates one of `min_ciphertext_buffer` from `gpa`, which then
+    /// must be non-null.
+    plaintext_read_buffer: ?[]u8 = null,
+    /// Plaintext out, before encryption. Must not alias `write_buffer`.
+    plaintext_write_buffer: ?[]u8 = null,
+    /// Used only to allocate the plaintext buffers when they are null.
+    gpa: ?std.mem.Allocator = null,
     /// 240 bytes of CSPRNG output. Null means "take it from the OS", which
     /// is what production wants; tests pass a fixed buffer when they need
     /// a reproducible ClientHello.
@@ -526,6 +558,12 @@ pub const Conn = struct {
     fiber: Fiber = undefined,
     transport: Transport = undefined,
     client: tls.Client = undefined,
+
+    /// Plaintext buffers allocated by `handshake` when the caller didn't
+    /// supply them. Freed by `deinit`.
+    owned_plaintext_read: ?[]u8 = null,
+    owned_plaintext_write: ?[]u8 = null,
+    owned_gpa: ?std.mem.Allocator = null,
 
     gpa: Allocator,
     loop: *reactor.Loop,
@@ -599,11 +637,26 @@ pub const Conn = struct {
     /// it first and let the session return.
     pub fn deinit(self: *Conn) void {
         self.fiber.deinit();
+        if (self.owned_gpa) |g| {
+            if (self.owned_plaintext_read) |b| g.free(b);
+            if (self.owned_plaintext_write) |b| g.free(b);
+        }
+        self.owned_plaintext_read = null;
+        self.owned_plaintext_write = null;
         if (self.fd != sys.invalid_fd) {
             sys.close(self.fd);
             self.fd = sys.invalid_fd;
         }
         self.state = .closed;
+    }
+
+    /// True when two slices share any storage. The plaintext and
+    /// ciphertext buffers overlapping is silent corruption rather than a
+    /// crash, so it is checked rather than documented.
+    fn aliases(a: []const u8, b: []const u8) bool {
+        const a_start = @intFromPtr(a.ptr);
+        const b_start = @intFromPtr(b.ptr);
+        return a_start < b_start + b.len and b_start < a_start + a.len;
     }
 
     /// Resume the session with `error.Canceled` out of whatever it is
@@ -619,7 +672,31 @@ pub const Conn = struct {
     /// Run the TLS handshake. Call this first, from inside the session.
     pub fn handshake(self: *Conn, options: Options) HandshakeError!void {
         assert(self.state == .idle);
-        if (options.read_buffer.len < min_read_buffer) return error.Misconfigured;
+        // Both ciphertext buffers, not just the read side: `Client.flush`
+        // asserts on the write buffer and a panic is not a diagnosable
+        // failure mode for an operator.
+        if (options.read_buffer.len < min_ciphertext_buffer) return error.Misconfigured;
+        if (options.write_buffer.len < min_ciphertext_buffer) return error.Misconfigured;
+
+        // The plaintext buffers must be distinct storage from the
+        // ciphertext ones; see `Options.plaintext_read_buffer`.
+        const gpa = options.gpa;
+        self.owned_gpa = gpa;
+        const pt_read = options.plaintext_read_buffer orelse blk: {
+            const g = gpa orelse return error.Misconfigured;
+            const b = g.alloc(u8, min_ciphertext_buffer) catch return error.Misconfigured;
+            self.owned_plaintext_read = b;
+            break :blk b;
+        };
+        const pt_write = options.plaintext_write_buffer orelse blk: {
+            const g = gpa orelse return error.Misconfigured;
+            const b = g.alloc(u8, min_ciphertext_buffer) catch return error.Misconfigured;
+            self.owned_plaintext_write = b;
+            break :blk b;
+        };
+        if (aliases(pt_read, options.read_buffer) or aliases(pt_write, options.write_buffer)) {
+            return error.Misconfigured;
+        }
 
         var gathered: [entropy_len]u8 = undefined;
         const entropy = options.entropy orelse blk: {
@@ -652,8 +729,8 @@ pub const Conn = struct {
                 .self_signed_only => .self_signed,
                 .insecure_skip_verification_dangerous => .no_verification,
             },
-            .read_buffer = options.read_buffer,
-            .write_buffer = options.write_buffer,
+            .read_buffer = pt_read,
+            .write_buffer = pt_write,
             .entropy = entropy,
             .realtime_now = now,
             .alert = &alert,
@@ -1311,6 +1388,9 @@ const TlsHarness = struct {
             .trust = self.trust,
             .read_buffer = self.read_buf,
             .write_buffer = self.write_buf,
+            // The plaintext buffers must be separate storage; letting
+            // `handshake` allocate them is the shape most callers want.
+            .gpa = self.gpa,
             .entropy = &test_entropy,
         }) catch |err| {
             self.handshake_err = err;
@@ -1762,4 +1842,66 @@ test "handshake stack high-water leaves the default stack size room to spare" {
     std.log.debug("TLS handshake stack high-water: {d} of {d} reserved", .{
         high_water, handshake_stack,
     });
+}
+
+test "the plaintext buffers are distinct storage from the ciphertext ones" {
+    // These were one buffer each, handed to both the transport and the
+    // Client, so ciphertext arriving from the socket and plaintext written
+    // by the Client shared bytes and the first plaintext byte of every
+    // connection was corrupted. Nothing caught it because nothing had ever
+    // decrypted a byte — this module had no caller until the NNTP client.
+    var cipher_read: [min_ciphertext_buffer]u8 = undefined;
+    var cipher_write: [min_ciphertext_buffer]u8 = undefined;
+
+    // Explicitly aliasing must be refused rather than silently corrupting.
+    try testing.expect(Conn.aliases(&cipher_read, &cipher_read));
+    try testing.expect(!Conn.aliases(&cipher_read, &cipher_write));
+
+    // A sub-slice overlaps too — the check is on storage, not identity.
+    try testing.expect(Conn.aliases(cipher_read[10..20], cipher_read[15..25]));
+    try testing.expect(!Conn.aliases(cipher_read[0..10], cipher_read[10..20]));
+}
+
+test "the default write buffer clears the floor Client asserts on" {
+    // default_write_buffer was 16 KiB, below tls.Client.min_buffer_len, so
+    // the first flush hit an assert and *panicked* rather than erroring.
+    // The first real handshake ever attempted crashed on it. Deriving the
+    // default from the floor means it cannot drift back under.
+    try testing.expect(default_write_buffer >= min_ciphertext_buffer);
+    try testing.expect(min_ciphertext_buffer >= std.crypto.tls.Client.min_buffer_len);
+}
+
+test "an undersized ciphertext buffer is an error, not a panic" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    // Both sides are checked. Only the read side used to be, so an
+    // undersized write buffer reached the assert instead of the caller —
+    // and a panic is not something an operator can diagnose.
+    var tiny: [64]u8 = undefined;
+    var ok_buf: [min_ciphertext_buffer]u8 = undefined;
+
+    const noop = struct {
+        fn f(_: *Conn) void {}
+    }.f;
+    var c: Conn = .{ .gpa = gpa, .loop = &loop, .fd = sys.invalid_fd, .session = noop };
+    c.state = .idle;
+    try testing.expectError(error.Misconfigured, c.handshake(.{
+        .host = "x.invalid",
+        .trust = .insecure_skip_verification_dangerous,
+        .read_buffer = &tiny,
+        .write_buffer = &ok_buf,
+        .gpa = gpa,
+    }));
+
+    c.state = .idle;
+    try testing.expectError(error.Misconfigured, c.handshake(.{
+        .host = "x.invalid",
+        .trust = .insecure_skip_verification_dangerous,
+        .read_buffer = &ok_buf,
+        .write_buffer = &tiny,
+        .gpa = gpa,
+    }));
 }

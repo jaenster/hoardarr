@@ -409,10 +409,12 @@ test "the ports left null are the documented ones and nothing else" {
     try testing.expect(api.events_hub != null);
     try testing.expect(api.logs_hub != null);
     try testing.expect(api.metrics != null);
+    // Wired by `bootstrap/runtime.zig`: dialling a provider needs the
+    // NNTP client, and the client needs the reactor.
+    try testing.expect(api.probe != null);
 
     // Deliberately not, each with a reason in `App.wire`. Asserted so
     // that wiring one of them without deleting its excuse fails here.
-    try testing.expect(api.probe == null);
     try testing.expect(api.health == null);
     try testing.expect(api.disk == null);
 }

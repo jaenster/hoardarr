@@ -28,11 +28,18 @@ const sys = @import("../posix/sys.zig");
 const reactor = @import("../posix/reactor.zig");
 const socket = @import("../net/socket.zig");
 const protocol = @import("protocol.zig");
+const transport = @import("transport.zig");
 
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
 
-pub const Error = socket.Error || error{
+pub const Transport = transport.Transport;
+pub const Security = transport.Security;
+pub const TlsConfig = transport.TlsConfig;
+pub const Trust = transport.Trust;
+pub const CaStore = transport.CaStore;
+
+pub const Error = transport.Error || error{
     /// The server said something that doesn't belong in this state. Almost
     /// always means a desynchronised stream, so the connection is dead.
     ProtocolDesync,
@@ -79,6 +86,10 @@ pub const Config = struct {
     /// reads, so this only needs to be large enough that the syscall
     /// count stays sane.
     read_buf_size: usize = 64 * 1024,
+    /// Plaintext or TLS. Defaults to plaintext because that is what an
+    /// address literal on 119 means; every commercial provider wants
+    /// `.tls`, and choosing it means choosing a `Trust` by name.
+    security: Security = .plaintext,
 };
 
 /// Where the conversation is. Ordered roughly by lifecycle so a
@@ -123,7 +134,10 @@ pub const Handler = struct {
 };
 
 pub const Conn = struct {
-    stream: socket.Stream,
+    /// A plain socket or a TLS session, chosen by `Config.security`. The
+    /// field keeps its name because everything above it only ever asks
+    /// for `write`, and the plaintext path is byte-for-byte what it was.
+    stream: Transport,
     loop: *reactor.Loop,
     gpa: Allocator,
     handler: *const Handler,
@@ -144,6 +158,17 @@ pub const Conn = struct {
     /// Per-command deadline. Armed on send, cancelled on response.
     timer: reactor.Timer,
 
+    /// Delivers a failure that was raised while the TLS session fiber was
+    /// running, from the loop's stack instead.
+    ///
+    /// `on_error` is entitled to destroy this connection — the pool does
+    /// exactly that — and destroying it frees the fiber's stack. Doing
+    /// that from a frame *on* that stack is a `munmap` of the caller.
+    /// Zero-delay timer, same answer `bootstrap/runtime.zig` uses for the
+    /// mirror-image problem.
+    defer_timer: reactor.Timer,
+    deferred_err: ?Error = null,
+
     /// Scratch for formatting commands. `protocol.max_command_len` is the
     /// RFC's 512-byte limit.
     cmd_buf: [protocol.max_command_len]u8 = undefined,
@@ -156,8 +181,19 @@ pub const Conn = struct {
         .on_connected = onConnected,
     };
 
+    /// What the TLS session calls back into. The plaintext path has no
+    /// equivalent because there the loop calls us, not the other way
+    /// round.
+    const tls_driver_vtable = .{
+        .on_open = tlsOpen,
+        .space = tlsSpace,
+        .filled = tlsFilled,
+        .awaiting = tlsAwaiting,
+        .on_closed = tlsClosed,
+    };
+
     /// Start connecting. Initialises in place, because the reactor stores
-    /// `&self.stream.source` and `&self.timer`.
+    /// `&self.stream.plain.source` and `&self.timer`.
     pub fn connect(
         self: *Conn,
         gpa: Allocator,
@@ -170,24 +206,67 @@ pub const Conn = struct {
         errdefer gpa.free(in);
 
         self.* = .{
-            .stream = undefined,
+            .stream = .{},
             .loop = loop,
             .gpa = gpa,
             .handler = handler,
             .config = config,
             .in = in,
             .timer = .{ .callback = onTimeout },
+            .defer_timer = .{ .callback = onDeferredFail },
         };
-        try self.stream.connect(gpa, loop, addr, &stream_handler);
-        try self.armTimeout();
+
+        switch (config.security) {
+            .plaintext => {
+                try self.stream.plain.connect(gpa, loop, addr, &stream_handler);
+                try self.armTimeout();
+            },
+            .tls => |cfg| {
+                // The fiber does the TCP connect too: it has to own the
+                // fd's readiness, and a `socket.Stream` owning it first
+                // would be a second registration of the same fd.
+                const t = try transport.Tls.create(gpa, loop, addr, cfg, .{
+                    .ctx = self,
+                    .on_open = tls_driver_vtable.on_open,
+                    .space = tls_driver_vtable.space,
+                    .filled = tls_driver_vtable.filled,
+                    .awaiting = tls_driver_vtable.awaiting,
+                    .on_closed = tls_driver_vtable.on_closed,
+                });
+                self.stream.tls = t;
+                // Armed before the session runs: the handshake — TCP,
+                // certificate exchange and all — is under the same
+                // per-command deadline as everything else, and `begin`
+                // can fail outright.
+                try self.armTimeout();
+                t.begin();
+            },
+        }
     }
 
     pub fn deinit(self: *Conn) void {
         if (self.timer.isArmed()) self.loop.cancelTimer(&self.timer);
+        if (self.defer_timer.isArmed()) self.loop.cancelTimer(&self.defer_timer);
+        // Before `self.in` is freed: a parked session's stack may still
+        // hold a slice of it.
         self.stream.deinit();
         self.body.deinit(self.gpa);
         self.gpa.free(self.in);
         self.state = .closed;
+    }
+
+    /// The peer's own reason for refusing the handshake, if it gave one.
+    /// Null on the plaintext path and on every error that is not
+    /// `error.TlsAlert`.
+    pub fn tlsAlert(self: *const Conn) ?std.crypto.tls.Alert {
+        const t = self.stream.tls orelse return null;
+        return t.alert;
+    }
+
+    /// The unmapped `std` error behind a `Tls*` failure. For logs only.
+    pub fn tlsDetail(self: *const Conn) ?anyerror {
+        const t = self.stream.tls orelse return null;
+        return t.detail;
     }
 
     pub fn isReady(self: *const Conn) bool {
@@ -235,8 +314,15 @@ pub const Conn = struct {
         self.fail(error.Timeout);
     }
 
+    /// Recover the connection from one of `socket.Stream`'s callbacks.
+    /// Two hops now that the stream sits inside a `Transport`.
+    fn fromStream(s: *socket.Stream) *Conn {
+        const t: *Transport = @fieldParentPtr("plain", s);
+        return @fieldParentPtr("stream", t);
+    }
+
     fn onConnected(s: *socket.Stream, err: ?socket.Error) void {
-        const self: *Conn = @fieldParentPtr("stream", s);
+        const self: *Conn = fromStream(s);
         if (err) |e| {
             self.fail(e);
             return;
@@ -246,7 +332,7 @@ pub const Conn = struct {
     }
 
     fn onClose(s: *socket.Stream, err: ?socket.Error) void {
-        const self: *Conn = @fieldParentPtr("stream", s);
+        const self: *Conn = fromStream(s);
         // A close while consuming a block means a truncated article, which
         // is a different problem from a close between commands and worth
         // reporting as such.
@@ -262,7 +348,7 @@ pub const Conn = struct {
     }
 
     fn onReadable(s: *socket.Stream) void {
-        const self: *Conn = @fieldParentPtr("stream", s);
+        const self: *Conn = fromStream(s);
 
         while (true) {
             // Compact rather than grow: a status line always fits, and a
@@ -296,6 +382,84 @@ pub const Conn = struct {
             };
             if (self.state == .closed) return;
         }
+    }
+
+    // -- the TLS side of the transport --------------------------------
+    //
+    // The first three run on the session fiber's stack. That is fine for
+    // everything the state machine does — including `on_body`, which the
+    // owner is expected to answer with the next `fetchBody`, and which
+    // then queues rather than writes. It is *not* fine for `on_error`;
+    // see `fail`.
+
+    /// The handshake completed. Same point the plaintext path reaches in
+    /// `onConnected`: connected, and the server speaks first.
+    fn tlsOpen(ctx: *anyopaque) void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (self.state != .connecting) return;
+        self.state = .greeting;
+    }
+
+    /// Decrypt straight into the connection's own input buffer, so a TLS
+    /// body costs no more copies than a plaintext one.
+    fn tlsSpace(ctx: *anyopaque) []u8 {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (self.in_len >= self.in.len) return &.{};
+        return self.in[self.in_len..];
+    }
+
+    fn tlsFilled(ctx: *anyopaque, n: usize) bool {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        self.in_len += n;
+        self.drive() catch |err| {
+            self.fail(err);
+            return false;
+        };
+        return self.state != .closed;
+    }
+
+    /// Whether the state machine is waiting on the server. False means
+    /// the session may park idle instead of blocking in a TLS read that
+    /// nothing is going to answer.
+    ///
+    /// State only. Bytes left in `in` are by definition ones the current
+    /// state cannot consume — `drive` loops until they are gone — so
+    /// counting them as "outstanding" would put the session into a read
+    /// it can never be woken out of for the next command.
+    fn tlsAwaiting(ctx: *anyopaque) bool {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        return switch (self.state) {
+            .connecting, .ready, .closed => false,
+            else => true,
+        };
+    }
+
+    /// The session ended. Always on the loop's stack, so this is where a
+    /// TLS failure becomes an ordinary `on_error`.
+    fn tlsClosed(ctx: *anyopaque, err: Error) void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        // A close while consuming a block means a truncated article,
+        // which is a different problem from a close between commands —
+        // exactly the distinction `onClose` makes for plaintext.
+        if (self.state == .body_data) {
+            self.fail(error.TruncatedBody);
+            return;
+        }
+        if (self.state == .quitting or self.state == .closed) {
+            self.state = .closed;
+            return;
+        }
+        self.fail(err);
+    }
+
+    fn onDeferredFail(t: *reactor.Timer) void {
+        const self: *Conn = @fieldParentPtr("defer_timer", t);
+        const err = self.deferred_err orelse return;
+        self.deferred_err = null;
+        // Unwind the session before telling anyone, so the handler is
+        // free to destroy this connection.
+        if (self.stream.tls) |tl| tl.halt();
+        self.handler.on_error(self, err);
     }
 
     /// Consume as much of the input buffer as the current state can.
@@ -460,10 +624,34 @@ pub const Conn = struct {
         };
     }
 
+    /// Report a fatal error once, and never from a stack the handler is
+    /// allowed to free.
+    ///
+    /// On the plaintext path that is unconditional: the handler runs from
+    /// a reactor callback and destroying the connection there is what the
+    /// pool already does. On the TLS path the caller may be the session
+    /// fiber itself, whose stack `on_error` would `munmap`, so the report
+    /// is postponed to a zero-delay timer.
     fn fail(self: *Conn, err: Error) void {
         if (self.state == .closed) return;
         self.state = .closed;
         self.disarmTimeout();
+
+        if (self.stream.tls) |t| {
+            // Tell the session to stop before anything else: it must not
+            // report this again from `on_closed`.
+            t.stop = true;
+            if (!t.isDone() and self.deferred_err == null) {
+                self.deferred_err = err;
+                if (self.loop.addTimer(&self.defer_timer, 0)) |_| return else |_| {
+                    // No timer available. Reporting inline is worse than
+                    // this being reported at all, so fall through — and
+                    // unwind the session first so its stack is idle.
+                    self.deferred_err = null;
+                    t.halt();
+                }
+            }
+        }
         self.handler.on_error(self, err);
     }
 };
@@ -1152,4 +1340,420 @@ test "a rejected message id never reaches the wire" {
     try testing.expectError(error.InvalidMessageId, client.conn.fetchBody("<a@b>\r\nQUIT"));
     try testing.expect(client.conn.isReady());
     try testing.expectEqual(@as(?[]const u8, null), stub.desync);
+}
+
+// ---------------------------------------------------------------------
+// TLS
+// ---------------------------------------------------------------------
+//
+// What these do and do not prove, stated plainly so nobody reads more
+// into them than is there.
+//
+// They cover: the fd being dialled at all when `security = .tls`, a real
+// `std.crypto.tls.Client` ClientHello reaching a real socket with SNI in
+// it, the mapping from a peer's refusal to a distinguishable NNTP error,
+// the guarantee that no NNTP command — credentials included — is written
+// before the handshake succeeds, the per-command deadline reaching a
+// fiber parked mid-handshake, and the fiber's stack being released on
+// every one of those paths.
+//
+// They do **not** cover a *completed* handshake. `std.crypto.tls` ships a
+// client and no server, so nothing in-tree can shake hands, and no test
+// below reaches ServerHello, the key schedule, certificate chain
+// verification, or a plaintext byte over TLS.
+//
+// Those paths were exercised out of tree, by hand, against OpenSSL 3.4.1
+// (`openssl s_server`, TLS 1.3) — see the recipe at the bottom of
+// `transport.zig`. That run is what found the buffer sizing this file
+// depends on, and it is not a substitute for a test: nothing in CI
+// re-runs it. Treat "TLS works" as verified once, not as guarded.
+
+const fiber_mod = @import("../posix/fiber.zig");
+
+/// A peer that speaks raw bytes on a socket: it collects whatever the
+/// client sends and answers with a fixed reply once anything arrives.
+///
+/// Deliberately not a TLS implementation. Everything above it — the
+/// fiber, the parking transport, `std.crypto.tls.Client`'s record layer
+/// and its error reporting — is the real thing; this is the wire.
+const RawPeer = struct {
+    listener: socket.Listener = undefined,
+    source: reactor.Source = undefined,
+    loop: *reactor.Loop,
+    gpa: Allocator,
+    fd: sys.Fd = sys.invalid_fd,
+
+    /// Sent once the first byte arrives. Empty means "say nothing".
+    reply: []const u8 = "",
+    /// Hang up after replying.
+    hang_up: bool = true,
+
+    got: std.ArrayList(u8) = .empty,
+    replied: bool = false,
+    accepted: usize = 0,
+
+    fn start(self: *RawPeer, gpa: Allocator, loop: *reactor.Loop, reply: []const u8, hang_up: bool) !u16 {
+        self.* = .{ .loop = loop, .gpa = gpa, .reply = reply, .hang_up = hang_up };
+        try self.listener.listen(try IpAddress.parse("127.0.0.1", 0), onAccept, 16);
+        self.listener.context = self;
+        try loop.add(&self.listener.source);
+        return self.listener.boundPort();
+    }
+
+    fn deinit(self: *RawPeer) void {
+        if (self.fd != sys.invalid_fd) {
+            if (self.source.isRegistered()) self.loop.remove(&self.source);
+            sys.close(self.fd);
+            self.fd = sys.invalid_fd;
+        }
+        if (self.listener.source.isRegistered()) self.loop.remove(&self.listener.source);
+        self.listener.close();
+        self.got.deinit(self.gpa);
+    }
+
+    fn onAccept(l: *socket.Listener, fd: sys.Fd) void {
+        const self: *RawPeer = @ptrCast(@alignCast(l.context.?));
+        self.accepted += 1;
+        if (self.fd != sys.invalid_fd) {
+            sys.close(fd);
+            return;
+        }
+        self.fd = fd;
+        // Readable only. A connected socket is writable essentially
+        // always, so registering both would spin the loop — the same
+        // reason `socket.Stream` drops write interest when its queue
+        // empties.
+        self.source = .{ .fd = fd, .interest = .readable, .callback = onReady };
+        self.loop.add(&self.source) catch {
+            sys.close(fd);
+            self.fd = sys.invalid_fd;
+        };
+    }
+
+    fn onReady(src: *reactor.Source, ready: reactor.Ready) void {
+        const self: *RawPeer = @fieldParentPtr("source", src);
+        if (ready.read) {
+            var buf: [16384]u8 = undefined;
+            while (true) {
+                const n = sys.read(src.fd, &buf) catch break;
+                if (n == 0) break;
+                self.got.appendSlice(self.gpa, buf[0..n]) catch break;
+            }
+        }
+        if (self.got.items.len == 0 or self.replied) return;
+        self.replied = true;
+        if (self.reply.len > 0) sys.writeAll(src.fd, self.reply) catch {};
+        if (self.hang_up) sys.shutdown(src.fd, .both);
+    }
+};
+
+const tls_insecure: Config = .{
+    .security = .{
+        .tls = .{
+            .host = "news.example.com",
+            // Not the insecure mode by default: `std` omits SNI entirely when
+            // host verification is off, and the SNI assertion below is half
+            // the point of these tests.
+            .trust = .self_signed_only,
+        },
+    },
+};
+
+test "a TLS server is dialled and gets a well-formed ClientHello with our SNI" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    var peer: RawPeer = undefined;
+    const port = try peer.start(gpa, &loop, "", true);
+    defer peer.deinit();
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), tls_insecure, &Client.handler);
+    defer client.deinit();
+
+    try pumpUntil(&loop, 10_000, &client, struct {
+        fn f(c: *Client) bool {
+            return c.err != null or c.ready;
+        }
+    }.f);
+
+    // The connection was actually made — the whole gap this closes is a
+    // `tls = true` server never being dialled at all.
+    try testing.expectEqual(@as(usize, 1), peer.accepted);
+
+    const hello = peer.got.items;
+    try testing.expect(hello.len > 64);
+    // TLS record header: handshake content type, then the legacy record
+    // version every TLS 1.3 ClientHello still carries.
+    try testing.expectEqual(@as(u8, 0x16), hello[0]);
+    try testing.expectEqual(@as(u8, 0x03), hello[1]);
+    try testing.expectEqual(@as(u8, 0x01), hello[2]);
+    try testing.expectEqual(@as(u8, 0x01), hello[5]); // client_hello
+    // Without SNI a provider on a shared address hands back the wrong
+    // certificate and every connection fails hostname verification.
+    try testing.expect(std.mem.indexOf(u8, hello, "news.example.com") != null);
+
+    // And the peer going away is reported rather than swallowed.
+    try testing.expect(client.err != null);
+    try testing.expect(!client.ready);
+}
+
+test "credentials never reach the wire before the handshake succeeds" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    var peer: RawPeer = undefined;
+    // Answer the ClientHello with a plausible NNTP greeting. A client that
+    // had its state machine wired to the raw socket would take it, and
+    // send AUTHINFO in the clear.
+    const port = try peer.start(gpa, &loop, "200 news ready\r\n", true);
+    defer peer.deinit();
+
+    var cfg = tls_insecure;
+    cfg.username = "alice";
+    cfg.password = "s3cret";
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), cfg, &Client.handler);
+    defer client.deinit();
+
+    try pumpUntil(&loop, 10_000, &client, struct {
+        fn f(c: *Client) bool {
+            return c.err != null or c.ready;
+        }
+    }.f);
+
+    // This is the security property, not a nicety: everything after the
+    // ClientHello is encrypted, so a password can never appear in what
+    // the peer received.
+    try testing.expect(std.mem.indexOf(u8, peer.got.items, "s3cret") == null);
+    try testing.expect(std.mem.indexOf(u8, peer.got.items, "alice") == null);
+    try testing.expect(std.mem.indexOf(u8, peer.got.items, "AUTHINFO") == null);
+    try testing.expect(std.mem.indexOf(u8, peer.got.items, "MODE READER") == null);
+    try testing.expect(!client.ready);
+    try testing.expect(client.err != null);
+}
+
+test "a fatal alert from a TLS peer surfaces as TlsAlert with the peer's reason" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    // A real, minimal TLS alert record: content type 21, version 3.3,
+    // length 2, level fatal (2), description handshake_failure (40).
+    const alert_record = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
+
+    var peer: RawPeer = undefined;
+    const port = try peer.start(gpa, &loop, &alert_record, true);
+    defer peer.deinit();
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), tls_insecure, &Client.handler);
+    defer client.deinit();
+
+    try pumpUntil(&loop, 10_000, &client, struct {
+        fn f(c: *Client) bool {
+            return c.err != null or c.ready;
+        }
+    }.f);
+
+    // The peer told us why it refused, and that is the single most useful
+    // thing to put in a log line about a provider that will not connect.
+    try testing.expectEqual(@as(?Error, error.TlsAlert), client.err);
+    try testing.expect(client.conn.tlsAlert() != null);
+    try testing.expectEqual(
+        std.crypto.tls.Alert.Description.handshake_failure,
+        client.conn.tlsAlert().?.description,
+    );
+}
+
+test "a plaintext NNTP server on the TLS port is a protocol error, not a hang" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    // The classic misconfiguration: 119 typed where 563 was meant. The
+    // greeting is a perfectly good NNTP line and complete nonsense as a
+    // TLS record.
+    var peer: RawPeer = undefined;
+    const port = try peer.start(gpa, &loop, "200 news.example.invalid ready\r\n", true);
+    defer peer.deinit();
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), tls_insecure, &Client.handler);
+    defer client.deinit();
+
+    try pumpUntil(&loop, 10_000, &client, struct {
+        fn f(c: *Client) bool {
+            return c.err != null or c.ready;
+        }
+    }.f);
+
+    try testing.expect(!client.ready);
+    // Not a certificate problem: pointing the operator at their roots
+    // when they typed the wrong port wastes an evening.
+    try testing.expectEqual(@as(?Error, error.TlsProtocolError), client.err);
+    try testing.expect(client.conn.tlsDetail() != null);
+}
+
+test "a TLS peer that never answers hits the per-command deadline" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    const before = fiber_mod.liveStacks();
+
+    // Accepts, reads the ClientHello, and says nothing ever again. The
+    // session fiber is parked inside `Client.init` when the timer fires,
+    // which is the case a deadline has to be able to reach.
+    var peer: RawPeer = undefined;
+    const port = try peer.start(gpa, &loop, "", false);
+    defer peer.deinit();
+
+    var cfg = tls_insecure;
+    cfg.timeout_ns = 120 * std.time.ns_per_ms;
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), cfg, &Client.handler);
+
+    try pumpUntil(&loop, 10_000, &client, struct {
+        fn f(c: *Client) bool {
+            return c.err != null or c.ready;
+        }
+    }.f);
+
+    // A stalled provider must not pin a connection forever, and a TLS one
+    // is the easiest to stall: the handshake is several round trips
+    // before a single byte of NNTP.
+    try testing.expectEqual(@as(?Error, error.Timeout), client.err);
+
+    client.deinit();
+    // The fiber was parked when the deadline fired; it has to have been
+    // unwound and its 1 MiB mapping released, not abandoned.
+    try testing.expectEqual(before, fiber_mod.liveStacks());
+}
+
+test "a TLS connect to a dead port fails fast and frees its stack" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    const before = fiber_mod.liveStacks();
+
+    // Bind then release, so nothing is listening.
+    var probe: socket.Listener = undefined;
+    try probe.listen(try IpAddress.parse("127.0.0.1", 0), struct {
+        fn f(_: *socket.Listener, fd: sys.Fd) void {
+            sys.close(fd);
+        }
+    }.f, 1);
+    const dead = try probe.boundPort();
+    probe.close();
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", dead), tls_insecure, &Client.handler);
+
+    try pumpUntil(&loop, 5000, &client, struct {
+        fn f(c: *Client) bool {
+            return c.err != null or c.ready;
+        }
+    }.f);
+
+    // The TCP failure has to survive the trip out through the fiber
+    // unchanged; reporting it as a TLS problem would send the operator
+    // looking at certificates for a closed port.
+    try testing.expectEqual(@as(?Error, error.ConnectionRefused), client.err);
+
+    client.deinit();
+    try testing.expectEqual(before, fiber_mod.liveStacks());
+}
+
+test "a TLS connection that is torn down mid-handshake leaks no stack" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    const before = fiber_mod.liveStacks();
+
+    var peer: RawPeer = undefined;
+    const port = try peer.start(gpa, &loop, "", false);
+    defer peer.deinit();
+
+    var client: Client = .{ .gpa = gpa };
+    try client.conn.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), tls_insecure, &Client.handler);
+
+    // Let the handshake get as far as parking on the peer's silence,
+    // then destroy the connection under it — which is what the pool's
+    // reaper and a shutdown both do.
+    try pumpUntil(&loop, 5000, &peer, struct {
+        fn f(p: *RawPeer) bool {
+            return p.got.items.len > 0;
+        }
+    }.f);
+    try testing.expect(!client.ready);
+
+    client.deinit();
+    try testing.expectEqual(before, fiber_mod.liveStacks());
+    // And nothing is left armed to wake the loop.
+    try testing.expect(!client.conn.timer.isArmed());
+}
+
+test "a TLS pool connection reports its failure through the pool's accounting" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    const before = fiber_mod.liveStacks();
+
+    const alert_record = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
+    var peer: RawPeer = undefined;
+    const port = try peer.start(gpa, &loop, &alert_record, true);
+    defer peer.deinit();
+
+    // The path that matters in production: the failure is raised from
+    // inside the session fiber, and the handler it reaches destroys the
+    // connection — and with it the fiber's own stack. Doing that from a
+    // frame on that stack is a `munmap` of the caller, which is why the
+    // report is deferred to a timer.
+    const pool_mod = @import("pool.zig");
+    var pool: pool_mod.Pool = undefined;
+    pool.init(gpa, &loop, try IpAddress.parse("127.0.0.1", port), .{
+        .max_connections = 2,
+        .conn = tls_insecure,
+    });
+    defer pool.deinit();
+
+    const Sink = struct {
+        var got: ?anyerror = null;
+        fn cb(_: ?*anyopaque, result: pool_mod.Error!*Conn) void {
+            _ = result catch |e| {
+                got = e;
+                return;
+            };
+        }
+    };
+    Sink.got = null;
+    pool.acquire(Sink.cb, null);
+
+    try pumpUntil(&loop, 10_000, &pool, struct {
+        fn f(p: *pool_mod.Pool) bool {
+            _ = p;
+            return Sink.got != null;
+        }
+    }.f);
+
+    try testing.expectEqual(@as(?anyerror, error.TlsAlert), Sink.got);
+    // The slot came back, so a retry is not blocked by a ghost.
+    try testing.expectEqual(@as(u32, 0), pool.openCount());
+    try testing.expectEqual(before, fiber_mod.liveStacks());
 }
