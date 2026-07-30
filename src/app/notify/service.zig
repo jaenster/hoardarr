@@ -50,6 +50,7 @@ const render = @import("render.zig");
 const transport = @import("transport.zig");
 const discord = @import("discord.zig");
 const slack = @import("slack.zig");
+const webhook = @import("webhook.zig");
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -153,9 +154,10 @@ pub const OutcomeSink = struct {
 };
 
 pub const DispatchError = error{
-    /// `sub.kind` has no adapter compiled in. The domain rejects unknown
-    /// kinds at construction, so this is a safety net — except for
-    /// `.webhook`, whose adapter is not ported yet.
+    /// `sub.kind` has no adapter compiled in. Every kind the domain
+    /// defines is wired in `deliverTo`, so this is a pure safety net: it
+    /// exists so that adding a `Kind` without an adapter fails loudly at
+    /// dispatch instead of being swallowed by an `else` prong.
     NoSenderForKind,
 } || Allocator.Error;
 
@@ -266,9 +268,7 @@ pub const Service = struct {
         return switch (kind) {
             .discord => try discord.send(arena, self.transport, target, env),
             .slack => try slack.send(arena, self.transport, target, env),
-            // The generic HTTP-POST subscriber (with HMAC signing) is a
-            // separate adapter and is not ported yet.
-            else => error.NoSenderForKind,
+            .webhook => try webhook.send(arena, self.transport, target, env),
         };
     }
 
@@ -812,26 +812,49 @@ test "a failing test send reports the failure" {
     );
 }
 
-test "a kind with no compiled adapter is reported, not dispatched" {
+test "a webhook subscription dispatches to the generic sender, signed" {
     var h: Harness = undefined;
     h.init(&.{.{ .status = 204 }});
-    var sub = try discordSub(5, "https://example.test/hook", &.{"deliver.complete"});
+    var sub = try Subscription.hydrate(testing.allocator, .{
+        .id = 5,
+        .name = "w",
+        .kind = .webhook,
+        .url = "https://example.test/hook",
+        .secret = "shared-key",
+        .topics = &.{"deliver.complete"},
+        .enabled = true,
+        .created_at = 0,
+        .updated_at = 0,
+    });
     defer sub.deinit();
-    sub.kind = .webhook;
-    const subs = [_]*const Subscription{&sub};
-    h.svc.setActive(&subs);
-
-    // Not fatal to the fan-out: logged and skipped.
-    try h.svc.onEvent(.{
+    // `dispatch` rather than `onEvent`: the request the fake records
+    // borrows from the arena, and `onEvent`'s is private and already
+    // released by the time the assertions run.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try h.svc.dispatch(arena.allocator(), &sub, .{
         .id = .nil,
         .topic = "deliver.complete",
         .aggregate_id = "42",
         .occurred_at = fixedNow(),
         .payload = "{\"job_id\":42}",
     });
-    try testing.expectEqual(@as(usize, 0), h.fake.calls);
-    try testing.expectEqual(@as(usize, 0), h.outcomes.n);
-    try testing.expect(std.mem.indexOf(u8, h.capture.seen(), "no sender for subscription kind") != null);
+    try testing.expectEqual(@as(usize, 1), h.fake.calls);
+    try testing.expectEqual(@as(usize, 1), h.outcomes.n);
+
+    // The body is the envelope, not a rendered chat message, and it is
+    // signed with the subscription's secret.
+    const req = h.fake.last.?;
+    var sig: ?[]const u8 = null;
+    for (req.headers) |hdr| {
+        if (std.mem.eql(u8, hdr.name, webhook.signature_header)) sig = hdr.value;
+    }
+    var expect: webhook.SignatureBuf = undefined;
+    try testing.expectEqualStrings(
+        webhook.sign(&expect, "shared-key", req.body),
+        sig orelse return error.NoSignatureHeader,
+    );
+    try testing.expect(std.mem.indexOf(u8, req.body, "\"Topic\":\"deliver.complete\"") != null);
 }
 
 test "no log record and no recorded reason contains the webhook token" {

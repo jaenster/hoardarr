@@ -2,6 +2,8 @@ const std = @import("std");
 const hoardarr = @import("hoardarr");
 const build_info = hoardarr.build_info;
 
+const cli = hoardarr.cli;
+
 const usage =
     \\hoardarr — a Usenet downloader
     \\
@@ -9,6 +11,8 @@ const usage =
     \\
     \\Commands:
     \\  serve         Run the daemon
+    \\  download      Queue an NZB on a running daemon
+    \\  server        Manage Usenet providers (add|list|rm)
     \\  healthcheck   Probe a running daemon; exit 0 when healthy
     \\  version       Print version information
     \\
@@ -41,7 +45,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     if (std.mem.eql(u8, cmd, "version")) return cmdVersion();
     if (std.mem.eql(u8, cmd, "serve")) return cmdServe(gpa, init.environ);
-    if (std.mem.eql(u8, cmd, "healthcheck")) return cmdHealthcheck();
+    if (std.mem.eql(u8, cmd, "healthcheck")) return cli.healthcheck.run(gpa, init.environ);
+
+    // The remaining subcommands take arguments. They parse a plain
+    // `[][]const u8` rather than the iterator so that every flag grammar
+    // is a pure function with tests; draining it here is the only place
+    // that needs an allocator for argv.
+    if (std.mem.eql(u8, cmd, "download") or std.mem.eql(u8, cmd, "server")) {
+        const rest = try cli.api.collectArgs(gpa, &args);
+        defer gpa.free(rest);
+        if (std.mem.eql(u8, cmd, "download")) return cli.download.run(gpa, init.environ, rest);
+        return cli.server.run(gpa, init.environ, rest);
+    }
 
     try writeStderr(usage);
     return 2;
@@ -64,11 +79,6 @@ fn cmdServe(gpa: std.mem.Allocator, env: std.process.Environ) !u8 {
     // Everything about startup order, ownership and shutdown lives in the
     // composition root; `main` only decides which subcommand runs.
     return hoardarr.bootstrap.run(gpa, env);
-}
-
-fn cmdHealthcheck() !u8 {
-    try writeStderr("hoardarr: healthcheck is not wired up yet\n");
-    return 1;
 }
 
 // Straight to the fd. `std.Io.File` would work but drags in the `Io`

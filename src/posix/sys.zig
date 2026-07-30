@@ -893,22 +893,37 @@ pub fn open(path: [:0]const u8, flags: OpenFlags) Error!Fd {
     }
 }
 
-/// Size of an open file.
+/// Size of an open file, leaving the read/write offset where it was.
 ///
-/// `lseek` to the end rather than `fstat`: one syscall, and no `struct
-/// stat` layout to reproduce for two platforms. Safe on an append-only
-/// fd because the write offset is the end regardless.
+/// `lseek` rather than `fstat`: one syscall family, and no `struct stat`
+/// layout to reproduce for two platforms.
+///
+/// The offset is saved and restored, which is not incidental. A naive
+/// `lseek(SEEK_END)` leaves the cursor at EOF, so the obvious
+/// size-then-read sequence on one descriptor reads zero bytes — and it
+/// fails *silently*, producing an empty buffer rather than an error. That
+/// bug ate the config file's API key once already.
 pub fn fileSize(fd: Fd) Error!u64 {
+    const SEEK_SET = 0;
+    const SEEK_CUR = 1;
     const SEEK_END = 2;
+
     if (is_linux) {
-        const rc = linux.lseek(fd, 0, SEEK_END);
-        const e = linux.errno(rc);
-        if (e != .SUCCESS) return mapError(e);
-        return @intCast(rc);
+        const cur = linux.lseek(fd, 0, SEEK_CUR);
+        if (linux.errno(cur) != .SUCCESS) return mapError(linux.errno(cur));
+        const end = linux.lseek(fd, 0, SEEK_END);
+        if (linux.errno(end) != .SUCCESS) return mapError(linux.errno(end));
+        const back = linux.lseek(fd, @intCast(cur), SEEK_SET);
+        if (linux.errno(back) != .SUCCESS) return mapError(linux.errno(back));
+        return @intCast(end);
     }
-    const rc = std.c.lseek(fd, 0, @as(std.c.whence_t, SEEK_END));
-    if (rc < 0) return mapError(cErrno());
-    return @intCast(rc);
+
+    const cur = std.c.lseek(fd, 0, @as(std.c.whence_t, SEEK_CUR));
+    if (cur < 0) return mapError(cErrno());
+    const end = std.c.lseek(fd, 0, @as(std.c.whence_t, SEEK_END));
+    if (end < 0) return mapError(cErrno());
+    if (std.c.lseek(fd, cur, @as(std.c.whence_t, SEEK_SET)) < 0) return mapError(cErrno());
+    return @intCast(end);
 }
 
 /// Flush a file's data to the device.
@@ -1325,4 +1340,34 @@ test "IPv6 peers render as a stable key too" {
     var buf: [64]u8 = undefined;
     const key = try sa.formatAddress(&buf);
     try testing.expectEqualStrings("0:0:0:0:0:0:0:1", key);
+}
+
+test "fileSize does not move the cursor out from under a reader" {
+    var buf: [path_max]u8 = undefined;
+    const p = try pathZ(&buf, "/tmp/hoardarr-filesize-test");
+    unlink(p) catch {};
+
+    const w = try open(p, .{ .mode = .write_only, .create = true, .truncate = true });
+    try writeAll(w, "the api key lives here");
+    close(w);
+    defer unlink(p) catch {};
+
+    // Size then read on ONE descriptor. A naive lseek(SEEK_END) leaves the
+    // cursor at EOF and this read returns zero bytes — silently, producing
+    // an empty buffer rather than an error, which is exactly how it ate a
+    // config file's API key.
+    const fd = try open(p, .{ .mode = .read_only });
+    defer close(fd);
+
+    const size = try fileSize(fd);
+    try testing.expectEqual(@as(u64, 22), size);
+
+    var into: [64]u8 = undefined;
+    const n = try read(fd, &into);
+    try testing.expectEqual(@as(usize, 22), n);
+    try testing.expectEqualStrings("the api key lives here", into[0..n]);
+
+    // And it is still non-destructive part-way through a read.
+    const mid = try read(fd, &into);
+    try testing.expectEqual(@as(usize, 0), mid);
 }
