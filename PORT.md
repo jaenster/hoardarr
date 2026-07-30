@@ -196,6 +196,26 @@ the Zig tests open.
 benchmark scaffolding and go with it; their numbers are already recorded in
 `bench/REPORT.md`.
 
+## Deleting the Go tree — sequencing
+
+The Go tree is the *source* for the 17 e2e tests still to be ported, so it
+has to survive until the parity suite is complete. Deleting it earlier would
+mean porting tests from memory.
+
+Order:
+
+1. Download engine works (DNS + the fiber bridge from the callback-based
+   NNTP pool to the synchronous `PoolSet.fetchOne`).
+2. All 22 e2e tests ported and green.
+3. `git rm` `internal/`, `cmd/`, `go.mod`, `go.sum`, `assets*.go`,
+   `bench/go/`, `docker/entrypoint.sh`, and the Go `Dockerfile`.
+   Keep `testdata/repair-bug-job38/` — the Zig PAR2 tests use it.
+4. `Dockerfile.zig` → `Dockerfile`, and drop the QEMU step from
+   `docker.yml`: the builder cross-compiles with `-Dtarget` and the runtime
+   stage is `scratch` plus one static binary, so there is nothing foreign
+   left to emulate. (That step cannot go earlier — the Go image's runtime
+   stage runs `apk add` and genuinely needs emulation.)
+
 ## Known debt
 
 * `src/core/log.zig` carries `open`/`lseek`/`rename`/`unlink`/`mkdir`/
