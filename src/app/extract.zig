@@ -123,10 +123,16 @@ pub const Service = struct {
         var adopted = false;
         if (self.store.byJobId(null, job_id)) |existing| {
             if (existing.state == .complete) {
-                self.logger.info("extract: already complete, skipping", &.{
+                self.logger.info("extract: already complete, ensuring job advanced", &.{
                     log.int("job_id", job_id),
                 });
                 self.store.release(existing);
+                // A crash between "extract row complete" and
+                // `Job.markCompleted` leaves the job alive with nothing
+                // left to run it — the same window `app/deliver` already
+                // guards. `markJobCompleted` is a no-op once the Job is
+                // terminal.
+                try self.markJobCompleted(job_id);
                 return .already_complete;
             }
             x = existing;

@@ -831,6 +831,9 @@ pub const Deps = struct {
     settings_ratio: ?app_ports.Knob = null,
     limiter: ?*bandwidth.Limiter = null,
     accounter: ?*byte_accounter.Accounter = null,
+    /// Persists what the accounter staged. Absent means the counters are
+    /// only ever written by the housekeeping tick; see `onReap`.
+    byte_flusher: ?*byte_accounter.Flusher = null,
     /// Per-command deadline and read buffer for every provider
     /// connection.
     conn_defaults: nntp_conn.Config = .{},
@@ -859,6 +862,7 @@ pub const Runtime = struct {
     settings_ratio: ?app_ports.Knob,
     limiter: ?*bandwidth.Limiter,
     accounter: ?*byte_accounter.Accounter,
+    byte_flusher: ?*byte_accounter.Flusher,
     conn_defaults: nntp_conn.Config,
     default_max_conns: u16,
 
@@ -895,6 +899,7 @@ pub const Runtime = struct {
             .settings_ratio = d.settings_ratio,
             .limiter = d.limiter,
             .accounter = d.accounter,
+            .byte_flusher = d.byte_flusher,
             .conn_defaults = d.conn_defaults,
             .default_max_conns = d.default_max_conns,
             .ca_roots = .init(d.gpa),
@@ -1201,6 +1206,19 @@ pub const Runtime = struct {
             freed += 1;
         }
         if (freed == 0) return;
+
+        // A runner that has exited will not charge another byte, so this
+        // is the last moment its consumption is only in memory. The
+        // ten-second housekeeping tick is the right cadence *while* a
+        // download is running — writing `used_bytes` per article is pure
+        // SQLite overhead — but it is the wrong one for the end of a
+        // job: a daemon restarted right after a download finished would
+        // otherwise forget the whole of it, and a metered block account
+        // that under-counts is one the operator over-spends. One UPDATE
+        // per finished job, not per article.
+        if (self.byte_flusher) |f| f.flush(null, self.clock.now()) catch |e| {
+            self.logger.warn("download: byte accounting flush failed", &.{log.errv("err", e)});
+        };
 
         const promoted = self.scheduler.nudgePending(self.gpa) catch |e| {
             self.logger.err("download: backlog promotion failed", &.{log.errv("err", e)});

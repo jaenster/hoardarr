@@ -41,16 +41,25 @@ const std = @import("std");
 
 const sys = @import("../posix/sys.zig");
 const reactor = @import("../posix/reactor.zig");
+const fiber = @import("../posix/fiber.zig");
 const config = @import("../core/config.zig");
 const client = @import("../net/http/client.zig");
 const sqlite = @import("../store/sqlite.zig");
 const migrate = @import("../store/migrate.zig");
+const repo_server = @import("../store/repo_server.zig");
+const repo_download = @import("../store/repo_download.zig");
+const dserver = @import("../domain/server.zig");
+const dstate = @import("../domain/download/state.zig");
 const bootstrap = @import("../bootstrap.zig");
 const infra = @import("../bootstrap/infra.zig");
 const tsnntp = @import("../testserver/nntp.zig");
+const tsfixture = @import("../testserver/fixture.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+
+pub const JobState = dstate.JobState;
+pub const SegmentState = dstate.SegmentState;
 
 pub const Error = error{
     /// The predicate never became true before the deadline.
@@ -83,6 +92,12 @@ pub const Harness = struct {
 
     /// The fake provider, when a test asked for one. On the same loop.
     nntp: ?*tsnntp.Server = null,
+    /// The generated release the provider serves, when a test asked for
+    /// one. Owned; outlives a restart so the *original bytes* a delivery
+    /// is compared against are the same on both sides of it.
+    release: ?tsfixture.Fixture = null,
+    /// Remembered so `restart` can boot the engine again if it was up.
+    engine_wanted: bool = false,
 
     pub const Options = struct {
         /// Arms the heartbeat and housekeeping timers. Off by default:
@@ -97,6 +112,11 @@ pub const Harness = struct {
         /// nothing had been persisted, because the fallback would
         /// produce the same value both times.
         api_key_fallback: []const u8 = api_key,
+        /// Starts the download engine — the job fibers, the pools, and
+        /// the inline outbox dispatcher that carries verify, repair,
+        /// extract and deliver. Off for the tests that only drive the
+        /// API, so a stray pool dial cannot colour their results.
+        engine: bool = false,
     };
 
     /// Boots a daemon against a fresh temporary directory.
@@ -118,6 +138,9 @@ pub const Harness = struct {
         errdefer gpa.destroy(self.app);
 
         try self.boot(options);
+        // After `boot`, because the engine loads its pools from the
+        // servers table and that only exists once the database is open.
+        if (options.engine) try self.startEngine();
         return self;
     }
 
@@ -171,7 +194,20 @@ pub const Harness = struct {
         if (options.timers) try app.startTimers();
     }
 
+    /// Starts the download engine. Separate from `boot` because a test
+    /// that needs a provider has to register the servers row first, and
+    /// the engine reads that table when it starts.
+    pub fn startEngine(self: *Harness) !void {
+        try self.app.startEngine();
+        self.engine_wanted = true;
+    }
+
     pub fn deinit(self: *Harness) void {
+        // The provider goes first: its listener and its sessions are
+        // sources on the daemon's loop, and `App.deinit` ends with
+        // `loop.deinit()`. The client side needs no live peer to be torn
+        // down — `App.deinit` cancels each job fiber, which hands its
+        // connection back to a pool that then closes the socket.
         if (self.nntp) |s| {
             s.deinit();
             self.gpa.destroy(s);
@@ -179,6 +215,7 @@ pub const Harness = struct {
         }
         self.app.deinit();
         self.gpa.destroy(self.app);
+        if (self.release) |*r| r.deinit();
         removeTree(self.gpa, self.dir);
         self.gpa.free(self.dir);
         self.gpa.destroy(self);
@@ -198,7 +235,11 @@ pub const Harness = struct {
     /// and it has to still be there. Its corpus does not survive — the
     /// caller re-registers the articles, which is also what would
     /// happen if the provider had been restarted alongside us.
-    pub fn restart(self: *Harness, options: Options) !void {
+    pub fn restart(self: *Harness, options_in: Options) !void {
+        const want_engine = options_in.engine or self.engine_wanted;
+        var options = options_in;
+        options.engine = false;
+
         var nntp_opts: ?tsnntp.Options = null;
         if (self.nntp) |s| {
             var o = s.opts;
@@ -212,7 +253,16 @@ pub const Harness = struct {
         self.app.deinit();
         try self.boot(options);
 
-        if (nntp_opts) |o| _ = try self.startNntp(o);
+        if (nntp_opts) |o| {
+            _ = try self.startNntp(o);
+            // The corpus does not survive `stop`, so it is re-registered
+            // from the release the harness still owns. The article
+            // *counters* deliberately start from zero, which is what
+            // lets a caller ask "how much did the second daemon have to
+            // fetch" and get an answer that means something.
+            try self.serveRelease();
+        }
+        if (want_engine) try self.startEngine();
     }
 
     // -- the fake provider ---------------------------------------------
@@ -226,6 +276,202 @@ pub const Harness = struct {
         const p = try s.start(self.gpa, &self.app.loop, opts);
         self.nntp = s;
         return p;
+    }
+
+    pub fn provider(self: *Harness) *tsnntp.Server {
+        return self.nntp.?;
+    }
+
+    /// Generates a release, starts a provider serving it, writes the
+    /// `servers` row that names that provider, and starts the engine.
+    ///
+    /// One call because the order matters and getting it wrong fails in
+    /// a way that reads like a pipeline bug: the engine loads its pools
+    /// from the servers table when it starts, so a row written
+    /// afterwards would leave the job parked in `waiting_for_server`.
+    pub fn withRelease(
+        self: *Harness,
+        release: tsfixture.Options,
+        net: tsnntp.Options,
+    ) !void {
+        std.debug.assert(self.release == null);
+        self.release = try tsfixture.generate(self.gpa, release);
+
+        const port = try self.startNntp(net);
+        try self.serveRelease();
+
+        var row = try dserver.UsenetServer.init(self.gpa, .{
+            .name = "stub",
+            .host = "127.0.0.1",
+            .port = @intCast(port),
+            .tls = false,
+            .max_conns = 4,
+        }, infra.nowMillis());
+        defer row.deinit();
+        try repo_server.ServerRepo.init(self.gpa, self.app.db).save(&row);
+
+        try self.startEngine();
+    }
+
+    /// Registers every article of the release with the running provider.
+    pub fn serveRelease(self: *Harness) !void {
+        const r = self.release orelse return;
+        const s = self.nntp orelse return;
+        for (r.articles) |a| try s.addArticle(a.message_id, a.body);
+    }
+
+    /// Queues the generated release through the same REST port the API
+    /// uses, and returns its job id.
+    pub fn addRelease(self: *Harness, name: []const u8) !i64 {
+        const r = self.release orelse return error.NoRelease;
+        const added = try self.app.p_queue.port().add(self.app.api.beginRequest(), .{
+            .nzb = r.nzb,
+            .name = name,
+            // No category, so the release lands directly under
+            // `complete/` and the expected path stays a constant.
+            .category = "",
+            .source = "e2e",
+        });
+        return added.id;
+    }
+
+    // -- job progress ----------------------------------------------------
+
+    pub fn jobState(self: *Harness, id: i64) !JobState {
+        const repo = repo_download.JobRepo.init(self.gpa, self.app.db);
+        var job = try repo.byId(self.gpa, id);
+        defer job.deinit();
+        return job.state;
+    }
+
+    /// How many of the job's segments are in `state`, read straight from
+    /// the table rather than from the in-memory aggregate — which is the
+    /// only reading that means anything to a restart test.
+    pub fn segmentsIn(self: *Harness, id: i64, state: SegmentState) !i64 {
+        return self.app.db.scalarInt(
+            \\SELECT count(*) FROM segments s
+            \\JOIN files f ON f.id = s.file_id
+            \\WHERE f.job_id = ? AND s.state = ?
+        , .{ id, @tagName(state) });
+    }
+
+    pub fn segmentCount(self: *Harness, id: i64) !i64 {
+        return self.app.db.scalarInt(
+            \\SELECT count(*) FROM segments s
+            \\JOIN files f ON f.id = s.file_id
+            \\WHERE f.job_id = ?
+        , .{id});
+    }
+
+    /// Advances the loop until the job reaches a terminal state.
+    ///
+    /// Bounded rather than open-ended: a pipeline that wedges must fail
+    /// in seconds rather than hang the suite until CI kills it.
+    pub fn runUntilTerminal(self: *Harness, id: i64, max_ms: u64) !JobState {
+        const deadline = sys.monotonicNanos() + max_ms * std.time.ns_per_ms;
+        while (sys.monotonicNanos() < deadline) {
+            _ = try self.app.loop.tick(5);
+            const state = try self.jobState(id);
+            if (state.isTerminal()) return state;
+        }
+        // A wedged pipeline is diagnosed from *where* it stopped, and a
+        // bare `PipelineDidNotFinish` says only that it did. The state
+        // and the durable timeline are the two things that identify the
+        // stage that never ran.
+        std.debug.print("\nthe job is stuck in {s}; its timeline:\n", .{
+            (try self.jobState(id)).toString(),
+        });
+        var timeline = try self.app.bus.eventsByJob(self.app.db, self.gpa, id);
+        defer timeline.deinit();
+        for (timeline.items.items) |env| std.debug.print("  {s}\n", .{env.topic});
+        return error.PipelineDidNotFinish;
+    }
+
+    /// Advances the loop until the job reaches exactly `want`, which is
+    /// how a non-terminal milestone (`download_complete`, `paused`) is
+    /// waited on without sleeping.
+    pub fn runUntilState(self: *Harness, id: i64, want: JobState, max_ms: u64) !void {
+        const deadline = sys.monotonicNanos() + max_ms * std.time.ns_per_ms;
+        while (sys.monotonicNanos() < deadline) {
+            _ = try self.app.loop.tick(5);
+            const state = try self.jobState(id);
+            if (state == want) return;
+            if (state.isTerminal() and state != want) {
+                std.debug.print("\njob reached the terminal state {s}; wanted {s}\n", .{
+                    state.toString(), want.toString(),
+                });
+                return error.WrongTerminalState;
+            }
+        }
+        return error.StateNotReached;
+    }
+
+    /// Whether the job's durable timeline already carries `topic`.
+    ///
+    /// The outbox is the only record that survives a crash, so "has this
+    /// stage started" is asked of it rather than of anything in memory —
+    /// which is also what lets a test crash the daemon at an exact point
+    /// in the pipeline rather than at an approximate time.
+    pub fn hasEvent(self: *Harness, id: i64, topic: []const u8) !bool {
+        var timeline = try self.app.bus.eventsByJob(self.app.db, self.gpa, id);
+        defer timeline.deinit();
+        for (timeline.items.items) |env| {
+            if (std.mem.eql(u8, env.topic, topic)) return true;
+        }
+        return false;
+    }
+
+    /// Everything the delivery left in `complete/<name>/`.
+    pub fn deliveredFiles(self: *Harness, a: Allocator, name: []const u8) ![]const []const u8 {
+        const dir = try std.fmt.allocPrint(a, "{s}/{s}", .{ self.completeDir(), name });
+        var fs_impl = infra.RealFs{ .gpa = self.gpa };
+        const entries = try fs_impl.filesystem().list(a, dir);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (entries) |e| {
+            if (e.is_dir) continue;
+            try out.append(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, e.name }));
+        }
+        return out.items;
+    }
+
+    /// Every delivered data file compared byte for byte against the
+    /// fixture's original, and nothing delivered that should not be.
+    ///
+    /// "The job says complete" is exactly the assertion that passes
+    /// while the output is corrupt, which is why this — not the state —
+    /// is what a download test ends on.
+    pub fn expectDeliveredMatchesRelease(self: *Harness, name: []const u8) !void {
+        const r = self.release orelse return error.NoRelease;
+
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const delivered = try self.deliveredFiles(a, name);
+
+        // The parity volumes are scratch and must not be delivered.
+        var expected: usize = 0;
+        for (r.files) |f| {
+            if (f.is_data) expected += 1;
+        }
+        if (delivered.len != expected) {
+            std.debug.print("\ndelivered {d} files; want {d}:\n", .{ delivered.len, expected });
+            for (delivered) |p| std.debug.print("  {s}\n", .{p});
+            return error.WrongDeliveredFileCount;
+        }
+
+        for (delivered) |path| {
+            const base = std.fs.path.basename(path);
+            const original = r.fileBytes(base) orelse {
+                std.debug.print("\ndelivered an unexpected file: {s}\n", .{base});
+                return error.UnexpectedDeliveredFile;
+            };
+            const landed = try readFile(a, path);
+            expectBytesEqual(original, landed) catch |e| {
+                std.debug.print("delivered file {s} does not match the original\n", .{base});
+                return e;
+            };
+        }
     }
 
     // -- driving the loop ----------------------------------------------
@@ -519,13 +765,31 @@ pub fn jsonField(body: []const u8, key: []const u8) ?[]const u8 {
     return std.mem.trim(u8, body[start..i], " \t\r\n");
 }
 
-/// `/tmp/hoardarr-e2e-<label>-<16 hex>`. Random rather than a counter so
-/// two concurrent `zig test` processes cannot pick the same name.
+/// `/tmp/hoardarr-e2e-<label>-<pid>-<16 hex>`.
+///
+/// Never a fixed path. A run that dies partway leaves its tree behind,
+/// and the next run then fails on that leftover rather than on whatever
+/// actually broke — which costs an afternoon every time. The pid makes a
+/// leftover attributable; the random suffix makes two runs of the same
+/// binary, or two tests in one binary, unable to collide.
 fn tempDir(gpa: Allocator, label: []const u8) ![]u8 {
     var raw: [8]u8 = undefined;
     sys.randomBytes(&raw);
-    return std.fmt.allocPrint(gpa, "/tmp/hoardarr-e2e-{s}-{x}", .{ label, &raw });
+    // `posix/sys.zig` keeps `getpid` private, so the process is stamped
+    // once at first use instead. It only has to make a leftover
+    // attributable to one run; the random suffix is what makes a
+    // collision impossible.
+    if (process_stamp == 0) process_stamp = @truncate(sys.monotonicNanos() | 1);
+    return std.fmt.allocPrint(gpa, "/tmp/hoardarr-e2e-{s}-{x}-{x}", .{
+        label,
+        process_stamp,
+        &raw,
+    });
 }
+
+/// Stamped once per process, so every directory this binary makes shares
+/// a prefix a human can grep for after a crash.
+var process_stamp: u32 = 0;
 
 fn removeTree(gpa: Allocator, dir: []const u8) void {
     var fs_impl = infra.RealFs{ .gpa = gpa };

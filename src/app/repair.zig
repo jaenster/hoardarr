@@ -137,11 +137,24 @@ pub const Service = struct {
         var adopted = false;
         if (self.store.byJobId(null, job_id)) |existing| {
             if (existing.state.isTerminal()) {
+                const state = existing.state;
                 self.logger.info("repair: already terminal, skipping", &.{
                     log.int("job_id", job_id),
-                    log.str("state", existing.state.toString()),
+                    log.str("state", state.toString()),
                 });
+                // Copied out before the release: the message belongs to
+                // the aggregate, and the store may hand it back to its
+                // allocator.
+                var reason_buf: [160]u8 = undefined;
+                const n = @min(existing.err.len, reason_buf.len);
+                @memcpy(reason_buf[0..n], existing.err[0..n]);
                 self.store.release(existing);
+                // A crash between "the repair was marked failed" and
+                // "the Job was told" strands the job with no stage left
+                // to move it; `markFailed` is a no-op once the Job is
+                // terminal, so re-asserting it costs nothing and is what
+                // lets `app/recovery.zig`'s sweep converge.
+                if (state == .failed) try self.failJob(job_id, reason_buf[0..n]);
                 return .already_terminal;
             }
             rep = existing;
@@ -240,7 +253,13 @@ pub const Service = struct {
     ) Error!void {
         try rep.markFailed(reason, self.clock.now());
         try self.persist(rep, adopted);
+        return self.failJob(job_id, reason);
+    }
 
+    /// Takes the Job terminal so history shows why the release stopped.
+    /// Its own transaction: the aggregates belong to different contexts
+    /// and must not share a write.
+    fn failJob(self: *Service, job_id: JobId, reason: []const u8) Error!void {
         const Args = struct { svc: *Service, job_id: JobId, reason: []const u8 };
         const Body = struct {
             fn run(unit: *dtx.Unit, args: Args) Error!void {
@@ -562,6 +581,31 @@ test "the bus handler hands the job id straight through" {
     h.init();
     defer h.deinit();
     try testing.expectEqual(@as(JobId, 7), h.svc.onRepairNeeded(7));
+}
+
+test "a failed repair found on a later run still pulls the job terminal" {
+    // The crash window: the repair was marked failed and the process
+    // died before the Job transition. `app/recovery.zig` re-offers the
+    // job here precisely so this branch can converge, and without it the
+    // job sits in `repairing` with every stage finished.
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    const j = try h.seed(.{});
+
+    const rep = try testing.allocator.create(Repair);
+    rep.* = try Repair.init(testing.allocator, j.id, 1);
+    try rep.start(2);
+    try rep.markFailed("short by 3 slices", 3);
+    devent.deinitAll(drepair.Event, testing.allocator, try rep.pullEvents());
+    try h.repairs.insert(rep);
+
+    try testing.expectEqual(Outcome.already_terminal, try h.svc.run(j.id));
+    try testing.expectEqual(job_mod.JobState.failed, j.state);
+    try testing.expect(h.dl_sink.has("download.job.failed"));
+    try testing.expectEqualStrings("repair: short by 3 slices", j.errorMsg());
+    // No second reconstruction pass: the verdict stands.
+    try testing.expectEqual(@as(usize, 0), h.fake_repairer.calls);
 }
 
 test "a repair resumed after a restart picks up its existing aggregate" {

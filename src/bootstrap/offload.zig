@@ -82,23 +82,12 @@ const max_queued: usize = 512;
 
 /// Which stage a queued item is. The bodies live in the composition root;
 /// this is only the label the runner dispatches on.
-pub const Stage = enum {
-    verify,
-    reverify,
-    repair,
-    extract,
-    deliver,
-
-    pub fn text(s: Stage) []const u8 {
-        return switch (s) {
-            .verify => "verify",
-            .reverify => "verify-after-repair",
-            .repair => "repair",
-            .extract => "extract",
-            .deliver => "deliver",
-        };
-    }
-};
+///
+/// Re-exported rather than redeclared: `app/recovery.zig`'s startup sweep
+/// names the same five stages, and two copies of a five-arm enum is the
+/// shape that drifts once and then quietly runs `extract` where the
+/// caller meant `deliver`.
+pub const Stage = @import("../app/recovery.zig").Stage;
 
 pub const OffloadError = error{
     /// No pool wired, or it refused the task. The caller runs inline.

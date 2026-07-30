@@ -33,6 +33,7 @@ const dl_ports = @import("download/ports.zig");
 const dtx = @import("../domain/tx.zig");
 const dverify = @import("../domain/verify.zig");
 const job_mod = @import("../domain/download/job.zig");
+const ddevents = @import("../domain/download/events.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -43,6 +44,7 @@ pub const VerifyState = dverify.VerifyState;
 pub const Result = dverify.Result;
 pub const FileResult = dverify.FileResult;
 pub const Sink = app_ports.EventSink(dverify.Event);
+pub const DownloadSink = app_ports.EventSink(ddevents.Event);
 pub const Store = app_ports.Repo(VerifySet);
 
 /// Why a verification pass could not produce a result at all — distinct
@@ -162,6 +164,10 @@ pub const Service = struct {
     store: Store,
     verifier: Verifier,
     sink: Sink,
+    /// The download context's bus, for `JobFailed`. Two sinks rather than
+    /// one erased sink, so neither context's events can be published to
+    /// the other's topic by accident.
+    downloads: DownloadSink,
     txm: app_ports.Manager,
     fs: app_ports.Filesystem,
     clock: app_ports.Clock,
@@ -220,11 +226,25 @@ pub const Service = struct {
                 // and only when it has actually asked for more volumes.
                 try self.resetSet(existing);
             } else if (existing.state.isTerminal()) {
+                const state = existing.state;
                 self.logger.info("verify: already terminal, skipping", &.{
                     log.int("job_id", job_id),
-                    log.str("state", existing.state.toString()),
+                    log.str("state", state.toString()),
                 });
+                // Copied out before the release: the message belongs to
+                // the aggregate, and the store may hand it straight back
+                // to its allocator.
+                var reason_buf: [160]u8 = undefined;
+                const n = @min(existing.error_msg.len, reason_buf.len);
+                @memcpy(reason_buf[0..n], existing.error_msg[0..n]);
+                const reason = reason_buf[0..n];
                 self.store.release(existing);
+                // A crash between "the set was marked failed" and "the
+                // Job was told" leaves a job with no evidence and no
+                // stage left to run it. Re-asserting the transition here
+                // is what makes the startup sweep able to converge on it;
+                // `markFailed` is a no-op once the Job is terminal.
+                if (state == .failed) try self.failJob(job_id, reason);
                 return .already_terminal;
             }
         } else |e| {
@@ -256,6 +276,7 @@ pub const Service = struct {
             _ = try vset.markStarted(self.clock.now());
             try vset.markFailed("no .par2 files in job", self.clock.now());
             try self.persist(vset, &adopted);
+            try self.failJob(job_id, "no .par2 files in job");
             return .failed;
         }
 
@@ -267,6 +288,7 @@ pub const Service = struct {
             const reason = std.fmt.bufPrint(&buf, "verify: {t}", .{e}) catch "verify failed";
             try vset.markFailed(reason, self.clock.now());
             try self.persist(vset, &adopted);
+            try self.failJob(job_id, reason);
             return .failed;
         };
 
@@ -304,6 +326,41 @@ pub const Service = struct {
             }
         };
         return dtx.inTx(Error, self.txm, Args{ .svc = self, .vset = vset }, Body.run);
+    }
+
+    /// Takes the Job terminal because verification produced no evidence.
+    ///
+    /// `verify.failed` has no subscriber that can act on it — repair
+    /// listens for `verify.repair_needed`, deliver and extract for
+    /// `verify.ok` — so without this the job sat in `download_complete`
+    /// with every stage finished and nothing left to move it. A release
+    /// we cannot check is a failed release, and saying so is strictly
+    /// better than a queue entry that never resolves: the alternative
+    /// the operator eventually gets is a corrupt file and no warning.
+    ///
+    /// Its own transaction, because the Job belongs to the download
+    /// context and must not share a write with the verify set.
+    fn failJob(self: *Service, job_id: JobId, reason: []const u8) Error!void {
+        const Args = struct { svc: *Service, job_id: JobId, reason: []const u8 };
+        const Body = struct {
+            fn run(unit: *dtx.Unit, args: Args) Error!void {
+                const s = args.svc;
+                const job = try s.jobs.byId(unit, args.job_id);
+                defer s.jobs.release(job);
+                var buf: [224]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "verify: {s}", .{args.reason}) catch args.reason;
+                if (!try job.markFailed(msg, s.clock.now())) return;
+                try s.jobs.save(unit, job);
+                const events = try job.pullEvents();
+                defer ddevents.deinitAll(s.gpa, events);
+                try s.downloads.publish(unit, events);
+            }
+        };
+        return dtx.inTx(Error, self.txm, Args{
+            .svc = self,
+            .job_id = job_id,
+            .reason = reason,
+        }, Body.run);
     }
 
     /// Saves the set and publishes its queued events in one transaction.
@@ -395,7 +452,7 @@ pub const FakeVerifier = struct {
 // =====================================================================
 
 const testing = std.testing;
-const devents = @import("../domain/download/events.zig");
+const devents = ddevents;
 const Job = job_mod.Job;
 
 const Harness = struct {
@@ -404,6 +461,7 @@ const Harness = struct {
     fs: app_ports.FakeFs = undefined,
     fake_verifier: FakeVerifier = .{},
     sink: app_ports.FakeSink(dverify.Event) = .{},
+    dl_sink: app_ports.FakeSink(devents.Event) = .{},
     ftx: app_ports.FakeTx = .{},
     clock: app_ports.FakeClock = .{ .t = 5_000 },
     logger: log.Logger = .{},
@@ -420,6 +478,7 @@ const Harness = struct {
             .store = self.sets.repo(),
             .verifier = self.fake_verifier.verifier(),
             .sink = self.sink.sink(),
+            .downloads = self.dl_sink.sink(),
             .txm = self.ftx.manager(),
             .fs = self.fs.filesystem(),
             .clock = self.clock.clock(),
@@ -530,6 +589,12 @@ test "a job with no parity fails with a reason rather than verifying" {
     // The verifier is never called: there is nothing to check against.
     try testing.expectEqual(@as(usize, 0), h.fake_verifier.calls);
     try testing.expect(h.sink.has("verify.failed"));
+    // And the Job goes with it. Nothing subscribes to `verify.failed`,
+    // so a Job left in `download_complete` here is a Job nothing will
+    // ever touch again.
+    try testing.expectEqual(job_mod.JobState.failed, j.state);
+    try testing.expect(h.dl_sink.has("download.job.failed"));
+    try testing.expectEqualStrings("verify: no .par2 files in job", j.errorMsg());
 }
 
 test "deferred recovery volumes are excluded from the parity set" {
@@ -583,6 +648,32 @@ test "a verifier error fails the set with the reason, not a crash" {
     try testing.expectEqual(VerifyState.failed, vset.state);
     try testing.expectEqualStrings("verify: Malformed", vset.error_msg);
     try testing.expect(h.sink.has("verify.failed"));
+    try testing.expectEqual(job_mod.JobState.failed, j.state);
+    try testing.expect(h.dl_sink.has("download.job.failed"));
+}
+
+test "a failed set found on a later run still pulls the job terminal" {
+    // The crash window: the set was marked failed and the process died
+    // before the Job transition. `app/recovery.zig` re-offers the job to
+    // this service precisely so this branch can converge.
+    var h: Harness = undefined;
+    h.init();
+    defer h.deinit();
+    const j = try h.seed(.{});
+
+    const vset = try testing.allocator.create(VerifySet);
+    vset.* = try VerifySet.init(testing.allocator, j.id, 1);
+    devent.deinitAll(dverify.Event, testing.allocator, try vset.pullEvents());
+    _ = try vset.markStarted(2);
+    try vset.markFailed("verify: Malformed", 3);
+    devent.deinitAll(dverify.Event, testing.allocator, try vset.pullEvents());
+    try h.sets.insert(vset);
+
+    try testing.expectEqual(Outcome.already_terminal, try h.svc.run(j.id));
+    try testing.expectEqual(job_mod.JobState.failed, j.state);
+    try testing.expect(h.dl_sink.has("download.job.failed"));
+    // No second verification: the verdict stands.
+    try testing.expectEqual(@as(usize, 0), h.fake_verifier.calls);
 }
 
 test "a second run over a terminal set does nothing" {

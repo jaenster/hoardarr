@@ -15,15 +15,14 @@
 //!     filesystem work and still pulls the Job across the line.
 //!   * A crash between "verify.ok delivered" and "delivery row written"
 //!     left jobs orphaned, because the bus had already marked the event
-//!     consumed and would not redeliver it. So `recoverStuck` sweeps for
-//!     jobs sitting in a post-download state with no delivery and
-//!     re-drives them at startup.
+//!     consumed and would not redeliver it. `app/recovery.zig` sweeps
+//!     for those at startup and queues this service again.
 //!
-//! `recoverStuck` is sequential on purpose. The first version fanned out
-//! one task per job, and because every one of them wants to UPDATE the
-//! jobs table, they produced busy/conflict storms under contention —
-//! three restarts before the backlog cleared. A serial loop is strictly
-//! faster than retry loops at that contention level.
+//! That sweep used to live here, and it re-drove *delivery* for anything
+//! sitting in a post-download state — which moved an unverified release
+//! into `complete/` whenever the crash landed before verification. It
+//! now reads the verify verdict first, which is why it is no longer this
+//! context's business.
 //!
 //! # Missing sources are normal
 //!
@@ -89,32 +88,6 @@ pub const Service = struct {
 
     pub fn onVerifyOk(_: *Service, job_id: JobId) JobId {
         return job_id;
-    }
-
-    /// Startup sweep for jobs whose trigger event was already consumed.
-    /// Returns how many were re-driven.
-    pub fn recoverStuck(self: *Service) Error!usize {
-        const active = try self.jobs.active(self.gpa, null);
-        defer self.gpa.free(active);
-        var swept: usize = 0;
-        for (active) |row| {
-            switch (row.state) {
-                .download_complete, .repairing, .unpacking => {},
-                else => continue,
-            }
-            _ = self.run(row.id) catch |e| {
-                self.logger.warn("deliver: recovery run failed", &.{
-                    log.int("job_id", row.id),
-                    log.errv("err", e),
-                });
-                continue;
-            };
-            swept += 1;
-        }
-        if (swept > 0) {
-            self.logger.info("deliver: startup recovery swept jobs", &.{log.uint("count", swept)});
-        }
-        return swept;
     }
 
     pub fn run(self: *Service, job_id: JobId) Error!Outcome {
@@ -631,37 +604,6 @@ test "a mkdir failure fails the delivery and the job" {
     try testing.expectEqual(Outcome.failed, try h.svc.run(j.id));
     try testing.expectEqualStrings("mkdir target: Denied", h.deliveries.get(j.id).?.err_msg);
     try testing.expectEqual(job_mod.JobState.failed, j.state);
-}
-
-test "recoverStuck re-drives jobs sitting in a post-download state" {
-    var h: Harness = undefined;
-    h.init();
-    defer h.deinit();
-    const stuck = try h.seed(.{});
-    stuck.state = .download_complete;
-    const running = try h.seed(.{ .name = "Still.Downloading" });
-    running.state = .downloading;
-
-    try testing.expectEqual(@as(usize, 1), try h.svc.recoverStuck());
-    try testing.expectEqual(job_mod.JobState.completed, stuck.state);
-    // A job still downloading is none of the sweep's business.
-    try testing.expectEqual(job_mod.JobState.downloading, running.state);
-    try testing.expectEqual(@as(usize, 1), h.deliveries.len());
-}
-
-test "recoverStuck keeps going when one job fails" {
-    var h: Harness = undefined;
-    h.init();
-    defer h.deinit();
-    const bad = try h.seed(.{ .on_disk = 0 });
-    bad.state = .download_complete;
-    const good = try h.seed(.{ .name = "Fine" });
-    good.state = .download_complete;
-
-    // Both are attempted; the failing one does not abort the sweep.
-    try testing.expectEqual(@as(usize, 2), try h.svc.recoverStuck());
-    try testing.expectEqual(job_mod.JobState.failed, bad.state);
-    try testing.expectEqual(job_mod.JobState.completed, good.state);
 }
 
 test "an unknown job is reported without creating a delivery" {

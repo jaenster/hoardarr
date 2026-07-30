@@ -86,6 +86,7 @@ const verify_app = @import("app/verify.zig");
 const repair_app = @import("app/repair.zig");
 const extract_app = @import("app/extract.zig");
 const deliver_app = @import("app/deliver/service.zig");
+const recovery_app = @import("app/recovery.zig");
 const dns = @import("net/dns.zig");
 
 const sse = @import("api/sse.zig");
@@ -208,6 +209,9 @@ pub const App = struct {
     repair_service: repair_app.Service = undefined,
     extract_service: extract_app.Service = undefined,
     deliver_service: deliver_app.Service = undefined,
+    /// The startup sweep for jobs whose trigger event was consumed by a
+    /// process that then died. See `app/recovery.zig`.
+    reconciler: recovery_app.Reconciler = undefined,
 
     accounter: byte_accounter.Accounter = undefined,
     server_bytes: ServerBytes = undefined,
@@ -519,6 +523,7 @@ pub const App = struct {
             .store = self.verify_store.port(),
             .verifier = self.verifier.port(),
             .sink = self.verify_publisher.sink(),
+            .downloads = self.download_publisher.sink(),
             .txm = self.txm.manager(),
             .fs = self.fs.filesystem(),
             .clock = clock,
@@ -569,10 +574,21 @@ pub const App = struct {
             .collapse_single_folder = self.runtime.toggle(settings.keys.collapse_single_folder),
         };
 
+        self.reconciler = .{
+            .gpa = gpa,
+            .jobs = self.job_store.port(),
+            .verify_sets = self.verify_store.port(),
+            .repairs = self.repair_store.port(),
+            .queue = stageQueue(self),
+        };
+
         // Per-server byte totals are staged in memory and written on the
-        // one-second tick, not per article: `used_bytes = used_bytes + ?`
+        // housekeeping tick, not per article: `used_bytes = used_bytes + ?`
         // once per segment was measured as pure SQLite overhead on a
-        // download that already writes a segment row per batch.
+        // download that already writes a segment row per batch. The
+        // engine also flushes when a runner exits, so a job's
+        // consumption is durable the moment it stops accruing — see
+        // `bootstrap/runtime.zig`'s `onReap`.
         self.accounter = byte_accounter.Accounter.init(gpa);
         errdefer self.accounter.deinit();
         self.server_bytes = .{ .gpa = gpa, .conn = self.db };
@@ -606,6 +622,7 @@ pub const App = struct {
             .resolver = &self.resolver,
             .limiter = &self.limiter,
             .accounter = &self.accounter,
+            .byte_flusher = &self.byte_flusher,
         });
         self.engine_ready = true;
         errdefer {
@@ -755,9 +772,11 @@ pub const App = struct {
 
         // Jobs whose trigger event was consumed by a previous process
         // before it wrote the row that would have advanced them. The bus
-        // will not redeliver those, so somebody has to go looking.
-        _ = self.deliver_service.recoverStuck() catch |err| {
-            log.warn("deliver: startup recovery failed", &.{log.str("error", @errorName(err))});
+        // will not redeliver those, so somebody has to go looking — and
+        // has to re-drive the stage the job's own verdict implies rather
+        // than assume it is the last one. See `app/recovery.zig`.
+        _ = self.reconciler.run() catch |err| {
+            log.warn("pipeline: startup recovery failed", &.{log.str("error", @errorName(err))});
         };
     }
 
@@ -894,6 +913,23 @@ fn runStage(ctx: ?*anyopaque, env: outbox.Envelope, stage: offload_mod.Stage) ou
         return .{ .failed = @errorName(err) };
     };
     return .ok;
+}
+
+/// `recovery.StageQueue` over the same backlog the bus handlers push
+/// into, so a job the startup sweep found is indistinguishable from one
+/// an event delivered — same fiber, same worker pool, same ordering.
+fn stageQueue(app: *App) recovery_app.StageQueue {
+    const Impl = struct {
+        fn enqueue(
+            ctx: *anyopaque,
+            stage: recovery_app.Stage,
+            job_id: i64,
+        ) recovery_app.QueueError!void {
+            const a: *App = @ptrCast(@alignCast(ctx));
+            return a.stages.enqueue(stage, job_id);
+        }
+    };
+    return .{ .ctx = @ptrCast(app), .enqueueFn = &Impl.enqueue };
 }
 
 /// The stage bodies, run on the stage fiber. One switch rather than five

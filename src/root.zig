@@ -120,6 +120,7 @@ pub const app = struct {
     pub const verify = @import("app/verify.zig");
     pub const repair = @import("app/repair.zig");
     pub const extract = @import("app/extract.zig");
+    pub const recovery = @import("app/recovery.zig");
     pub const schedule = @import("app/schedule.zig");
     pub const auth = @import("app/auth.zig");
     pub const download = struct {
