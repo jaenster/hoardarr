@@ -25,6 +25,7 @@ pub const wiring = struct {
     pub const sab = @import("bootstrap/sab.zig");
     pub const runtime = @import("bootstrap/runtime.zig");
     pub const pipeline = @import("bootstrap/pipeline.zig");
+    pub const notify = @import("bootstrap/notify.zig");
     pub const wiring_test = @import("bootstrap/wiring_test.zig");
     pub const download_test = @import("bootstrap/download_test.zig");
 };
@@ -57,6 +58,7 @@ pub const codec = struct {
         pub const par2 = @import("codec/par2/par2.zig");
         pub const rs = @import("codec/par2/rs.zig");
         pub const verifier = @import("codec/par2/verifier.zig");
+        pub const repair = @import("codec/par2/repair.zig");
     };
 };
 
@@ -221,6 +223,7 @@ pub const e2e = struct {
     pub const sab_test = @import("e2e/sab_test.zig");
     pub const speed_test = @import("e2e/speed_test.zig");
     pub const server_edit_test = @import("e2e/server_edit_test.zig");
+    pub const crash_recovery_test = @import("e2e/crash_recovery_test.zig");
 };
 
 pub const posix = struct {
@@ -228,6 +231,7 @@ pub const posix = struct {
     pub const reactor = @import("posix/reactor.zig");
     pub const signals = @import("posix/signals.zig");
     pub const fiber = @import("posix/fiber.zig");
+    pub const pool = @import("posix/pool.zig");
 };
 
 test {
@@ -240,6 +244,7 @@ test {
     _ = wiring.sab;
     _ = wiring.runtime;
     _ = wiring.pipeline;
+    _ = wiring.notify;
     _ = wiring.wiring_test;
     _ = wiring.download_test;
     _ = core.crc32;
@@ -263,6 +268,7 @@ test {
     _ = codec.par2.par2;
     _ = codec.par2.rs;
     _ = codec.par2.verifier;
+    _ = codec.par2.repair;
     _ = domain.download.state;
     _ = domain.download.segment;
     _ = domain.download.file;
@@ -374,8 +380,10 @@ test {
     _ = e2e.sab_test;
     _ = e2e.speed_test;
     _ = e2e.server_edit_test;
+    _ = e2e.crash_recovery_test;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;
     _ = posix.fiber;
+    _ = posix.pool;
 }

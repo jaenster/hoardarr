@@ -44,6 +44,7 @@ const log = @import("../core/log.zig");
 const sqlite = @import("../store/sqlite.zig");
 
 const par2_verifier = @import("../codec/par2/verifier.zig");
+const par2_repair = @import("../codec/par2/repair.zig");
 const rar_extract = @import("../codec/rar/extract.zig");
 
 const app_ports = @import("../app/ports.zig");
@@ -128,20 +129,14 @@ pub const Verifier = struct {
 // PAR2 repair
 // =====================================================================
 
-/// `app/repair.zig`'s `Repairer`.
+/// `app/repair.zig`'s `Repairer` over `codec/par2`.
 ///
-/// **Not implemented.** `codec/par2/rs.zig` has the Reed-Solomon
-/// reconstruction and `codec/par2/par2.zig` has the recovery slices, but
-/// nothing in the tree joins them into "rebuild these damaged files on
-/// disk" — slice-level damage detection, loading the present slices,
-/// writing the rebuilt ones back at their offsets.
-///
-/// Reporting `UnrecoverableSet` is the honest stand-in and it is not
-/// inert: it is the one error `app/repair.zig` reacts to rather than
-/// reports, so a job with deferred recovery volumes still asks the
-/// download context for them, and only a job that already has all its
-/// parity ends in `repair.failed`. What the operator sees is "hoardarr
-/// could not repair this", which is true.
+/// The one translation that carries weight is the shortfall: a set with
+/// fewer recovery slices than damaged ones becomes `UnrecoverableSet`,
+/// which is the single error the service reacts to rather than reports.
+/// A job holding deferred recovery volumes uses it to go and fetch them
+/// and try again, so collapsing it into a generic failure would take
+/// jobs terminal that were one download away from repairing.
 pub const Repairer = struct {
     logger: *log.Logger = &log.default,
 
@@ -156,12 +151,52 @@ pub const Repairer = struct {
         data: []const verify_app.DataPath,
     ) repair_app.RepairerError!repair_app.Report {
         const self: *Repairer = @ptrCast(@alignCast(ctx));
-        _ = a;
-        _ = data;
-        self.logger.warn("par2: reconstruction is not implemented in this build", &.{
-            log.uint("par2_files", par2_paths.len),
+
+        const files = try a.alloc(par2_repair.DataFile, data.len);
+        for (data, files) |d, *f| f.* = .{ .name = d.filename, .path = d.path };
+
+        // `a` is the service's per-run arena, so nothing below has to be
+        // freed on any path out of here.
+        const result = par2_repair.repair(a, io(), Io.Dir.cwd(), par2_paths, files) catch |e| {
+            self.logger.warn("par2: reconstruction could not run", &.{
+                log.errv("err", e),
+                log.uint("par2_files", par2_paths.len),
+            });
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                // The equations we had did not span the damage. Same
+                // answer as a shortfall: go and find more parity.
+                error.Singular => error.UnrecoverableSet,
+                // Either an unreadable `.par2` or bytes that are not a
+                // recovery set. Both mean we have no parity to work from.
+                else => error.Malformed,
+            };
+        };
+
+        if (result.shortfall) |s| {
+            self.logger.warn("par2: not enough recovery slices to repair", &.{
+                log.uint("damaged_slices", s.damaged_slices),
+                log.uint("recovery_slices", s.recovery_slices),
+            });
+            return error.UnrecoverableSet;
+        }
+
+        const repaired = try a.alloc([]const u8, result.repaired.items.len);
+        for (result.repaired.items, repaired) |src, *dst| dst.* = src.filename;
+        const already_ok = try a.alloc([]const u8, result.already_ok.items.len);
+        for (result.already_ok.items, already_ok) |src, *dst| dst.* = src;
+        const failed = try a.alloc(repair_app.FileFailure, result.failed.items.len);
+        for (result.failed.items, failed) |src, *dst| {
+            dst.* = .{ .filename = src.filename, .reason = src.reason };
+        }
+
+        self.logger.info("par2: reconstruction pass complete", &.{
+            log.uint("repaired", repaired.len),
+            log.uint("already_ok", already_ok.len),
+            log.uint("failed", failed.len),
+            log.uint("matched_by_content", result.matched_by_content),
         });
-        return error.UnrecoverableSet;
+        return .{ .repaired = repaired, .already_ok = already_ok, .failed = failed };
     }
 };
 
@@ -234,6 +269,20 @@ pub const VerifyStore = stores.AggregateStore(dverify.VerifySet, repo_verify.Ver
 pub const RepairStore = stores.AggregateStore(drepair.Repair, repo_repair.RepairRepo);
 pub const ExtractStore = stores.AggregateStore(dextract.Extract, repo_extract.ExtractRepo);
 pub const DeliverStore = stores.AggregateStore(ddeliver.Delivery, repo_deliver.DeliveryRepo);
+
+// =====================================================================
+// Notifications
+// =====================================================================
+
+/// The last stage of the pipeline: telling somebody it finished.
+///
+/// The implementation is `bootstrap/notify.zig` rather than this file,
+/// for the reason the `wiring` namespace exists at all — one bounded
+/// context's composition per file, and notify's is a fiber, a queue and
+/// an HTTP/TLS client rather than the two-line adapter every other stage
+/// here needs. Re-exported so the pipeline's wiring is reachable from
+/// the pipeline's module.
+pub const Notifier = @import("notify.zig").Notifier;
 
 // =====================================================================
 // Tests
@@ -345,4 +394,130 @@ test "a verifier over a real PAR2 set reports per-file verdicts" {
     const damaged = try v.port().verify(arena.allocator(), par2_paths.items, data.items);
     try testing.expect(!damaged.allOk());
     try testing.expectEqualStrings("md5 mismatch", damaged.files[0].reason);
+}
+
+test "a damaged release travels the repair service all the way to repair.ok" {
+    // The whole point of the parity, end to end through the real
+    // service: a job whose bytes are damaged on disk comes out of
+    // `run` as `repair.ok` with the file byte-identical to what was
+    // posted. Every part of this is real except the stores and the
+    // clock — the PAR2 set, the damage, the reconstruction and the
+    // files on disk are all genuine.
+    const gpa = testing.allocator;
+    const fixture = @import("../testserver/fixture.zig");
+    const job_mod = @import("../domain/download/job.zig");
+    const ddevents = @import("../domain/download/events.zig");
+    const infra = @import("infra.zig");
+
+    var fx = try fixture.generate(gpa, .{
+        .name = "repairme",
+        .file_count = 2,
+        .file_size = 5000,
+        .article_size = 4096,
+        .par2_slice_size = 1024,
+        .recovery_slices = 4,
+    });
+    defer fx.deinit();
+
+    // A per-run directory under the cache, cleaned up on the way out. A
+    // fixed path would leave a failing run's wreckage behind for the
+    // next one to trip over.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const incomplete = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(incomplete);
+
+    // One job file per generated file, PAR2 volumes included.
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |p| gpa.free(p);
+        owned.deinit(gpa);
+    }
+    var params: std.ArrayList(job_mod.NewFileParams) = .empty;
+    defer params.deinit(gpa);
+    var segs: std.ArrayList([1]job_mod.NewSegmentParams) = .empty;
+    defer segs.deinit(gpa);
+    try segs.ensureTotalCapacity(gpa, fx.files.len);
+    for (fx.files, 0..) |f, i| {
+        const mid = try std.fmt.allocPrint(gpa, "seg{d}@hoardarr", .{i});
+        try owned.append(gpa, mid);
+        segs.appendAssumeCapacity(.{.{
+            .seq_index = 1,
+            .message_id = mid,
+            .bytes = @intCast(f.bytes.len),
+        }});
+        try params.append(gpa, .{
+            .filename = f.name,
+            .is_par2 = !f.is_data,
+            .size_bytes = @intCast(f.bytes.len),
+            .segments = &segs.items[i],
+        });
+    }
+
+    var jobs = dl_ports.FakeJobStore.init(gpa);
+    defer jobs.deinit();
+    const job = try gpa.create(job_mod.Job);
+    job.* = try job_mod.Job.init(gpa, .{
+        .nzb_hash = "repairme",
+        .name = "repairme",
+        .files = params.items,
+    }, 0);
+    try jobs.insert(job);
+    ddevents.deinitAll(gpa, try job.pullEvents());
+
+    // Lay the release out where `partitionJobPaths` will look for it.
+    var fs_impl = infra.RealFs{ .gpa = gpa };
+    const fs = fs_impl.filesystem();
+    const job_dir = try std.fmt.allocPrint(gpa, "{s}/{d}", .{ incomplete, job.id });
+    defer gpa.free(job_dir);
+    try fs.mkdirAll(job_dir);
+
+    var target: []const u8 = "";
+    for (job.files) |jf| {
+        const bytes = fx.fileBytes(jf.filename).?;
+        const p = try std.fmt.allocPrint(gpa, "{s}/{d}.tmp", .{ job_dir, jf.id });
+        try owned.append(gpa, p);
+        try fs.writeAt(p, 0, bytes, @intCast(bytes.len));
+        if (!jf.is_par2 and target.len == 0) target = p;
+    }
+
+    // Damage one slice of the first data file.
+    try fs.writeAt(target, 100, "\xff\xff\xff\xff\xff\xff\xff\xff", 0);
+
+    var repairs = app_ports.FakeRepo(drepair.Repair).init(gpa);
+    defer repairs.deinit();
+    var sink: app_ports.FakeSink(drepair.Event) = .{};
+    var dl_sink: app_ports.FakeSink(ddevents.Event) = .{};
+    var ftx: app_ports.FakeTx = .{};
+    var clock: app_ports.FakeClock = .{ .t = 9_000 };
+    var logger: log.Logger = .{};
+    var r: Repairer = .{ .logger = &logger };
+
+    var svc: repair_app.Service = .{
+        .gpa = gpa,
+        .jobs = jobs.store(),
+        .store = repairs.repo(),
+        .repairer = r.port(),
+        .sink = sink.sink(),
+        .downloads = dl_sink.sink(),
+        .txm = ftx.manager(),
+        .fs = fs,
+        .clock = clock.clock(),
+        .logger = &logger,
+        .incomplete_dir = incomplete,
+    };
+
+    try testing.expectEqual(repair_app.Outcome.ok, try svc.run(job.id));
+    try testing.expectEqual(drepair.State.ok, repairs.get(job.id).?.state);
+    try testing.expect(sink.has("repair.ok"));
+    try testing.expect(!sink.has("repair.failed"));
+    // The job stays untouched: verify re-runs off `repair.ok` and
+    // decides from there.
+    try testing.expectEqual(@as(usize, 0), dl_sink.n);
+    try testing.expect(ftx.balanced());
+
+    // And the bytes on disk are the ones that were posted.
+    const repaired = try Io.Dir.cwd().readFileAlloc(io(), target, gpa, .limited(1 << 20));
+    defer gpa.free(repaired);
+    try testing.expectEqualSlices(u8, fx.files[0].bytes, repaired);
 }
