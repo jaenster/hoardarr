@@ -23,6 +23,7 @@ pub const wiring = struct {
     pub const rest = @import("bootstrap/rest.zig");
     pub const files = @import("bootstrap/files.zig");
     pub const sab = @import("bootstrap/sab.zig");
+    pub const runtime = @import("bootstrap/runtime.zig");
     pub const wiring_test = @import("bootstrap/wiring_test.zig");
 };
 
@@ -192,6 +193,7 @@ pub const cli = struct {
 
 pub const net = struct {
     pub const socket = @import("net/socket.zig");
+    pub const dns = @import("net/dns.zig");
     pub const tls = @import("net/tls.zig");
     pub const http = struct {
         pub const request = @import("net/http/request.zig");
@@ -209,6 +211,15 @@ pub const testserver = struct {
 /// The end-to-end suite: a booted `App` driven over its own HTTP
 /// surface. Lives here rather than beside the code it exercises because
 /// what it exercises is the composition root, not any one module.
+pub const e2e = struct {
+    pub const harness = @import("e2e/harness.zig");
+    pub const bootstrap_test = @import("e2e/bootstrap_test.zig");
+    pub const auth_test = @import("e2e/auth_test.zig");
+    pub const sab_test = @import("e2e/sab_test.zig");
+    pub const speed_test = @import("e2e/speed_test.zig");
+    pub const server_edit_test = @import("e2e/server_edit_test.zig");
+};
+
 pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
@@ -224,6 +235,7 @@ test {
     _ = wiring.rest;
     _ = wiring.files;
     _ = wiring.sab;
+    _ = wiring.runtime;
     _ = wiring.wiring_test;
     _ = core.crc32;
     _ = core.toml;
@@ -342,6 +354,7 @@ test {
     _ = cli.download;
     _ = cli.server;
     _ = net.socket;
+    _ = net.dns;
     _ = net.tls;
     _ = net.http.request;
     _ = net.http.response;
@@ -349,6 +362,12 @@ test {
     _ = net.http.client;
     _ = testserver.fixture;
     _ = testserver.nntp;
+    _ = e2e.harness;
+    _ = e2e.bootstrap_test;
+    _ = e2e.auth_test;
+    _ = e2e.sab_test;
+    _ = e2e.speed_test;
+    _ = e2e.server_edit_test;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;

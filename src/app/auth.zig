@@ -70,6 +70,14 @@ pub const UserStore = struct {
         self.releaseFn(self.ctx, u);
     }
 
+    /// Persist `u`. **Does not take ownership** — the caller still owns the
+    /// aggregate and must free it. An implementation that wants to keep a
+    /// copy has to make one.
+    ///
+    /// This was ambiguous once and the two implementations disagreed: the
+    /// in-memory double adopted the pointer while the SQLite repo wrote
+    /// columns and walked away, so the same caller leaked against one and
+    /// double-freed against the other depending on which was wired in.
     pub fn save(self: UserStore, unit: ?*app_ports.Unit, u: *User) StoreError!void {
         return self.saveFn(self.ctx, unit, u);
     }
@@ -190,18 +198,19 @@ pub const Service = struct {
                     if (e == error.OutOfMemory) return error.OutOfMemory;
                     return error.InvalidUser;
                 };
-                var adopted = false;
-                defer if (!adopted) {
+                defer {
                     u.deinit();
                     s.gpa.destroy(u);
-                };
+                }
 
                 s.users.save(unit, u) catch |e| {
                     // Another setup request won the race.
                     if (e == error.UsernameTaken) return error.SetupAlreadyDone;
                     return e;
                 };
-                adopted = true;
+                // Not adopted: `UserStore.save` never takes ownership, so
+                // the defer above is what frees this. Marking it adopted
+                // leaked one User per admin setup against the real store.
                 args.out.* = u.id;
                 const events = try u.pullEvents();
                 defer devent.deinitAll(dauth.Event, s.gpa, events);
@@ -433,7 +442,20 @@ pub const FakeUsers = struct {
             }
             u.setId(self.next_id);
             self.next_id += 1;
-            try self.items.append(self.gpa, u);
+
+            // Clone rather than adopt: `save` does not take ownership, and
+            // the real SQLite repo doesn't either. A double that keeps the
+            // caller's pointer would let an ownership bug pass here and
+            // only show up in production.
+            const copy = try self.gpa.create(User);
+            errdefer self.gpa.destroy(copy);
+            copy.* = User.init(self.gpa, .{
+                .username = u.username,
+                .password_hash = u.password_hash,
+                .role = u.role,
+            }, u.created_at) catch return error.Backend;
+            copy.setId(u.id);
+            try self.items.append(self.gpa, copy);
         }
         self.saves += 1;
     }

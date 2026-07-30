@@ -991,8 +991,15 @@ pub const Auth = struct {
             error.SessionNotFound, error.SessionExpired, error.UserNotFound => return error.Unauthorized,
             else => return mapErr("auth.authenticate", e),
         };
-        // The service hands back a borrowed aggregate; the identity has to
-        // outlive it, so the strings are copied into the request arena.
+        // The aggregate is *owned*, not borrowed — `authenticate` goes
+        // through `UserStore.byId`, which allocates a fresh one per call.
+        // Without this release every cookie-authenticated request leaked a
+        // user, and the UI polls every two seconds, so a live daemon grew
+        // without bound.
+        defer self_(ctx).svc.users.release(u);
+
+        // The identity has to outlive the aggregate, so the strings are
+        // copied into the request arena.
         return .{
             .user_id = u.id,
             .username = try arena.dupe(u8, u.username),
