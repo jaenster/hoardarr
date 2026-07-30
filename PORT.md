@@ -189,6 +189,39 @@ segments fetched, yEnc decoded, PAR2 verified and repaired, RAR extracted,
 delivered, history written — plus crash recovery mid-download, multi-server
 failover, throttling, auth, and webhooks.
 
+### Where the gate stands
+
+**1846 of 1849 tests pass. Three fail, and all three are real bugs**, which
+is what the gate is for — every one of them was invisible to the unit suite:
+
+1. **A crash between download-complete and verify does not restore the
+   timeline.** The data recovers (the job reaches `completed`, the files are
+   byte-identical), but the per-job event history gains nothing after the
+   reboot, so the UI shows the job dying at the crash while history says it
+   finished.
+2. **Damage beyond the available parity may be delivered as though it were
+   fine.** Repair correctly reports a shortfall and touches nothing; the
+   pipeline then does the wrong thing with that answer. Silently delivering
+   a corrupt release is the worst outcome available here.
+3. **430 failover and byte billing.** A primary answering "not here" must
+   fall through to the next tier, and the bytes must be attributed to the
+   server that actually served them — metered providers have monthly caps,
+   so mis-billing burns somebody's quota.
+
+Two further bugs the suite already found and that are now fixed: a
+use-after-free in `net/socket.zig` when a handler destroyed its own stream
+mid-dispatch (which segfaulted on the *430 path* — the ordinary path on
+Usenet, not an error case), and `p_servers.on_change` being declared, read,
+invoked from four call sites and never assigned, which left the entire
+first-run flow — upload an NZB, then configure a provider — permanently
+stuck until a restart.
+
+14 of the 22 Go tests are ported and green, plus 5 restart cases the Go
+suite did not have. Four are not ported: RAR extract (no Stored
+multi-volume writer exists to build the fixture — authoring one is
+production work, not a test), the data-directory lock (no such lock exists
+in the Zig build), a live-provider test, and a cassette replay.
+
 **Nothing in this port claims functional parity until those 22 pass.** They
 are the only thing that answers "is it truly the same". Porting them is
 tracked as its own task, and `src/testserver/` (fixture generator +
