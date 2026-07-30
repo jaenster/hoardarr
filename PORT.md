@@ -42,9 +42,9 @@ Go: 31,145 lines of implementation, 12,714 lines of tests,
 | crc32 | (stdlib) | — | `src/core/crc32.zig` | done |
 | yEnc decode | `adapter/yenc/*.go` (767) | `yenc_test.go`, `yenc_bench_test.go` (380) | `src/codec/yenc.zig` | done |
 | NZB parse | `adapter/nzb/nzb.go` (289) | `nzb_test.go` (159) | `src/codec/nzb.zig`, `src/codec/xml.zig` | done |
-| GF(2^16) | `adapter/par2/gf16/*.go` (290) | `gf16_test.go`, `matrix_test.go` (274) | `src/codec/par2/gf16.zig` | todo |
-| PAR2 parse | `adapter/par2/par2.go` (382) | `par2_test.go` (172) | `src/codec/par2/par2.zig` | todo |
-| Reed-Solomon | `adapter/par2/rs.go` (260) | `rs_test.go` (145) | `src/codec/par2/rs.zig` | todo |
+| GF(2^16) | `adapter/par2/gf16/*.go` (290) | `gf16_test.go`, `matrix_test.go` (274) | `src/codec/par2/gf16.zig`, `matrix.zig` | done |
+| PAR2 parse | `adapter/par2/par2.go` (382) | `par2_test.go` (172) | `src/codec/par2/par2.zig`, `verifier.zig` | done |
+| Reed-Solomon | `adapter/par2/rs.go` (260) | `rs_test.go` (145) | `src/codec/par2/rs.zig` | done |
 | TOML config | `config/config.go` (389) | `config_test.go` (226) | `src/core/toml.zig`, `src/core/config.zig` | done |
 | bcrypt | `adapter/bcrypt` | — | `std.crypto.bcrypt` wrapper | todo |
 
@@ -53,24 +53,27 @@ Go: 31,145 lines of implementation, 12,714 lines of tests,
 | Module | Go source | Go tests | Zig | Status |
 |-|-|-|-|-|
 | Reactor | (Go runtime) | — | `src/posix/reactor.zig`, `src/posix/sys.zig` | done |
-| Structured log | `logfile/`, `loghub/` (476) | `loghub_test.go` (123) | `src/core/log.zig` | todo |
-| SQLite binding | `adapter/sqlite/sqlite.go` (244) | `sqlite_test.go` (234) | `src/store/sqlite.zig` | todo |
+| Structured log | `logfile/`, `loghub/` (476) | `loghub_test.go` (123) | `src/core/log.zig`, `logring.zig` | done |
+| SQLite C build | (vendored 3.50.4) | linkage/WAL/DQS tests | `c/sqlite3/`, `src/store/sqlite_c.zig` | done |
+| SQLite binding | `adapter/sqlite/sqlite.go` (244) | `sqlite_test.go` (234) | `src/store/sqlite.zig` | in progress |
 | Migrations | `adapter/sqlite/migrate.go` (170) | — | `src/store/migrate.zig` | todo |
-| Outbox | `adapter/sqlite/outbox.go` (786) | `outbox_test.go` (361) | `src/store/outbox.zig` | todo |
+| Outbox | `adapter/sqlite/outbox.go` (786) | `outbox_test.go` (361) | `src/store/outbox.zig` | in progress |
 | Repos | `adapter/sqlite/repo_*.go` | `repo_*_test.go` | `src/store/repo_*.zig` | todo |
-| NNTP wire | `adapter/nntp/conn.go` (437) | `body_reader_test.go`, `stub_test.go` (712) | `src/nntp/conn.zig` | todo |
+| NNTP protocol | `adapter/nntp/conn.go`, `errors.go` | `body_reader_test.go`, `errors_test.go` | `src/nntp/protocol.zig` | done |
+| NNTP conn (I/O half) | `adapter/nntp/conn.go` (437) | `stub_test.go` (486) | `src/nntp/conn.zig` | todo |
 | NNTP pool | `adapter/nntp/pool.go` (330) | `pool_test.go` (172) | `src/nntp/pool.zig` | todo |
-| TLS | `crypto/tls` | — | `std.crypto.tls.Client` wrapper | todo |
+| Fiber bridge | (Go goroutines) | — | `src/posix/fiber.zig` | in progress |
+| TLS | `crypto/tls` | — | `src/net/tls.zig` | in progress |
 
 ### Wave 3 — domain + app
 
 | Module | Go source | Go tests | Zig | Status |
 |-|-|-|-|-|
-| download domain | `domain/download/*.go` (1122) | `job_test.go` (390) | `src/domain/download.zig` | todo |
-| other aggregates | `domain/{verify,repair,extract,deliver,server,notify,auth,command,schedule}` | various | `src/domain/*.zig` | todo |
+| download domain | `domain/download/*.go` (1122) | `job_test.go` (390) | `src/domain/download/*.zig` | done |
+| other aggregates | `domain/{verify,repair,extract,deliver,server,notify,auth,command,schedule}` | various | `src/domain/*.zig` | in progress |
 | orchestrator | `app/download/*.go` (1728) | `orchestrator_test.go` + 4 more (800) | `src/app/download/*.zig` | todo |
 | verify/repair/extract/deliver | `app/{verify,repair,extract,deliver}` (1575) | various | `src/app/*.zig` | todo |
-| notify | `app/notify` + `adapter/notify/*` (1182) | `render_test.go`, `discord_test.go`, `slack_test.go` (528) | `src/app/notify/*.zig` | todo |
+| notify | `app/notify` + `adapter/notify/*` (1182) | `render_test.go`, `discord_test.go`, `slack_test.go` (528) | `src/app/notify/*.zig` | in progress |
 | scheduler, system, auth, command | `app/*` | various | `src/app/*.zig` | todo |
 | RAR reader | `adapter/rar` (was `nwaples/rardecode`) | `rar_test.go` (72) | `src/codec/rar/*.zig` | todo |
 
@@ -78,7 +81,8 @@ Go: 31,145 lines of implementation, 12,714 lines of tests,
 
 | Module | Go source | Go tests | Zig | Status |
 |-|-|-|-|-|
-| HTTP/1.1 server | `server/*.go` (862) | `auth_test.go` (101) | `src/net/http/server.zig` | todo |
+| TCP sockets | (Go net) | — | `src/net/socket.zig` | done |
+| HTTP/1.1 server | `server/*.go` (862) | `auth_test.go` (101) | `src/net/http/*.zig` | in progress |
 | REST API | `api/rest/*.go` (2212) | `ratelimit_test.go` (45) | `src/api/rest/*.zig` | todo |
 | SAB API | `api/sab/*.go` (1056) | `sort_eval_test.go` (78) | `src/api/sab/*.zig` | todo |
 | SSE hub | `api/sse/hub.go` (176) | — | `src/api/sse.zig` | todo |
@@ -86,19 +90,29 @@ Go: 31,145 lines of implementation, 12,714 lines of tests,
 | Frontend embed | `assets*.go` | — | build-step asset blob | todo |
 | e2e suite | `bootstrap/e2e_*_test.go` (3000+) | — | `src/e2e/*.zig` | todo |
 | Container | `Dockerfile` | — | static musl → scratch | todo |
-| Benchmarks | — | — | `bench/` + `bench/REPORT.md` | todo |
+| Benchmarks | — | — | `bench/` + `bench/REPORT.md` | throughput done; HTTP/RSS/image pending |
 
-## Benchmarks to publish
+## Benchmarks
 
-Go baseline vs Zig, same machine, same input:
+Results live in `bench/REPORT.md`; reproduce with `bench/run.sh`.
 
-1. yEnc decode throughput (MB/s) on a 750 KiB article
-2. CRC32 throughput (GB/s)
-3. NNTP body read (dot-unstuffing) throughput
-4. GF(2^16) Reed-Solomon repair throughput
-5. NZB parse (large multi-file NZB)
-6. HTTP request/s on `/api/queue`
-7. **Idle CPU** — % over 60 s with an empty queue
-8. Resident memory at idle
-9. Container image size
-10. Cold start to first served request
+Done: yEnc decode, CRC-32, NNTP body read, GF(2^16) multiply-accumulate,
+NZB parse, TOML parse, reactor timer churn and dispatch, idle CPU
+(asserted as a test in `src/posix/reactor.zig`), stripped binary size.
+
+Still owed: HTTP requests/s, resident memory at idle vs Go, container
+image size vs Go, cold start to first served request, and the whole table
+re-run on a Linux host so the `epoll` backend is measured rather than
+`poll`.
+
+## Known debt
+
+* `src/core/log.zig` carries `open`/`lseek`/`rename`/`unlink`/`mkdir`/
+  `getdents` in a marked section at the bottom. They belong in
+  `src/posix/sys.zig` once it grows a filesystem section, so `store/` and
+  `deliver/` share one implementation instead of three.
+* `adapter/par2/repair.go` is not ported — it needs filesystem write-back
+  and job plumbing. `rs.reconstruct` and `verifier`, which it sits on,
+  are done.
+* The CA bundle for TLS has to be embedded at build time; the container
+  has no `/etc/ssl/certs` to read.
