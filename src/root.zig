@@ -77,6 +77,7 @@ pub const net = struct {
 pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
+    pub const signals = @import("posix/signals.zig");
 };
 
 test {
@@ -120,4 +121,5 @@ test {
     _ = net.socket;
     _ = posix.sys;
     _ = posix.reactor;
+    _ = posix.signals;
 }
