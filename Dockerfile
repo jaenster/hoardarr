@@ -13,8 +13,14 @@
 #     because Go can't setuid reliably from a multithreaded runtime. We
 #     call setgid/setgroups/setuid ourselves before starting the reactor,
 #     which also removes the shell from the image.
-#   * **No ca-certificates.** The CA bundle is compiled into the binary,
-#     so TLS to a provider does not depend on a file existing.
+#   * **The CA bundle, and nothing else from a distro.** Every Usenet
+#     provider is TLS on 563, so trust anchors are not optional — a
+#     `scratch` image without them refuses to dial any real provider, which
+#     is exactly what the first deployment of this image did. The single
+#     `ca-certificates.crt` is copied out of the builder, so it tracks the
+#     base image's bundle rather than a vendored copy that silently goes
+#     stale. That is ~230 KB and the only file in the image besides the
+#     binary.
 #   * **No tzdata.** Timestamps are stored and logged in UTC and rendered
 #     in the browser's zone, which is where a user's timezone actually
 #     lives.
@@ -38,7 +44,7 @@ FROM --platform=$BUILDPLATFORM alpine:3.20 AS builder
 # compiler with its checksum is what makes this build reproducible.
 ARG ZIG_VERSION=0.16.0
 RUN set -eux; \
-    apk add --no-cache curl xz; \
+    apk add --no-cache curl xz ca-certificates; \
     case "$(uname -m)" in \
       x86_64)  ZARCH=x86_64;  ZSHA=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;; \
       aarch64) ZARCH=aarch64; ZSHA=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;; \
@@ -88,6 +94,12 @@ LABEL org.opencontainers.image.title="hoardarr"
 LABEL org.opencontainers.image.description="A Usenet downloader with a Sonarr/Radarr-style UI"
 
 COPY --from=builder /out/bin/hoardarr /hoardarr
+
+# The path the daemon already looks in first; see `ca_bundle_paths` in
+# src/bootstrap/runtime.zig. Without this it logs "no CA bundle found; TLS
+# providers will not be dialled" and every `tls = true` server is registered
+# but never contacted.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # `scratch` has no filesystem at all, so the mount points have to be
 # created here. A bind mount would create them implicitly, but a named

@@ -156,6 +156,29 @@ hashing and decompression:
 | **Idle CPU** | 3.250% of a core, sustained | **0.0%** — 10 ms across 81 s, essentially all startup |
 | **RSS** | 43.9 MB, sawtoothing | **9.6 MB**, flat |
 
+### Final, on the deployment machine
+
+Both idle for 120 s, side by side on the Synology, after the Go tree was
+removed and the parity suite went green. The Zig side is the shipping image
+— 61 routes, the download engine, the outbox subscribers, the notification
+transport, TLS trust anchors, and the worker pool:
+
+| | Go (production) | Zig | |
+|-|-|-|-|
+| **Threads** | 57 | **6** | |
+| **Idle CPU over 120 s** | 3.93 s | **0.01 s** | |
+| **as % of one core** | 3.275% | **0.008%** | **~400× less** |
+| **RSS** | 60.7 MB | **5.7 MB** | **10.6× less** |
+| **Image** | 25 MB | **4.47 MB** | **5.6× smaller** |
+
+Read the CPU column carefully: 0.008% is not "very little", it is the
+floor of what `/proc` can resolve over two minutes — 10 ms of scheduler
+noise. The daemon is blocked in one `epoll_wait` and never runs.
+
+The image grew from 2.07 MB to 4.47 MB across the port as DNS, TLS, PAR2
+repair, fibers and the worker pool landed, plus 230 KB of CA bundle. It is
+the binary, one certificate file, and two empty directories.
+
 Six threads rather than one: the reactor, four **parked** worker threads, and
 the outbox pruner. Parked is the operative word — a pool that spun, or a
 completion that polled, would have cost the whole result. Workers block on a
