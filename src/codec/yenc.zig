@@ -532,6 +532,9 @@ pub const EncodeOpts = struct {
     total: u32 = 0,
     begin: u64 = 0,
     end: u64 = 0,
+    /// Total size of the assembled file, for the multi-part `size=`
+    /// field. Zero falls back to this part's extent.
+    total_size: u64 = 0,
     line_width: usize = 128,
 };
 
@@ -540,8 +543,16 @@ pub fn encodeForTest(gpa: std.mem.Allocator, o: EncodeOpts) error{OutOfMemory}![
     errdefer buf.deinit(gpa);
 
     if (o.total > 0) {
+        // `size=` on =ybegin is the size of the WHOLE file, not this
+        // part's — the part's extent is what =ypart's begin/end carry.
+        // Getting this wrong matters beyond cosmetics: the orchestrator
+        // sizes the output file from this field, so emitting the part
+        // size here truncates every multi-segment download to its first
+        // segment. `total_size` falls back to the part extent only when
+        // a caller genuinely doesn't know the whole size.
+        const declared = if (o.total_size > 0) o.total_size else o.end - o.begin + 1;
         try buf.print(gpa, "=ybegin part={d} total={d} line={d} size={d} name={s}\r\n", .{
-            o.part, o.total, o.line_width, o.end - o.begin + 1, o.name,
+            o.part, o.total, o.line_width, declared, o.name,
         });
         try buf.print(gpa, "=ypart begin={d} end={d}\r\n", .{ o.begin, o.end });
     } else {
@@ -1043,4 +1054,31 @@ test "vector width is what the target actually supports" {
     // target that has real vectors.
     try t.expect(vec_len >= 8);
     try t.expectEqual(vec_len, @bitSizeOf(Mask));
+}
+
+test "multipart =ybegin declares the whole file size, not the part's" {
+    const gpa = std.testing.allocator;
+    const part = "second half";
+
+    // The orchestrator allocates the output file from `header.size`. If
+    // this reported the part's length, every multi-segment download would
+    // be truncated to its first segment.
+    const article = try encodeForTest(gpa, .{
+        .name = "movie.mkv",
+        .payload = part,
+        .part = 2,
+        .total = 2,
+        .begin = 12,
+        .end = 11 + part.len,
+        .total_size = 11 + part.len,
+    });
+    defer gpa.free(article);
+
+    var a = try decodeUnverified(gpa, article);
+    defer a.deinit(gpa);
+
+    try std.testing.expectEqual(@as(i64, 11 + part.len), a.header.size);
+    try std.testing.expectEqual(@as(i64, 12), a.header.begin);
+    try std.testing.expectEqual(@as(i64, 11 + part.len), a.header.end);
+    try std.testing.expectEqualStrings(part, a.payload);
 }

@@ -14,6 +14,12 @@ pub const build_info = @import("build_info");
 
 pub const bootstrap = @import("bootstrap.zig");
 
+/// The composition root's adapters, split out of `bootstrap.zig` so each
+/// bounded context's wiring is one file.
+pub const wiring = struct {
+    pub const infra = @import("bootstrap/infra.zig");
+};
+
 pub const core = struct {
     pub const crc32 = @import("core/crc32.zig");
     pub const toml = @import("core/toml.zig");
@@ -178,6 +184,11 @@ pub const net = struct {
     };
 };
 
+pub const testserver = struct {
+    pub const fixture = @import("testserver/fixture.zig");
+    pub const nntp = @import("testserver/nntp.zig");
+};
+
 pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
@@ -187,6 +198,7 @@ pub const posix = struct {
 
 test {
     _ = bootstrap;
+    _ = wiring.infra;
     _ = core.crc32;
     _ = core.toml;
     _ = core.config;
@@ -304,6 +316,8 @@ test {
     _ = net.http.response;
     _ = net.http.server;
     _ = net.http.client;
+    _ = testserver.fixture;
+    _ = testserver.nntp;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;
