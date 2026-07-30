@@ -88,6 +88,26 @@ season-pack NZB drops from ~16 ms to ~2 ms, and config parse from 13 µs to
 faster download. The throughput numbers that affect a download are yEnc,
 CRC, and the NNTP body reader.
 
+## End-to-end data path
+
+The number that actually answers "how fast can this download":
+
+| Benchmark | Zig |
+|-|-|
+| NNTP → dot-unstuffing → yEnc decode → CRC verify | **1402 MB/s** |
+
+A real 750 KiB yEnc article, dot-stuffed into an NNTP multi-line block
+exactly as a provider sends it, served over a loopback socket and pulled
+through the reactor, the body reader, the decoder and its CRC check. Nothing
+is stubbed except the network itself.
+
+1402 MB/s is 11 Gbit/s. No consumer connection is close, which is the useful
+conclusion: on any real download the provider's link is the bottleneck and
+the daemon is not, with roughly two orders of magnitude of headroom. There
+is no Go counterpart because the Go path can't be isolated the same way — it
+spans a goroutine per connection plus a context watcher — but the component
+figures above (yEnc 1.88×, body read 1.42×) are the parts that moved.
+
 ## Reactor
 
 | Benchmark | Zig | Note |
