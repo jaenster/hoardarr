@@ -96,6 +96,7 @@ pub const net = struct {
         pub const request = @import("net/http/request.zig");
         pub const response = @import("net/http/response.zig");
         pub const server = @import("net/http/server.zig");
+        pub const client = @import("net/http/client.zig");
     };
 };
 
@@ -168,6 +169,7 @@ test {
     _ = net.http.request;
     _ = net.http.response;
     _ = net.http.server;
+    _ = net.http.client;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;
