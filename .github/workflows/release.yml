@@ -13,47 +13,123 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  ZIG_VERSION: "0.16.0"
+
 jobs:
-  release:
-    name: goreleaser
+  build:
+    name: build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One Linux runner cross-compiles everything, which is the whole
+        # point of the Zig toolchain — no per-OS runner, no cgo, and every
+        # artifact comes out of one job so they cannot drift.
+        target:
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - x86_64-macos
+          - aarch64-macos
     steps:
       - uses: actions/checkout@v4
         with:
-          # goreleaser uses `git describe`, which needs the full history.
+          # `git describe` needs the full history.
           fetch-depth: 0
 
-      - name: setup go
-        uses: actions/setup-go@v5
+      - uses: mlugg/setup-zig@v2
         with:
-          go-version: "1.25"
-          check-latest: true
-          cache: true
+          version: ${{ env.ZIG_VERSION }}
 
-      - name: setup node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 
-      - name: run goreleaser
-        uses: goreleaser/goreleaser-action@v6
+      # The frontend bundle has to exist before the embed step runs.
+      - name: build frontend
+        run: cd frontend && npm ci && npm run build
+
+      - name: build
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          COMMIT=$(git rev-parse --short=12 HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          zig build --release=fast \
+            -Dtarget=${{ matrix.target }} \
+            -Dembed-ui=true -Dstrip=true \
+            -Dversion="${VERSION}" -Dcommit="${COMMIT}" -Dbuild-date="${BUILD_DATE}" \
+            --prefix dist/${{ matrix.target }}
+
+      - name: package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          NAME=hoardarr_${VERSION}_${{ matrix.target }}
+          tar -czf "${NAME}.tar.gz" -C dist/${{ matrix.target }}/bin hoardarr
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          ls -l "${NAME}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
         with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
+          name: ${{ matrix.target }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+
+  release:
+    name: publish
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: collect checksums
+        run: |
+          cd dist
+          cat *.sha256 > checksums.txt
+          rm -f *.sha256
+          cat checksums.txt
+
+      # The CHANGELOG section for this tag becomes the release notes,
+      # matching what the previous release tooling did.
+      - name: extract release notes
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[?" v "\\]?" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          # An untagged or unlisted version should still release, just
+          # without curated notes.
+          [ -s RELEASE_NOTES.md ] || echo "See CHANGELOG.md." > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            dist/*.tar.gz dist/checksums.txt
 
-      # SLSA build provenance over every release tarball + the
-      # checksums file goreleaser produced. Verify with:
+      # SLSA build provenance over every release tarball and the
+      # checksums file. Verify with:
       #
-      #   gh attestation verify hoardarr_0.1.2_linux_amd64.tar.gz \
+      #   gh attestation verify hoardarr_0.1.2_x86_64-linux-musl.tar.gz \
       #     --repo jaenster/hoardarr
       - name: attest release artifacts
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            dist/hoardarr_*.tar.gz
+            dist/*.tar.gz
             dist/checksums.txt
