@@ -278,6 +278,12 @@ Order:
 
 ## Known debt
 
+* The PAR2 oracle fixture `testdata/repair-bug-job38/` is gitignored, so it
+  exists on developer machines only. The tests that use it — the real
+  ParPar index in `codec/par2/{par2,verifier,repair}.zig` — **skip in CI**
+  and are only exercised locally. Every other PAR2 test builds its own
+  fixture and runs everywhere.
+
 * `src/core/log.zig` carries `open`/`lseek`/`rename`/`unlink`/`mkdir`/
   `getdents` in a marked section at the bottom. They belong in
   `src/posix/sys.zig` once it grows a filesystem section, so `store/` and
