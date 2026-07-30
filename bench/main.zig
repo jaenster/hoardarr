@@ -27,6 +27,8 @@ const yenc = hoardarr.codec.yenc;
 const nzb = hoardarr.codec.nzb;
 const toml = hoardarr.core.toml;
 const protocol = hoardarr.nntp.protocol;
+const nntp_conn = hoardarr.nntp.conn;
+const socket = hoardarr.net.socket;
 const gf16 = hoardarr.codec.par2.gf16;
 const reactor = hoardarr.posix.reactor;
 
@@ -376,6 +378,119 @@ fn benchGf16MulAdd(gpa: std.mem.Allocator) !Result {
 }
 
 // ---------------------------------------------------------------------
+// End-to-end data path
+// ---------------------------------------------------------------------
+
+/// The number that actually answers "how fast can this download": a real
+/// yEnc article served over a real loopback socket, pulled through the
+/// reactor, the NNTP dot-unstuffing reader, the yEnc decoder and its CRC
+/// check — everything a downloaded segment goes through except the
+/// provider's bandwidth.
+///
+/// Loopback removes the network, which is the point. On a real download the
+/// provider's link is the bottleneck; this measures the ceiling that
+/// bottleneck is compared against, and whether the daemon itself could ever
+/// be the limiting factor.
+fn benchDataPath(gpa: std.mem.Allocator) !Result {
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+
+    // One 750 KiB article, yEnc-encoded, then dot-stuffed into an NNTP
+    // multi-line block exactly as a provider sends it.
+    const article = try makeArticle(gpa);
+    var reply: std.Io.Writer.Allocating = .init(gpa);
+    try reply.writer.writeAll("222 0 <bench@x> body\r\n");
+    var line_start = true;
+    for (article) |b| {
+        // Dot-stuff: a line beginning with '.' gets a second one.
+        if (line_start and b == '.') try reply.writer.writeByte('.');
+        try reply.writer.writeByte(b);
+        line_start = b == '\n';
+    }
+    try reply.writer.writeAll("\r\n.\r\n");
+
+    const script = try gpa.alloc(nntp_conn.StubServer.Exchange, 1 + max_fetches);
+    script[0] = .{ .expect = "MODE READER", .reply = "200 reader\r\n" };
+    for (script[1..]) |*e| e.* = .{ .expect = "BODY", .reply = reply.written() };
+
+    var stub: nntp_conn.StubServer = undefined;
+    const port = try stub.start(gpa, &loop, "200 ready\r\n", script);
+
+    const Ctx = struct {
+        conn: nntp_conn.Conn = undefined,
+        loop: *reactor.Loop,
+        ready: bool = false,
+        bodies: usize = 0,
+        decoded: usize = 0,
+        failed: bool = false,
+        gpa: std.mem.Allocator,
+
+        const handler: nntp_conn.Handler = .{
+            .on_ready = onReady,
+            .on_body = onBody,
+            .on_error = onError,
+        };
+
+        fn onReady(c: *nntp_conn.Conn) void {
+            const self: *@This() = @fieldParentPtr("conn", c);
+            self.ready = true;
+        }
+
+        fn onBody(c: *nntp_conn.Conn, payload: []const u8) void {
+            const self: *@This() = @fieldParentPtr("conn", c);
+            self.bodies += 1;
+            // Decode with CRC verification — the whole point is to measure
+            // the path a real segment takes, and the CRC is not optional.
+            var a = yenc.decode(self.gpa, payload) catch {
+                self.failed = true;
+                return;
+            };
+            defer a.deinit(self.gpa);
+            self.decoded += a.payload.len;
+            std.mem.doNotOptimizeAway(a.payload.len);
+        }
+
+        fn onError(c: *nntp_conn.Conn, _: nntp_conn.Error) void {
+            const self: *@This() = @fieldParentPtr("conn", c);
+            self.failed = true;
+        }
+    };
+
+    var ctx = Ctx{ .loop = &loop, .gpa = gpa };
+    try ctx.conn.connect(gpa, &loop, try std.Io.net.IpAddress.parse("127.0.0.1", port), .{}, &Ctx.handler);
+    while (!ctx.ready and !ctx.failed) _ = try loop.tick(5);
+    if (ctx.failed) return error.HandshakeFailed;
+
+    // Fetch a fixed number of articles and time the whole thing, rather
+    // than going through `measure`: the work per iteration spans many
+    // reactor ticks, so the harness's calibration loop doesn't fit.
+    var samples: [rounds]f64 = undefined;
+    for (&samples) |*sample| {
+        const per_round = 24;
+        const before_bodies = ctx.bodies;
+        const t0 = sys.monotonicNanos();
+        var issued: usize = 0;
+        while (ctx.bodies - before_bodies < per_round and !ctx.failed) {
+            if (issued < per_round and ctx.conn.isReady()) {
+                try ctx.conn.fetchBody("<bench@x>");
+                issued += 1;
+            }
+            _ = try loop.tick(1);
+        }
+        const dt = sys.monotonicNanos() - t0;
+        if (ctx.failed) return error.FetchFailed;
+        const bytes: f64 = @floatFromInt(per_round * article_payload);
+        sample.* = bytes / @as(f64, @floatFromInt(dt)) * 1000.0;
+    }
+
+    std.mem.sort(f64, &samples, {}, std.sort.asc(f64));
+    return .{ .median = samples[rounds / 2], .best = samples[rounds - 1] };
+}
+
+/// Enough script entries for every round's fetches.
+const max_fetches = rounds * 32 + 64;
+
+// ---------------------------------------------------------------------
 // Reactor
 // ---------------------------------------------------------------------
 
@@ -464,6 +579,7 @@ const all_benchmarks = [_]Benchmark{
     .{ .name = "nntp body read (750 KiB)", .unit = "MB/s", .run = benchNntpBodyRead },
     .{ .name = "nntp body read, scalar ref", .unit = "MB/s", .run = benchNntpBodyReadScalar },
     .{ .name = "gf16 mul-add (1.5 MiB slice)", .unit = "MB/s", .run = benchGf16MulAdd },
+    .{ .name = "data path: nntp+yenc+crc", .unit = "MB/s", .run = benchDataPath },
     .{ .name = "reactor timer arm+cancel", .unit = "ops/s", .run = benchTimerChurn },
     .{ .name = "reactor dispatch (64 fds)", .unit = "ops/s", .run = benchReactorDispatch },
 };

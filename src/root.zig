@@ -91,6 +91,7 @@ pub const app = struct {
 
 pub const net = struct {
     pub const socket = @import("net/socket.zig");
+    pub const tls = @import("net/tls.zig");
     pub const http = struct {
         pub const request = @import("net/http/request.zig");
         pub const response = @import("net/http/response.zig");
@@ -102,6 +103,7 @@ pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
     pub const signals = @import("posix/signals.zig");
+    pub const fiber = @import("posix/fiber.zig");
 };
 
 test {
@@ -162,10 +164,12 @@ test {
     _ = app.notify.slack;
     _ = app.notify.service;
     _ = net.socket;
+    _ = net.tls;
     _ = net.http.request;
     _ = net.http.response;
     _ = net.http.server;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;
+    _ = posix.fiber;
 }

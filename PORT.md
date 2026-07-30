@@ -116,3 +116,15 @@ re-run on a Linux host so the `epoll` backend is measured rather than
   are done.
 * The CA bundle for TLS has to be embedded at build time; the container
   has no `/etc/ssl/certs` to read.
+* **TLS has never completed a handshake against a real server.** `std.crypto.tls`
+  ships a client and no server, so the tests reach an inspected ClientHello
+  and can drive server records back in (a fatal alert becomes `TlsAlert`,
+  garbage becomes a protocol error, a truncated record becomes a transport
+  failure), but nothing gets as far as ServerHello, the key schedule, or
+  certificate verification. `reader()`/`writer()` compile and cross-compile
+  but have never moved a plaintext byte. **This must be validated against a
+  real provider before anyone relies on it.**
+* Fiber stacks are 1 MiB. The canary test measured a real `Client.init` at
+  148 KB under ReleaseFast and 506 KB under Debug, and 256 KiB actually
+  crashed on the guard page. It is virtual address space, so 40 connections
+  is ~40 MiB of VA and ~6 MiB resident.
