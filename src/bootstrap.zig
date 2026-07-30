@@ -662,6 +662,12 @@ pub const App = struct {
         self.api.queue = self.p_queue.port();
         self.api.events = self.p_events.port();
         self.api.servers = self.p_servers.port();
+        // Without this the hook is permanently null and `notifyChanged` is
+        // a no-op, which breaks the first-run flow outright: upload an NZB,
+        // then configure a provider, and the job stays parked in
+        // `waiting_for_server` until the daemon is restarted. The e2e
+        // hotwire test is what caught it.
+        self.p_servers.on_change = .{ .ctx = @ptrCast(self), .changedFn = onServersChanged };
         self.api.categories = self.p_categories.port();
         self.api.system = self.p_system.port();
         self.api.schedule = self.p_schedule.port();
@@ -753,6 +759,26 @@ pub const App = struct {
         _ = self.deliver_service.recoverStuck() catch |err| {
             log.warn("deliver: startup recovery failed", &.{log.str("error", @errorName(err))});
         };
+    }
+
+    /// A server was added, edited, enabled, disabled or removed through the
+    /// API. Rebuild the pools so a newly configured provider can pick up
+    /// jobs that are parked waiting for one, and so a removed provider
+    /// loses its connections rather than being dialled again.
+    ///
+    /// Failure is logged rather than propagated: the REST call itself
+    /// succeeded and the row is written, so reporting an error to the
+    /// operator would be misleading. The next restart reloads regardless.
+    fn onServersChanged(ctx: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (!self.engine_ready) return;
+        self.engine.loadPools() catch |err| {
+            log.warn("servers changed but pools could not be rebuilt", &.{
+                log.str("error", @errorName(err)),
+            });
+            return;
+        };
+        self.engine.kickParked();
     }
 
     /// The post-download half of `docs/architecture.md`'s event flow,

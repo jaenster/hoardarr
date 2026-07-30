@@ -1338,6 +1338,29 @@ pub const Runtime = struct {
         };
     }
 
+    /// Re-drive jobs parked for lack of a usable provider.
+    ///
+    /// Called after the server list changes. `kickIdleJobs` unparks
+    /// anything in `waiting_for_server` and starts a runner for every
+    /// non-paused, non-terminal job that lacks one, so a provider
+    /// configured *after* an NZB was uploaded picks it up immediately
+    /// rather than at the next restart.
+    pub fn kickParked(self: *Runtime) void {
+        const admitted = self.scheduler.kickIdleJobs(self.gpa) catch |err| {
+            self.logger.warn("download: could not re-drive parked jobs", &.{
+                log.errv("err", err),
+            });
+            return;
+        };
+        defer self.gpa.free(admitted);
+        for (admitted) |id| self.openSlot(id) catch |err| {
+            self.logger.warn("download: could not open a slot for an unparked job", &.{
+                log.int("job_id", id),
+                log.errv("err", err),
+            });
+        };
+    }
+
     pub fn activeSlots(self: *const Runtime) usize {
         var n: usize = 0;
         for (self.slots.items) |s| {

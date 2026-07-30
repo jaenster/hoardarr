@@ -161,6 +161,19 @@ pub const Stream = struct {
     state: State = .open,
     context: ?*anyopaque = null,
 
+    /// Points at a stack flag owned by the in-progress `onReady`, when
+    /// there is one. `deinit` clears it, which is how dispatch learns that
+    /// a handler destroyed this stream.
+    ///
+    /// A handler is allowed to tear its own connection down — the NNTP
+    /// pool does exactly that when a provider answers 430 — and once it
+    /// has, `self` is freed memory. Reading `self.state` afterwards to
+    /// decide whether to continue is a use-after-free, and it was one:
+    /// it segfaulted on the 430 path, which on Usenet is the *ordinary*
+    /// path, not an error case. The flag lives on the dispatching
+    /// frame's stack precisely so it survives the object it describes.
+    alive_guard: ?*bool = null,
+
     pub const State = enum {
         /// Non-blocking connect in flight; waiting for writability.
         connecting,
@@ -233,6 +246,12 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Stream) void {
+        // Tell any dispatch frame above us that we are gone, before we
+        // actually go.
+        if (self.alive_guard) |g| {
+            g.* = false;
+            self.alive_guard = null;
+        }
         if (self.source.isRegistered()) self.loop.remove(&self.source);
         if (self.source.fd != sys.invalid_fd) {
             sys.close(self.source.fd);
@@ -294,6 +313,17 @@ pub const Stream = struct {
     fn onReady(src: *reactor.Source, ready: reactor.Ready) void {
         const self: *Stream = @fieldParentPtr("source", src);
 
+        // Every handler below may destroy this stream. `alive` lives on
+        // *this* frame, so it stays readable after `self` does not; the
+        // rule for the rest of this function is that nothing touches
+        // `self` again without checking it first.
+        var alive = true;
+        const outer_guard = self.alive_guard;
+        self.alive_guard = &alive;
+        defer if (alive) {
+            self.alive_guard = outer_guard;
+        };
+
         if (self.state == .connecting) {
             self.finishConnect(ready);
             return;
@@ -307,11 +337,13 @@ pub const Stream = struct {
                 self.fail(err);
                 return;
             };
+            if (!alive) return;
             if (self.state == .closed) return;
         }
 
         if (ready.read) {
             self.handler.on_readable(self);
+            if (!alive) return;
             if (self.state == .closed) return;
         }
 
@@ -809,4 +841,128 @@ test "listener drains a burst of connections without one accept per tick" {
     _ = try loop.tick(50);
 
     try testing.expectEqual(@as(usize, n), server.accepted);
+}
+
+test "a handler may destroy its own stream from inside the callback" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    var server: EchoServer = undefined;
+    const port = try server.start(gpa, &loop);
+    defer server.deinit();
+
+    // This is what the NNTP pool does when a provider answers 430: the
+    // read handler decides the connection is finished and tears it down
+    // right there. Everything after that callback in `onReady` is then
+    // touching freed memory — which segfaulted on the 430 path, the
+    // ordinary path on Usenet rather than an error case.
+    const Suicidal = struct {
+        stream: *Stream,
+        gpa: Allocator,
+        fired: usize = 0,
+        buf: [256]u8 = undefined,
+
+        const handler: Handler = .{
+            .on_readable = onReadable,
+            .on_close = onClose,
+            .on_connected = onConnected,
+        };
+
+        fn onConnected(s: *Stream, err: ?Error) void {
+            _ = err;
+            s.write("trigger a reply") catch {};
+        }
+
+        fn onReadable(s: *Stream) void {
+            const self: *@This() = @ptrCast(@alignCast(s.context.?));
+            self.fired += 1;
+            _ = s.read(&self.buf) catch {};
+            // Destroy the stream from inside its own dispatch, then free
+            // the storage it lived in — the strongest form of the hazard.
+            s.deinit();
+            self.gpa.destroy(s);
+            self.stream = undefined;
+        }
+
+        fn onClose(s: *Stream, _: ?Error) void {
+            s.state = .closed;
+        }
+    };
+
+    const stream = try gpa.create(Stream);
+    var owner = Suicidal{ .stream = stream, .gpa = gpa };
+    try stream.connect(gpa, &loop, try IpAddress.parse("127.0.0.1", port), &Suicidal.handler);
+    stream.context = &owner;
+
+    try pumpUntil(&loop, 3000, &owner, struct {
+        fn f(o: *Suicidal) bool {
+            return o.fired > 0;
+        }
+    }.f);
+
+    // Reaching here at all is the assertion: before the liveness guard
+    // this dereferenced freed memory immediately after the callback.
+    try testing.expectEqual(@as(usize, 1), owner.fired);
+
+    // And the loop is still healthy afterwards.
+    _ = try loop.tick(10);
+}
+
+test "a stream destroyed while both readable and hung up does not resurface" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    // A socket can be readable and hung up in the same event. If the read
+    // handler frees the stream, the terminal branch must not then run
+    // against it — that is the second dereference in the same dispatch.
+    const p = try sys.pipe();
+    defer sys.close(p.read_end);
+
+    const Freer = struct {
+        stream: *Stream,
+        gpa: Allocator,
+        fired: usize = 0,
+
+        const handler: Handler = .{
+            .on_readable = onReadable,
+            .on_close = onClose,
+        };
+
+        fn onReadable(s: *Stream) void {
+            const self: *@This() = @ptrCast(@alignCast(s.context.?));
+            self.fired += 1;
+            var b: [64]u8 = undefined;
+            _ = s.read(&b) catch {};
+            s.deinit();
+            self.gpa.destroy(s);
+        }
+
+        fn onClose(s: *Stream, _: ?Error) void {
+            // Must never run: the stream was freed in on_readable.
+            const self: *@This() = @ptrCast(@alignCast(s.context.?));
+            self.fired += 1000;
+        }
+    };
+
+    const stream = try gpa.create(Stream);
+    var owner = Freer{ .stream = stream, .gpa = gpa };
+    try stream.initAccepted(gpa, &loop, p.read_end, &Freer.handler);
+    stream.context = &owner;
+
+    // Write then close the far end, so the same event carries both.
+    _ = try sys.write(p.write_end, "bye");
+    sys.close(p.write_end);
+
+    try pumpUntil(&loop, 3000, &owner, struct {
+        fn f(o: *Freer) bool {
+            return o.fired > 0;
+        }
+    }.f);
+
+    // Exactly one dispatch, and on_close never fired against dead memory.
+    try testing.expectEqual(@as(usize, 1), owner.fired);
 }
