@@ -5,7 +5,7 @@
 [![release](https://img.shields.io/github/v/release/jaenster/hoardarr?include_prereleases&sort=semver)](https://github.com/jaenster/hoardarr/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**hoardarr** is a Go-based SABnzbd alternative with a Sonarr/Radarr-style UI.
+**hoardarr** is a Zig SABnzbd alternative with a Sonarr/Radarr-style UI.
 Point Sonarr / Radarr / Lidarr / Readarr / Prowlarr at `/sabnzbd/api`
 and they don't know the difference.
 
@@ -17,12 +17,17 @@ and they don't know the difference.
 - **Sonarr/Radarr-style UI.** Dark theme, drag-reorder queue, live
   per-segment progress over SSE, per-job timeline, per-file explorer.
   No SABnzbd 2010-era page reloads.
-- **Wire-level from scratch.** NNTP, yEnc, NZB parsing and PAR2
-  (verify + Reed-Solomon repair over GF(2^16)) are all native Go.
-  The only external dep in the data path is `nwaples/rardecode` for
-  multi-part RAR.
-- **Pure-Go single binary.** `CGO_ENABLED=0`, `modernc.org/sqlite`,
-  embedded React frontend. One ~12 MB binary, one container image.
+- **Wire-level from scratch.** NNTP, yEnc, NZB parsing, PAR2 (verify +
+  Reed-Solomon repair over GF(2^16)) and RAR are all written here, with
+  SIMD on the hot paths. The only third-party code in the binary is
+  SQLite.
+- **Nothing running when nothing is happening.** One thread parked in one
+  syscall; no polling interval anywhere. Measured against the previous
+  release on the same machine, both idle: **0.000% CPU and 2.8 MB
+  resident**, against 3.25% of a core and 43.9 MB.
+- **A 2 MB container.** Runtime stage is `scratch` — no libc, no shell,
+  no `ca-certificates`, no `tzdata`. The frontend is embedded and
+  gzipped at build time, so the daemon never runs a compressor.
 - **Multi-server with priority tiers + metered providers.** Block
   accounts kick in only after a missing-article 430 from primaries;
   byte counters persist across restarts so monthly caps are honoured.
@@ -48,9 +53,10 @@ Honest positioning — pick the row that matches what you actually care about.
 
 | | hoardarr | SABnzbd | NZBGet |
 |-|-|-|-|
-| Language | Go (pure, no cgo) | Python | C++ |
-| Binary size | ~12 MB | ~50 MB + Python runtime | ~5 MB |
-| Memory at idle | ~30 MB | ~80 MB | ~20 MB |
+| Language | Zig (no libc on Linux) | Python | C++ |
+| Container image | ~2 MB (`scratch`) | ~50 MB + Python runtime | ~5 MB |
+| Memory at idle | ~3 MB | ~80 MB | ~20 MB |
+| CPU at idle | 0.000% | polling loop | low |
 | UI | Sonarr/Radarr-style, dark, live SSE | Original 2010s template | Bootstrap, dated |
 | SAB API drop-in | Yes (`/sabnzbd/api`) | Native | Compat shim |
 | Sonarr/Radarr | Drop-in | Native | Drop-in |
@@ -282,11 +288,13 @@ Yes. First boot prompts for an admin password. Sessions are bcrypt +
 HTTP-only cookies, rate-limited, with CSRF on mutating endpoints. The
 *arr suite authenticates via API key (rotatable from Settings).
 
-**Pure Go means no cgo means…?**
-The binary is statically linked and cross-compiles cleanly to any
-`GOOS/GOARCH` combo Go supports. No glibc dependency, no
-`apt install par2cmdline`, no `unrar` on the host. The container is
-alpine + the binary + a tiny entrypoint shim.
+**No libc means…?**
+On Linux the binary talks to the kernel directly, so it is statically
+linked with no dynamic loader and cross-compiles to x86_64 and aarch64
+from any host. No glibc dependency, no `apt install par2cmdline`, no
+`unrar` on the host. The container's runtime stage is `scratch`: the
+binary and two empty directories. `PUID`/`PGID` still work — the daemon
+drops privileges itself rather than needing `su-exec` and a shell.
 
 **Where does state live?**
 Everything except the actual downloaded bytes lives in
