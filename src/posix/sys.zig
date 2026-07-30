@@ -203,6 +203,28 @@ pub const Sockaddr = union(enum) {
         };
     }
 
+    /// Render the address (without the port) into `buf`.
+    ///
+    /// Used as a rate-limiter bucket key, so it must be stable and must
+    /// not include the ephemeral port — every request from one client
+    /// arrives on a different one.
+    pub fn formatAddress(self: Sockaddr, buf: []u8) ![]const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        switch (self) {
+            .in => |a| {
+                const o: [4]u8 = @bitCast(a.addr);
+                try w.print("{d}.{d}.{d}.{d}", .{ o[0], o[1], o[2], o[3] });
+            },
+            .in6 => |a| {
+                for (0..8) |i| {
+                    if (i > 0) try w.writeByte(':');
+                    try w.print("{x}", .{std.mem.readInt(u16, a.addr[i * 2 ..][0..2], .big)});
+                }
+            },
+        }
+        return w.buffered();
+    }
+
     /// Port in host byte order.
     pub fn port(self: Sockaddr) u16 {
         return switch (self) {
@@ -341,6 +363,25 @@ pub fn getsockname(fd: Fd) Error!Sockaddr {
     // Re-read the family from the struct the kernel filled in rather than
     // trusting the caller to know it. The field sits at the same offset in
     // both v4 and v6 layouts on each platform, so one cast reads either.
+    const fam: u32 = @as(*const SockaddrIn, @ptrCast(&storage)).family;
+    if (fam == AF_INET6) return .{ .in6 = storage };
+    return .{ .in = @as(*const SockaddrIn, @ptrCast(&storage)).* };
+}
+
+/// The peer's address on a connected socket.
+///
+/// The rate limiter needs a per-client key. A proxy header is the usual
+/// source, but a client that sends none must not share a bucket with
+/// every other such client — that turns one abusive caller into a denial
+/// of service for everyone behind the same gap.
+pub fn getpeername(fd: Fd) Error!Sockaddr {
+    var storage: SockaddrIn6 = .{};
+    var len: u32 = @sizeOf(SockaddrIn6);
+    if (is_linux) {
+        _ = try linuxUnwrap(linux.getpeername(fd, @ptrCast(&storage), &len));
+    } else {
+        _ = try cUnwrap(std.c.getpeername(fd, @ptrCast(&storage), &len));
+    }
     const fam: u32 = @as(*const SockaddrIn, @ptrCast(&storage)).family;
     if (fam == AF_INET6) return .{ .in6 = storage };
     return .{ .in = @as(*const SockaddrIn, @ptrCast(&storage)).* };
@@ -1232,4 +1273,56 @@ test "DirIter on a missing directory is an error, not an empty listing" {
     // An empty listing would make a prune silently do nothing while
     // reporting success.
     try testing.expectError(error.NoSuchFileOrDirectory, DirIter.open("/tmp/hoardarr-no-such-dir-4b1c"));
+}
+
+test "getpeername identifies the client, and the key excludes the port" {
+    // A connected pair over loopback: the peer address is what the rate
+    // limiter buckets on when no proxy header is present.
+    const listener = try socket(AF_INET, SOCK_STREAM, 0);
+    defer close(listener);
+    try setReuseAddr(listener);
+    var bind_addr = Sockaddr.fromIp(try std.Io.net.IpAddress.parse("127.0.0.1", 0));
+    try bind(listener, &bind_addr);
+    try listen(listener, 4);
+    const port_no = (try getsockname(listener)).port();
+
+    const client = try socket(AF_INET, SOCK_STREAM, 0);
+    defer close(client);
+    var target = Sockaddr.fromIp(try std.Io.net.IpAddress.parse("127.0.0.1", port_no));
+    connect(client, &target) catch |err| switch (err) {
+        error.InProgress, error.WouldBlock, error.AlreadyConnected => {},
+        else => return err,
+    };
+
+    // Give the loopback handshake a moment, then accept.
+    var accepted: Fd = invalid_fd;
+    for (0..200) |_| {
+        accepted = accept(listener) catch |err| switch (err) {
+            error.WouldBlock => {
+                sleep(2 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
+    try testing.expect(accepted != invalid_fd);
+    defer close(accepted);
+
+    const peer = try getpeername(accepted);
+    var buf: [64]u8 = undefined;
+    const key = try peer.formatAddress(&buf);
+    try testing.expectEqualStrings("127.0.0.1", key);
+
+    // The ephemeral port differs per connection, so including it would
+    // give every request its own bucket and defeat the limiter entirely.
+    try testing.expect(std.mem.indexOfScalar(u8, key, ':') == null);
+    try testing.expect(peer.port() != port_no);
+}
+
+test "IPv6 peers render as a stable key too" {
+    const sa = Sockaddr.fromIp(try std.Io.net.IpAddress.parse("::1", 1234));
+    var buf: [64]u8 = undefined;
+    const key = try sa.formatAddress(&buf);
+    try testing.expectEqualStrings("0:0:0:0:0:0:0:1", key);
 }
