@@ -144,6 +144,27 @@ directory. CPU is the delta of `utime + stime` from `/proc/<pid>/stat`, not
 | **RSS movement while idle** | 65.5 → 43.9 MB | 2.8 → 2.8 MB | |
 | **Image** | 25 MB | **2.07 MB** | **12× smaller** |
 
+That measurement was taken when the Zig side served HTTP but could not yet
+download. The table below is the same property re-measured with **everything
+wired** — the full 61-route surface, the download orchestrator, the outbox
+subscribers, the SSE hubs, the notification transport, and a worker pool for
+hashing and decompression:
+
+| | Go | Zig (complete) |
+|-|-|-|
+| **Threads** | 57 | **6** |
+| **Idle CPU** | 3.250% of a core, sustained | **0.0%** — 10 ms across 81 s, essentially all startup |
+| **RSS** | 43.9 MB, sawtoothing | **9.6 MB**, flat |
+
+Six threads rather than one: the reactor, four **parked** worker threads, and
+the outbox pruner. Parked is the operative word — a pool that spun, or a
+completion that polled, would have cost the whole result. Workers block on a
+futex and completions cross back on an eventfd registered as a reactor
+source, so an idle daemon still wakes for nothing.
+
+Memory roughly tripled from the HTTP-only build and is still 4.6× smaller
+than Go's, and unlike Go's it does not move.
+
 The RSS column is the more interesting one. The Go process is not sitting
 still: over the sample it swung between 43.9 and 77 MB with nothing in the
 queue. That is the garbage collector's sawtooth, and it is also where most
