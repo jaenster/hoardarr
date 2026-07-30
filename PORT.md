@@ -142,6 +142,34 @@ tracked as its own task, and `src/testserver/` (fixture generator +
 content-addressed NNTP server with missing-fraction, throttle, latency and
 connection-limit knobs) is the harness they need.
 
+## Coverage audit
+
+Every Go source file has a Zig counterpart except the following, which were
+found by walking `internal/` and `cmd/` against `src/`:
+
+| Go | Status |
+|-|-|
+| `adapter/notify/webhook/` + `router/` (194) | being ported — `Kind.webhook` currently returns `NoSenderForKind` |
+| `cmd/hoardarr/cmd_download.go` (102) | being ported |
+| `cmd/hoardarr/cmd_server.go` (154) | being ported |
+| `cmd/hoardarr/cmd_healthcheck.go` (52) | stubbed; being ported |
+| `adapter/bcrypt/` | covered by `src/domain/auth.zig` (cost 10, `$2a$`, byte-compatible) |
+| `adapter/fs/` | covered by `posix/sys.zig`'s filesystem section |
+| `adapter/eventbus/memory/` | superseded by the SQLite outbox |
+| `logfile/`, `loghub/` | covered by `core/log.zig`, `core/logring.zig` |
+| `app/{backup,diskspace,health}`, `adapter/nntptest/probe` | wired as bootstrap adapters |
+
+### What the Go tree still holds that Zig needs
+
+Exactly one thing: `testdata/repair-bug-job38/`, a real ParPar index used as
+the PAR2 oracle. Everything else under `internal/` and `cmd/` can be deleted
+once the parity gate passes — verified by grepping every repo-relative path
+the Zig tests open.
+
+`bench/go/` and `internal/adapter/nntp/body_reader_bench_test.go` are
+benchmark scaffolding and go with it; their numbers are already recorded in
+`bench/REPORT.md`.
+
 ## Known debt
 
 * `src/core/log.zig` carries `open`/`lseek`/`rename`/`unlink`/`mkdir`/
