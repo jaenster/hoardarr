@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     hoardarr.addOptions("build_info", build_info);
+    addSqlite(b, hoardarr, target, optimize);
 
     const exe = b.addExecutable(.{
         .name = "hoardarr",
@@ -53,6 +54,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addOptions("build_info", build_info);
+    addSqlite(b, tests.root_module, target, optimize);
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 
@@ -79,6 +81,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         });
         check_hoardarr.addOptions("build_info", build_info);
+        addSqlite(b, check_hoardarr, resolved, .ReleaseFast);
         check_mod.addOptions("build_info", build_info);
         check_mod.addImport("hoardarr", check_hoardarr);
         const obj = b.addObject(.{
@@ -100,6 +103,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     hoardarr_fast.addOptions("build_info", build_info);
+    addSqlite(b, hoardarr_fast, target, .ReleaseFast);
 
     const bench = b.addExecutable(.{
         .name = "bench",
@@ -115,3 +119,70 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_bench.addArgs(args);
     b.step("bench", "Run microbenchmarks").dependOn(&run_bench.step);
 }
+
+/// Compile the vendored SQLite amalgamation and attach it to `mod`.
+///
+/// SQLite stays as the persistence adapter rather than being rewritten.
+/// It is C, not Go, so it satisfies the "no Go" requirement, and Zig
+/// compiles C natively — there is no FFI boundary and no cgo-equivalent
+/// call overhead. Writing a storage engine from scratch would be weeks of
+/// work whose failure mode is losing somebody's download history, which
+/// is a bad trade against a database that ships on every phone on earth.
+/// `store/` keeps it behind the same port the Go version used, so a
+/// future Postgres adapter remains a peer rather than a rewrite.
+fn addSqlite(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const lib = b.addLibrary(.{
+        .name = "sqlite3",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    lib.root_module.addCSourceFile(.{
+        .file = b.path("c/sqlite3/sqlite3.c"),
+        .flags = &sqlite_cflags,
+    });
+    lib.root_module.addIncludePath(b.path("c/sqlite3"));
+    // The amalgamation needs a libc. This is the one place we do: the
+    // Zig code itself goes straight to syscalls, but SQLite's VFS is
+    // written against POSIX stdio and pthreads.
+    lib.root_module.link_libc = true;
+
+    mod.linkLibrary(lib);
+    mod.addIncludePath(b.path("c/sqlite3"));
+}
+
+/// Build flags, chosen for footprint and for the guarantees the store
+/// layer relies on.
+const sqlite_cflags = [_][]const u8{
+    // We use one connection per thread with an explicit mutex around
+    // writes, never one connection shared across threads, so SQLite's own
+    // per-connection mutexes are pure overhead.
+    "-DSQLITE_THREADSAFE=2",
+    // WAL is how we get concurrent readers alongside a writer.
+    "-DSQLITE_ENABLE_JSON1",
+    "-DSQLITE_DQS=0", // reject double-quoted string literals; they hide typos
+    "-DSQLITE_DEFAULT_MEMSTATUS=0",
+    "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+    "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+    "-DSQLITE_MAX_EXPR_DEPTH=0",
+    "-DSQLITE_OMIT_DEPRECATED",
+    "-DSQLITE_OMIT_SHARED_CACHE",
+    "-DSQLITE_OMIT_PROGRESS_CALLBACK",
+    "-DSQLITE_USE_ALLOCA",
+    // Everything below is a feature we never call, and each one is bytes
+    // in the image and attack surface in a process that parses files off
+    // the internet.
+    "-DSQLITE_OMIT_LOAD_EXTENSION",
+    "-DSQLITE_OMIT_AUTHORIZATION",
+    "-DSQLITE_OMIT_COMPLETE",
+    "-DSQLITE_OMIT_TCL_VARIABLE",
+    "-DSQLITE_OMIT_UTF16",
+    "-DSQLITE_UNTESTABLE",
+};

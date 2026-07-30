@@ -27,6 +27,14 @@ pub const codec = struct {
     };
 };
 
+pub const nntp = struct {
+    pub const protocol = @import("nntp/protocol.zig");
+};
+
+pub const store = struct {
+    pub const sqlite_c = @import("store/sqlite_c.zig");
+};
+
 pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
@@ -44,6 +52,8 @@ test {
     _ = codec.par2.par2;
     _ = codec.par2.rs;
     _ = codec.par2.verifier;
+    _ = nntp.protocol;
+    _ = store.sqlite_c;
     _ = posix.sys;
     _ = posix.reactor;
 }
