@@ -1665,9 +1665,9 @@ const testing = std.testing;
 
 test "every error has a message that leaks nothing" {
     const all = [_]Error{
-        error.NotFound,     error.Conflict, error.Invalid,   error.Unauthorized,
-        error.Forbidden,    error.Upstream, error.Canceled,  error.Internal,
-        error.Unavailable,  error.OutOfMemory,
+        error.NotFound,    error.Conflict,    error.Invalid,  error.Unauthorized,
+        error.Forbidden,   error.Upstream,    error.Canceled, error.Internal,
+        error.Unavailable, error.OutOfMemory,
     };
     for (all) |e| {
         const m = message(e);

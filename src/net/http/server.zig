@@ -1614,10 +1614,9 @@ test "pipelined requests are all answered, in order" {
     defer h.deinit();
 
     // Three requests in one segment, the last one closing.
-    const c = try h.exchange(gpa,
-        "GET /files/a HTTP/1.1\r\nHost: h\r\n\r\n" ++
-            "GET /files/b HTTP/1.1\r\nHost: h\r\n\r\n" ++
-            "GET /files/c HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    const c = try h.exchange(gpa, "GET /files/a HTTP/1.1\r\nHost: h\r\n\r\n" ++
+        "GET /files/b HTTP/1.1\r\nHost: h\r\n\r\n" ++
+        "GET /files/c HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
     defer c.destroy();
 
     try pumpUntil(&h.loop, 2000, c, struct {

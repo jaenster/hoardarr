@@ -1,42 +1,34 @@
 #
 # hoardarr — make targets.
 #
-# Default: `make build` produces a single-binary `./hoardarr` with the
-# frontend baked in via go:embed. This is what you run in production.
+# The build itself is `build.zig`; this file is a set of shorthands for
+# the combinations people actually type, plus the frontend step, which
+# Zig doesn't own.
 #
-# For day-to-day frontend iteration prefer `make dev` (Vite live-reload
-# on :5173 + Go daemon serving the API on :8080).
+# Default: `make build` produces a single `./hoardarr` with the frontend
+# embedded (gzipped at build time). That is what runs in production.
 #
-# Variables you can override on the command line:
-#     make build  BIN=./hoardarr.test     # change output path
-#     make build  GOFLAGS=-trimpath -ldflags='-s -w'  # release flags
+# For frontend iteration use `make dev`: Vite live-reloads on :5173 and
+# the daemon serves the API on :8085, without the embed step.
 #
 
 SHELL := /bin/bash
-BIN ?= ./hoardarr
-GOFLAGS ?=
+ZIG ?= zig
 NPM ?= npm
-GO ?= go
+BIN := zig-out/bin/hoardarr
 
-# Version metadata baked into the binary via -ldflags. VERSION is the
-# closest git tag or "dev" outside a tagged commit; COMMIT is the short
-# SHA; BUILD_DATE is RFC3339 UTC. Override any of them on the command
-# line; CI / Dockerfile builds set them explicitly.
+# Baked into the binary via -Doption. VERSION is the closest git tag, or
+# "dev" outside one; COMMIT is the short SHA; BUILD_DATE is RFC3339 UTC.
+# Override on the command line; CI and the Dockerfile set them explicitly.
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT     ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-LDFLAGS := -s -w \
-  -X main.version=$(VERSION) \
-  -X main.commit=$(COMMIT) \
-  -X main.buildDate=$(BUILD_DATE)
+STAMP := -Dversion="$(VERSION)" -Dcommit="$(COMMIT)" -Dbuild-date="$(BUILD_DATE)"
 
-# Source-listing helpers used as Make dependency targets so we only
-# re-run the corresponding step when the inputs actually change.
 FRONTEND_SRC := $(shell find frontend/src frontend/public 2>/dev/null) \
                 frontend/package.json frontend/tsconfig.json \
                 frontend/vite.config.ts frontend/index.html
-GO_SRC := $(shell find . -name '*.go' -not -path './frontend/*' 2>/dev/null) go.mod go.sum
 
 .PHONY: all
 all: build
@@ -45,11 +37,9 @@ all: build
 # Production build: frontend bundle + embedded binary.
 # ---------------------------------------------------------------------
 .PHONY: build
-build: $(BIN)
-
-$(BIN): frontend/dist/index.html $(GO_SRC)
-	@echo "==> go build (embedded) → $(BIN) ($(VERSION) $(COMMIT))"
-	@$(GO) build $(GOFLAGS) -tags embed -trimpath -ldflags="$(LDFLAGS)" -o $(BIN) ./cmd/hoardarr
+build: frontend/dist/index.html
+	@echo "==> zig build (embedded) → $(BIN) ($(VERSION) $(COMMIT))"
+	@$(ZIG) build --release=fast -Dembed-ui=true -Dstrip=true $(STAMP)
 
 frontend/dist/index.html: $(FRONTEND_SRC)
 	@echo "==> npm install (if needed)"
@@ -57,32 +47,75 @@ frontend/dist/index.html: $(FRONTEND_SRC)
 	@echo "==> npm run build"
 	@cd frontend && $(NPM) run build
 
-# ---------------------------------------------------------------------
-# Dev: assumes you run `cd frontend && npm run dev` in another terminal.
-# The Go daemon here is built WITHOUT -tags embed; the frontend is
-# served by Vite directly.
-# ---------------------------------------------------------------------
-.PHONY: dev
-dev:
-	@$(GO) run ./cmd/hoardarr serve
-
-# ---------------------------------------------------------------------
-# Tests.
-# ---------------------------------------------------------------------
-.PHONY: test
-test:
-	@$(GO) test -count=1 ./...
-
-.PHONY: race
-race:
-	@$(GO) test -count=1 -race ./...
-
-# Frontend type-check + bundle without re-running Go.
 .PHONY: frontend
 frontend: frontend/dist/index.html
 
 # ---------------------------------------------------------------------
-# Run the built binary. Builds first if stale.
+# Dev: no embed step, so the binary rebuilds in a second. Run
+# `cd frontend && npm run dev` in another terminal for the UI.
+# ---------------------------------------------------------------------
+.PHONY: dev
+dev:
+	@$(ZIG) build run -- serve
+
+# ---------------------------------------------------------------------
+# Tests.
+#
+# Both optimisation modes, because they catch different things: Debug
+# has the safety checks, ReleaseFast has the optimiser. The reactor and
+# the SIMD codecs have each had a bug that only showed up optimised.
+# ---------------------------------------------------------------------
+.PHONY: test
+test:
+	@$(ZIG) build test --summary all
+
+.PHONY: test-release
+test-release:
+	@$(ZIG) build test --release=fast --summary all
+
+.PHONY: check
+check:
+	@echo "==> type-checking every shipping target"
+	@$(ZIG) build check
+
+.PHONY: fmt
+fmt:
+	@$(ZIG) fmt src/ bench/ tools/ build.zig
+
+.PHONY: fmt-check
+fmt-check:
+	@$(ZIG) fmt --check src/ bench/ tools/ build.zig
+
+# Everything CI runs, so a green `make ci` locally means a green CI.
+.PHONY: ci
+ci: fmt-check test test-release check
+
+# ---------------------------------------------------------------------
+# Benchmarks. `bench/run.sh` also runs the Go baseline where one still
+# exists, so both columns come off the same machine.
+# ---------------------------------------------------------------------
+.PHONY: bench
+bench:
+	@$(ZIG) build bench
+
+.PHONY: bench-compare
+bench-compare:
+	@./bench/run.sh
+
+# ---------------------------------------------------------------------
+# Container. Runtime stage is `scratch`; see Dockerfile.zig for why
+# nothing else is needed in the image.
+# ---------------------------------------------------------------------
+.PHONY: docker
+docker:
+	@docker build -f Dockerfile.zig -t hoardarr:dev \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) .
+	@docker images hoardarr:dev --format '==> image size: {{.Size}}'
+
+# ---------------------------------------------------------------------
+# Run the built binary.
 # ---------------------------------------------------------------------
 .PHONY: run
 run: build
@@ -94,10 +127,4 @@ run: build
 .PHONY: clean
 clean:
 	@echo "==> removing build artifacts"
-	@rm -f $(BIN) hoardarr.new
-	@rm -rf frontend/dist
-
-.PHONY: tidy
-tidy:
-	@$(GO) mod tidy
-	@cd frontend && $(NPM) install
+	@rm -rf zig-out .zig-cache frontend/dist

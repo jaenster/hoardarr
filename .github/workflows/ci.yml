@@ -14,55 +14,54 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Pinned rather than "latest": Zig's std library still moves between
+  # minor releases, and a toolchain bump should be a commit somebody
+  # reviewed rather than something CI discovers on a Tuesday.
+  ZIG_VERSION: "0.16.0"
+
 jobs:
-  go:
-    name: go test + vet
+  test:
+    name: zig test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup go
-        uses: actions/setup-go@v5
+      - uses: mlugg/setup-zig@v2
         with:
-          go-version: "1.25"
-          check-latest: true
-          cache: true
+          version: ${{ env.ZIG_VERSION }}
 
-      - name: go mod tidy check
-        run: |
-          go mod tidy
-          if ! git diff --exit-code go.mod go.sum; then
-            echo "::error::go.mod / go.sum drifted from `go mod tidy`. Run it locally and commit."
-            exit 1
-          fi
+      - name: formatting
+        run: zig fmt --check src/ bench/ tools/ build.zig
 
-      - name: go vet
-        run: go vet ./...
+      # Both modes, deliberately. Debug catches what the safety checks
+      # catch; ReleaseFast catches what the optimiser exposes — the
+      # reactor and the SIMD codecs have each had a bug that only
+      # appeared optimised, and one TLS test that only flaked under load.
+      - name: test (Debug)
+        run: zig build test --summary all
 
-      - name: go test
-        # HOARDARR_USENET_TEST gates real-provider integration tests
-        # (env-checked at runtime; left unset on CI so they skip
-        # cleanly).
-        env:
-          HOARDARR_USENET_TEST: ""
-        run: go test -race -timeout=10m ./...
+      - name: test (ReleaseFast)
+        run: zig build test --release=fast --summary all
+
+      # The Linux-only paths — epoll, signalfd, eventfd, raw syscalls —
+      # cannot run on every host, and a backend that only one job ever
+      # compiles is a backend that breaks silently.
+      - name: type-check every shipping target
+        run: zig build check
 
   build:
-    name: make build
+    name: build + smoke
     runs-on: ubuntu-latest
-    needs: go
+    needs: test
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup go
-        uses: actions/setup-go@v5
+      - uses: mlugg/setup-zig@v2
         with:
-          go-version: "1.25"
-          check-latest: true
-          cache: true
+          version: ${{ env.ZIG_VERSION }}
 
-      - name: setup node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
@@ -74,25 +73,74 @@ jobs:
       - name: tsc + vite build
         run: cd frontend && npm run build
 
-      - name: go build (embedded)
-        # Mirror the Makefile ldflags so the smoke run reports the
-        # same identification a release build would. CI builds aren't
-        # tagged, so VERSION falls through to the "dev-<sha>" form.
+      - name: build (embedded, stripped)
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
           COMMIT=$(git rev-parse --short=12 HEAD)
           BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          go build -tags embed -trimpath \
-            -ldflags="-s -w \
-              -X main.version=${VERSION} \
-              -X main.commit=${COMMIT} \
-              -X main.buildDate=${BUILD_DATE}" \
-            -o ./hoardarr ./cmd/hoardarr
+          zig build --release=fast -Dembed-ui=true -Dstrip=true \
+            -Dversion="${VERSION}" -Dcommit="${COMMIT}" -Dbuild-date="${BUILD_DATE}"
 
-      - name: smoke run version + --help
+      - name: smoke run
         run: |
-          ./hoardarr version
-          ./hoardarr serve -h 2>&1 || true
+          ./zig-out/bin/hoardarr version
+          # Start against a scratch volume, confirm it migrates and
+          # serves, then confirm it shuts down cleanly on SIGTERM rather
+          # than having to be killed.
+          mkdir -p /tmp/ci-data
+          HOARDARR_DATA_DIR=/tmp/ci-data ./zig-out/bin/hoardarr serve &
+          PID=$!
+          for i in $(seq 100); do
+            curl -sf -m1 http://127.0.0.1:8085/healthz >/dev/null && break
+            sleep 0.1
+          done
+          curl -sf -m2 http://127.0.0.1:8085/healthz
+          curl -sf -m2 http://127.0.0.1:8085/api/v1/version
+          kill -TERM $PID
+          wait $PID
+          echo "clean shutdown, exit $?"
+
+      - name: report binary size
+        run: |
+          # Footprint is a stated goal, so surface it on every run: a
+          # regression should be visible in the log without anyone having
+          # to go looking for it.
+          ls -l zig-out/bin/hoardarr
+          echo "stripped size: $(stat -c%s zig-out/bin/hoardarr) bytes"
+
+  cross:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: build ${{ matrix.target }}
+        run: |
+          zig build --release=small -Dtarget=${{ matrix.target }} -Dstrip=true \
+            --prefix zig-out/${{ matrix.target }}
+          ls -l zig-out/${{ matrix.target }}/bin/hoardarr
+          file zig-out/${{ matrix.target }}/bin/hoardarr
+
+      - name: assert nothing reintroduced a dynamic loader
+        # Linux goes straight to syscalls and links no libc. If a change
+        # quietly reintroduces one, the binary grows by an order of
+        # magnitude and gains an interpreter — fail rather than ship it.
+        run: |
+          BIN=zig-out/${{ matrix.target }}/bin/hoardarr
+          if readelf -l "$BIN" | grep -qi 'INTERP'; then
+            echo "::error::binary has a dynamic interpreter; it must be static"
+            exit 1
+          fi
+          echo "static, no interpreter"
 
   playwright:
     name: playwright e2e
@@ -101,14 +149,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup go
-        uses: actions/setup-go@v5
+      - uses: mlugg/setup-zig@v2
         with:
-          go-version: "1.25"
-          cache: true
+          version: ${{ env.ZIG_VERSION }}
 
-      - name: setup node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
@@ -123,8 +168,7 @@ jobs:
       - name: build embedded binary
         run: |
           cd frontend && npm run build && cd ..
-          go build -tags embed -o ./hoardarr ./cmd/hoardarr
-          go build -o ./testserver-nntpd ./cmd/testserver-nntpd
+          zig build --release=fast -Dembed-ui=true
 
       - name: run playwright
         run: cd frontend && npx playwright test --reporter=line

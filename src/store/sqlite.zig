@@ -901,7 +901,6 @@ pub const string_array = struct {
 /// and the repo tests share one definition of "a database to test
 /// against", exactly as the Go tests shared `openTestDB`.
 pub const testing_support = struct {
-
     /// An in-memory connection with the shipping pragmas.
     ///
     /// `:memory:` is private per connection and this build has

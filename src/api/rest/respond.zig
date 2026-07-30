@@ -439,8 +439,10 @@ test "id parsing refuses everything that is not a plain number" {
     try testing.expectEqual(@as(?i64, 9223372036854775807), parseId("9223372036854775807"));
 
     const bad = [_][]const u8{
-        "",       "-1",   "+1",   " 1",   "1 ",       "1.0",
-        "0x10",   "abc",  "1e3",  "١٢٣", "1\x002",   "99999999999999999999",
+        "",       "-1",                   "+1",  " 1", "1 ", "1.0",
+        "0x10",   "abc",                  "1e3",
+        "١٢٣",
+        "1\x002", "99999999999999999999",
     };
     for (bad) |s| try testing.expectEqual(@as(?i64, null), parseId(s));
 }

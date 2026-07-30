@@ -235,11 +235,11 @@ test "every table the repos query exists after migration" {
     defer conn.close();
 
     for ([_][]const u8{
-        "outbox",         "outbox_subs", "servers",   "categories",
-        "jobs",           "files",       "segments",  "par2_sets",
-        "users",          "sessions",    "deliveries", "extracts",
-        "repairs",        "subscriptions", "scheduled_tasks",
-        "settings",       "commands",    "speed_history",
+        "outbox",   "outbox_subs",   "servers",         "categories",
+        "jobs",     "files",         "segments",        "par2_sets",
+        "users",    "sessions",      "deliveries",      "extracts",
+        "repairs",  "subscriptions", "scheduled_tasks", "settings",
+        "commands", "speed_history",
     }) |name| {
         const n = try conn.scalarInt(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
