@@ -150,18 +150,31 @@ Hostnames resolve, through our own DNS client.
 
 ### Still missing
 
-* **PAR2 repair is a stub.** `pipeline.Repairer` returns `UnrecoverableSet`,
-  so `RepairNeeded` goes straight to `repair.failed` and never `RepairOK`.
-  The Reed-Solomon reconstruct and the verifier exist and are tested;
-  nothing calls them. A damaged release is not repaired — which on Usenet is
-  the normal case, not an edge one.
-* **Notify never fires.** `Transport.post` blocks and its retry path
-  *sleeps*, neither of which can run on the loop, so nothing is subscribed.
-  The webhook, Discord and Slack senders are complete and tested but never
-  called.
-* **Verify and extract run inline on the reactor thread.** Hashing or
-  decompressing a large release stalls HTTP and every other job for the
-  duration.
+* **Job enrichment in notifications** — `jobs = null`, so a webhook payload
+  carries the event but not the job's details.
+* **The Settings "Test" button** answers 503. Its port is a synchronous
+  `bool`, which a fiber cannot answer; the underlying probe works and is
+  wired for `POST /servers/test`.
+* **`health` and `disk` REST ports.** `disk` needs `statfs`, which belongs
+  in the syscall layer rather than being reproduced per-platform in
+  bootstrap. Each is asserted null in a test, so wiring one without deleting
+  its excuse fails the build.
+
+### Trade-offs taken, and what they cost
+
+* **The outbox row settles when a stage is queued, not when it finishes.**
+  So a crash between the hand-off and the stage's own commit loses that
+  redelivery. The justification is that stages are idempotent — but
+  idempotency only helps if something *re-triggers* the stage, and
+  `Runtime.start` re-admits jobs that need **downloading**, not ones parked
+  at `download_complete`. The e2e suite has been asked to prove a crash in
+  that window recovers; **until it does, treat this as an open question
+  rather than a settled trade.**
+* **Shutdown joins the worker pool**, so stopping during a large
+  verification waits it out. Abandoning the thread would be a use-after-free
+  on a `munmap`'d stack.
+* **Repair does not attempt a partial fix** when the solve is singular, and
+  does not rewrite the `.par2` files themselves.
 
 Three REST ports remain null, each asserted so in a test — wiring one
 without deleting its excuse fails the build: `health` (no service in the app
