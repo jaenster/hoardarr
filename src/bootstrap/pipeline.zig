@@ -23,20 +23,23 @@
 //! file operations run synchronously on the calling thread. It is the
 //! narrowest thing that satisfies the codecs' signature.
 //!
-//! ## What runs on the loop thread, and what that costs
+//! ## What runs where
 //!
-//! These four services run inline in their bus handler, on the reactor
-//! thread. Verification hashes every byte of the release and extraction
-//! decompresses it, so a large job stalls the event loop for as long as
-//! that takes: the HTTP surface stops answering and other downloads stop
-//! progressing.
+//! These services used to run inline in their bus handler, on the reactor
+//! thread — which meant that verification hashing every byte of a release
+//! and extraction decompressing it stalled the event loop for as long as
+//! that took: no HTTP, no SSE, no other download.
 //!
-//! That is a real limitation and it is stated here rather than hidden.
-//! The alternative — a worker thread — would need its own `*sqlite.Conn`
-//! and a hand-off for every state transition, and neither the services
-//! nor the aggregates are written for it. The shape that fixes it
-//! properly is a fiber whose hashing loop yields every few megabytes,
-//! which is a change to `codec/par2`'s reader rather than to this file.
+//! They now run on a fiber, with their CPU handed to a worker pool. See
+//! `bootstrap/offload.zig`, which owns both halves and states what it
+//! costs. The split is visible here as the `Work` struct each adapter
+//! carries: everything the codec needs in, everything it produced out,
+//! and no pointer to anything single-threaded — because that struct is
+//! the only thing a worker thread ever touches.
+//!
+//! A null `stages` on any adapter keeps it exactly as it was: called on
+//! whichever thread called the port. That is what a test driving a
+//! service directly gets, and it is why none of them needed changing.
 
 const std = @import("std");
 
@@ -59,6 +62,8 @@ const drepair = @import("../domain/repair.zig");
 const dextract = @import("../domain/extract.zig");
 const ddeliver = @import("../domain/deliver.zig");
 
+const offload_mod = @import("offload.zig");
+
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -66,12 +71,52 @@ const Io = std.Io;
 ///
 /// `init_single_threaded` is a comptime-constructed value: no thread
 /// pool, no allocator, `deinit` not required. Every call through it is a
-/// direct syscall on whichever thread made it, which for this daemon is
-/// always the loop thread.
+/// direct syscall on whichever thread made it — which since the hashers
+/// moved off the reactor is either the loop thread or the one worker
+/// running the single in-flight stage, never both at once. That
+/// serialisation is `offload.Stages`'s, not this value's: it holds no
+/// state to race over, but nothing here would notice if it did.
 pub var io_impl: Io.Threaded = .init_single_threaded;
 
 pub fn io() Io {
     return io_impl.io();
+}
+
+/// Run `f(w)` on a worker thread when there is a stage fiber to park,
+/// and inline when there is not.
+///
+/// Returns false only when the pool cancelled the task — shutdown, in
+/// other words — in which case `w` holds nothing and the caller must not
+/// pretend it does. `Unavailable` (no pool wired, or its queue is full)
+/// falls back to running inline, which is what a build without threads
+/// does for everything.
+///
+/// `w` lives on the stage fiber's stack and the worker writes through
+/// it; see `offload.zig` on why that makes the shutdown ordering
+/// load-bearing.
+fn onWorker(
+    stages: ?*offload_mod.Stages,
+    comptime T: type,
+    w: *T,
+    comptime f: fn (*T) void,
+) bool {
+    const s = stages orelse {
+        f(w);
+        return true;
+    };
+    const run = s.current() orelse {
+        f(w);
+        return true;
+    };
+    offload_mod.offload(T, run, w, f) catch |e| switch (e) {
+        error.Unavailable => {
+            f(w);
+            return true;
+        },
+        // Hashing a release during teardown would only delay it.
+        error.Canceled => return false,
+    };
+    return true;
 }
 
 // =====================================================================
@@ -82,10 +127,37 @@ pub fn io() Io {
 pub const Verifier = struct {
     gpa: Allocator,
     logger: *log.Logger = &log.default,
+    /// Where the MD5 and CRC of every byte of the release actually run.
+    /// Null keeps it on the calling thread, which is what a test that
+    /// drives the service directly wants and what the daemon did before
+    /// `offload.zig` existed.
+    stages: ?*offload_mod.Stages = null,
 
     pub fn port(self: *Verifier) verify_app.Verifier {
         return .{ .ctx = @ptrCast(self), .verifyFn = &doVerify };
     }
+
+    /// The CPU half, in the shape a worker can be handed: everything in,
+    /// everything out, no pointer into anything single-threaded.
+    ///
+    /// `a` is the service's per-run arena. Only this task allocates from
+    /// it while the task is in flight — the stage fiber that owns it is
+    /// parked — so the arena is single-user throughout even though the
+    /// user changed threads.
+    const Work = struct {
+        a: Allocator,
+        par2_paths: []const []const u8,
+        files: []par2_verifier.DataFile,
+        result: ?par2_verifier.Result = null,
+        err: ?anyerror = null,
+
+        fn body(w: *Work) void {
+            w.result = par2_verifier.verify(w.a, io(), Io.Dir.cwd(), w.par2_paths, w.files) catch |e| {
+                w.err = e;
+                return;
+            };
+        }
+    };
 
     fn doVerify(
         ctx: *anyopaque,
@@ -101,7 +173,11 @@ pub const Verifier = struct {
         // `a` is the service's per-run arena, so the parsed set and the
         // result share its lifetime and nothing here has to be freed on
         // the error paths.
-        const result = par2_verifier.verify(a, io(), Io.Dir.cwd(), par2_paths, files) catch |e| {
+        var work: Work = .{ .a = a, .par2_paths = par2_paths, .files = files };
+        if (!onWorker(self.stages, Work, &work, Work.body)) return error.Malformed;
+
+        const result = work.result orelse {
+            const e = work.err orelse error.Unexpected;
             self.logger.warn("par2: verification could not run", &.{log.errv("err", e)});
             return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -139,10 +215,29 @@ pub const Verifier = struct {
 /// jobs terminal that were one download away from repairing.
 pub const Repairer = struct {
     logger: *log.Logger = &log.default,
+    /// Reed-Solomon reconstruction is the heaviest arithmetic in the
+    /// tree. Same treatment as verification: off the reactor thread when
+    /// there is a stage fiber to park.
+    stages: ?*offload_mod.Stages = null,
 
     pub fn port(self: *Repairer) repair_app.Repairer {
         return .{ .ctx = @ptrCast(self), .repairFn = &doRepair };
     }
+
+    const Work = struct {
+        a: Allocator,
+        par2_paths: []const []const u8,
+        files: []par2_repair.DataFile,
+        result: ?par2_repair.Result = null,
+        err: ?anyerror = null,
+
+        fn body(w: *Work) void {
+            w.result = par2_repair.repair(w.a, io(), Io.Dir.cwd(), w.par2_paths, w.files) catch |e| {
+                w.err = e;
+                return;
+            };
+        }
+    };
 
     fn doRepair(
         ctx: *anyopaque,
@@ -157,7 +252,11 @@ pub const Repairer = struct {
 
         // `a` is the service's per-run arena, so nothing below has to be
         // freed on any path out of here.
-        const result = par2_repair.repair(a, io(), Io.Dir.cwd(), par2_paths, files) catch |e| {
+        var work: Work = .{ .a = a, .par2_paths = par2_paths, .files = files };
+        if (!onWorker(self.stages, Work, &work, Work.body)) return error.Malformed;
+
+        const result = work.result orelse {
+            const e = work.err orelse error.Unexpected;
             self.logger.warn("par2: reconstruction could not run", &.{
                 log.errv("err", e),
                 log.uint("par2_files", par2_paths.len),
@@ -208,10 +307,40 @@ pub const Repairer = struct {
 pub const Extractor = struct {
     gpa: Allocator,
     logger: *log.Logger = &log.default,
+    /// Decompression is the other thing that used to stop the daemon for
+    /// minutes. Same offload as verification.
+    stages: ?*offload_mod.Stages = null,
 
     pub fn port(self: *Extractor) extract_app.Extractor {
         return .{ .ctx = @ptrCast(self), .extractFn = &doExtract };
     }
+
+    /// Note the allocator: `rar_extract.extract` is handed the process
+    /// `gpa`, not a per-run arena, and it runs on a worker. That is only
+    /// safe because the daemon's allocator is thread-safe (a
+    /// `DebugAllocator` in debug builds, the page allocator in release)
+    /// and because exactly one stage is in flight at a time.
+    const Work = struct {
+        gpa: Allocator,
+        rar_paths: []const []const u8,
+        target_dir: []const u8,
+        count: usize = 0,
+        err: ?anyerror = null,
+        ok: bool = false,
+
+        fn body(w: *Work) void {
+            var result = rar_extract.extract(w.gpa, io(), Io.Dir.cwd(), .{
+                .archive_paths = w.rar_paths,
+                .target_dir = w.target_dir,
+            }) catch |e| {
+                w.err = e;
+                return;
+            };
+            defer result.deinit();
+            w.count = result.files.len;
+            w.ok = true;
+        }
+    };
 
     fn doExtract(
         ctx: *anyopaque,
@@ -222,15 +351,19 @@ pub const Extractor = struct {
         const self: *Extractor = @ptrCast(@alignCast(ctx));
         _ = a;
 
-        var result = rar_extract.extract(self.gpa, io(), Io.Dir.cwd(), .{
-            .archive_paths = rar_paths,
+        var work: Work = .{
+            .gpa = self.gpa,
+            .rar_paths = rar_paths,
             .target_dir = target_dir,
-        }) catch |e| {
+        };
+        if (!onWorker(self.stages, Work, &work, Work.body)) return error.Io;
+
+        if (!work.ok) {
+            const e = work.err orelse error.Unexpected;
             self.logger.warn("rar: extraction failed", &.{log.errv("err", e)});
             return mapExtractError(e);
-        };
-        defer result.deinit();
-        return result.files.len;
+        }
+        return work.count;
     }
 
     /// The four outcomes the service distinguishes. Everything else is

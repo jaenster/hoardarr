@@ -101,6 +101,7 @@ const rest_ports = @import("bootstrap/rest.zig");
 const sab_ports = @import("bootstrap/sab.zig");
 const files = @import("bootstrap/files.zig");
 const pipeline = @import("bootstrap/pipeline.zig");
+const offload_mod = @import("bootstrap/offload.zig");
 const runtime_mod = @import("bootstrap/runtime.zig");
 
 const Allocator = std.mem.Allocator;
@@ -216,6 +217,12 @@ pub const App = struct {
     engine: runtime_mod.Runtime = undefined,
     engine_ready: bool = false,
     probe: runtime_mod.Probe = undefined,
+    notifier: pipeline.Notifier = undefined,
+    notifier_ready: bool = false,
+    /// Runs the post-download stages on a fiber with their CPU on a
+    /// worker pool. See `bootstrap/offload.zig`.
+    stages: offload_mod.Stages = undefined,
+    stages_ready: bool = false,
 
     // -- REST ports ----------------------------------------------------
 
@@ -275,6 +282,23 @@ pub const App = struct {
         // — which needs the database, the bus and the loop still alive.
         // Freeing a parked fiber instead, or closing the sockets first,
         // is a leak and a use-after-free respectively.
+        // Before everything else in the graph: a stage fiber may be
+        // parked on a worker that is writing into its stack, so the pool
+        // has to be joined before anything that stack points at goes
+        // away. `Stages.deinit` owns that ordering.
+        if (self.stages_ready) {
+            self.stages.deinit();
+            self.stages_ready = false;
+        }
+
+        // Before the engine, because a delivery in flight is parked on a
+        // socket the loop owns and holds a subscription list read through
+        // the database — both of which are still alive at this point, and
+        // neither of which would be a step later.
+        if (self.notifier_ready) {
+            self.notifier.deinit();
+            self.notifier_ready = false;
+        }
         if (self.engine_ready) {
             self.engine.deinit();
             self.engine_ready = false;
@@ -477,9 +501,17 @@ pub const App = struct {
         self.extract_store = .{ .gpa = gpa, .conn = self.db };
         self.deliver_store = .{ .gpa = gpa, .conn = self.db };
 
-        self.verifier = .{ .gpa = gpa, .logger = &log.default };
-        self.repairer = .{ .logger = &log.default };
-        self.extractor = .{ .gpa = gpa, .logger = &log.default };
+        self.stages = .{
+            .gpa = gpa,
+            .loop = &self.loop,
+            .ctx = @ptrCast(self),
+            .bodyFn = &runStageBody,
+        };
+        self.stages_ready = true;
+
+        self.verifier = .{ .gpa = gpa, .logger = &log.default, .stages = &self.stages };
+        self.repairer = .{ .logger = &log.default, .stages = &self.stages };
+        self.extractor = .{ .gpa = gpa, .logger = &log.default, .stages = &self.stages };
 
         self.verify_service = .{
             .gpa = gpa,
@@ -585,6 +617,17 @@ pub const App = struct {
         // reloading them: a `CaStore` is memory with no loop affinity,
         // and the engine is what owns its lifetime.
         self.probe = .{ .gpa = gpa, .ca_roots = &self.engine.ca_roots };
+
+        // Same anchors again for the notifier: an `https://` webhook is
+        // verified against exactly what a TLS provider is.
+        self.notifier = .{
+            .gpa = gpa,
+            .loop = &self.loop,
+            .db = self.db,
+            .resolver = &self.resolver,
+            .ca = &self.engine.ca_roots.store,
+        };
+        self.notifier_ready = true;
 
         // ---- REST ports ----
         self.p_queue = .{
@@ -696,6 +739,10 @@ pub const App = struct {
     /// published by the sweep is lost — an `outbox_subs` row is only
     /// written for a subscription that already exists. The sweep last.
     pub fn startEngine(self: *App) !void {
+        // Threads before subscribers: a stage queued by the sweep below
+        // must find somewhere to put its hashing rather than falling back
+        // to the reactor thread.
+        try self.stages.start(.{});
         try self.engine.loadPools();
         try self.subscribePipeline();
         try self.engine.start();
@@ -729,6 +776,11 @@ pub const App = struct {
             .{ .name = "deliver.on_verify_ok", .topic = "verify.ok", .handler = &onDeliver },
         };
         for (table) |s| try self.engine.subscribe(s.name, s.topic, s.handler, @ptrCast(self));
+
+        // Notify comes last and subscribes to the *outcome* topics the
+        // five above publish, so a webhook fires on what the pipeline
+        // decided rather than on what it was asked to do.
+        try self.notifier.subscribeAll(&self.engine);
     }
 
     /// Mirror the resolved API key into the settings table when it has
@@ -793,17 +845,23 @@ pub const App = struct {
 // retry-and-park machinery rather than losing it, which is why none of
 // them swallow an error.
 
-fn runStage(
-    ctx: ?*anyopaque,
-    env: outbox.Envelope,
-    who: []const u8,
-    comptime body: fn (app: *App, id: i64) anyerror!void,
-) outbox.HandlerResult {
+/// Queue one stage and return.
+///
+/// The handler no longer *runs* the stage: verification hashes every byte
+/// of the release and extraction decompresses it, and doing that here
+/// held the reactor thread for as long as it took — no HTTP, no SSE, no
+/// other download. `offload.Stages` runs it on a fiber with the CPU on a
+/// worker pool instead, and that file's module comment states what
+/// settling the outbox row at hand-off rather than at completion costs.
+///
+/// A refusal is still reported, because a stage that was never queued is
+/// one the bus should hold on to and offer again.
+fn runStage(ctx: ?*anyopaque, env: outbox.Envelope, stage: offload_mod.Stage) outbox.HandlerResult {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     const id = runtime_mod.aggregateJobId(env) orelse return .{ .failed = "no job id in the event" };
-    body(app, id) catch |err| {
-        log.err("pipeline stage failed", &.{
-            log.str("stage", who),
+    app.stages.enqueue(stage, id) catch |err| {
+        log.err("pipeline stage could not be queued", &.{
+            log.str("stage", stage.text()),
             log.int("job_id", id),
             log.str("error", @errorName(err)),
         });
@@ -812,44 +870,37 @@ fn runStage(
     return .ok;
 }
 
+/// The stage bodies, run on the stage fiber. One switch rather than five
+/// closures, because `offload.Stages` dispatches on a value.
+fn runStageBody(ctx: *anyopaque, stage: offload_mod.Stage, id: i64) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    switch (stage) {
+        .verify => _ = try app.verify_service.run(id),
+        .reverify => _ = try app.verify_service.onRepairOk(id),
+        .repair => _ = try app.repair_service.run(id),
+        .extract => _ = try app.extract_service.run(id),
+        .deliver => _ = try app.deliver_service.run(id),
+    }
+}
+
 fn onVerify(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
-    return runStage(ctx, env, "verify", struct {
-        fn run(app: *App, id: i64) anyerror!void {
-            _ = try app.verify_service.run(id);
-        }
-    }.run);
+    return runStage(ctx, env, .verify);
 }
 
 fn onReverify(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
-    return runStage(ctx, env, "verify-after-repair", struct {
-        fn run(app: *App, id: i64) anyerror!void {
-            _ = try app.verify_service.onRepairOk(id);
-        }
-    }.run);
+    return runStage(ctx, env, .reverify);
 }
 
 fn onRepair(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
-    return runStage(ctx, env, "repair", struct {
-        fn run(app: *App, id: i64) anyerror!void {
-            _ = try app.repair_service.run(id);
-        }
-    }.run);
+    return runStage(ctx, env, .repair);
 }
 
 fn onExtract(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
-    return runStage(ctx, env, "extract", struct {
-        fn run(app: *App, id: i64) anyerror!void {
-            _ = try app.extract_service.run(id);
-        }
-    }.run);
+    return runStage(ctx, env, .extract);
 }
 
 fn onDeliver(ctx: ?*anyopaque, env: outbox.Envelope) outbox.HandlerResult {
-    return runStage(ctx, env, "deliver", struct {
-        fn run(app: *App, id: i64) anyerror!void {
-            _ = try app.deliver_service.run(id);
-        }
-    }.run);
+    return runStage(ctx, env, .deliver);
 }
 
 /// `byte_accounter.ServerByteStore` over the servers table.

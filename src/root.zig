@@ -26,6 +26,7 @@ pub const wiring = struct {
     pub const runtime = @import("bootstrap/runtime.zig");
     pub const pipeline = @import("bootstrap/pipeline.zig");
     pub const notify = @import("bootstrap/notify.zig");
+    pub const offload = @import("bootstrap/offload.zig");
     pub const wiring_test = @import("bootstrap/wiring_test.zig");
     pub const download_test = @import("bootstrap/download_test.zig");
 };
@@ -224,6 +225,10 @@ pub const e2e = struct {
     pub const speed_test = @import("e2e/speed_test.zig");
     pub const server_edit_test = @import("e2e/server_edit_test.zig");
     pub const crash_recovery_test = @import("e2e/crash_recovery_test.zig");
+    pub const pipeline_test = @import("e2e/pipeline_test.zig");
+    pub const lifecycle_test = @import("e2e/lifecycle_test.zig");
+    pub const repair_test = @import("e2e/repair_test.zig");
+    pub const multiserver_test = @import("e2e/multiserver_test.zig");
 };
 
 pub const posix = struct {
@@ -245,6 +250,7 @@ test {
     _ = wiring.runtime;
     _ = wiring.pipeline;
     _ = wiring.notify;
+    _ = wiring.offload;
     _ = wiring.wiring_test;
     _ = wiring.download_test;
     _ = core.crc32;
@@ -381,6 +387,10 @@ test {
     _ = e2e.speed_test;
     _ = e2e.server_edit_test;
     _ = e2e.crash_recovery_test;
+    _ = e2e.pipeline_test;
+    _ = e2e.lifecycle_test;
+    _ = e2e.repair_test;
+    _ = e2e.multiserver_test;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;
