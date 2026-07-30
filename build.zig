@@ -118,7 +118,9 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "hoardarr", .module = hoardarr_fast }},
         }),
     });
-    b.installArtifact(bench);
+    // Deliberately not installArtifact: the default `zig build` is a
+    // product build, and the container image doesn't ship bench/ at all.
+    // `zig build bench` still builds and runs it on demand.
     const run_bench = b.addRunArtifact(bench);
     if (b.args) |args| run_bench.addArgs(args);
     b.step("bench", "Run microbenchmarks").dependOn(&run_bench.step);

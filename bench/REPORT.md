@@ -123,14 +123,39 @@ nothing. A 100 ms "check for work" loop — the usual arrangement — wakes
 
 ## Footprint
 
-| | Go | Zig |
-|-|-|-|
-| Binary, stripped, static x86_64-linux | — | **233 KB** |
-| libc | — | none — raw syscalls |
-| Dynamic loader | — | none — static |
+Both images built from this repo with `docker build`, same machine, both
+embedding the frontend bundle:
 
-The Go binary is not measured here yet because the comparison is only
-meaningful once the Zig build embeds the frontend, as the Go one does.
+| | Go | Zig | |
+|-|-|-|-|
+| **Container image** | **38.8 MB** | **429 kB** | **90× smaller** |
+| Base image | `alpine:3.20` | `scratch` | |
+| Binary, stripped, static | — | 233 KB (no UI) | |
+| libc | musl, in the image | none — raw syscalls | |
+| Dynamic loader | present | none — static | |
+| Shell in image | yes (`/bin/sh`) | no | |
+
+Verified running: `docker run --rm hoardarr:zig version` prints
+`reactor backend: epoll`, so the Linux backend really is the one active in
+the container rather than the `poll` fallback the macOS tests exercise.
+
+Almost all of the 38 MB the Go image spends is base layer, not program.
+The Zig runtime stage is `scratch` because nothing the alpine base provided
+is needed any more:
+
+* **No libc.** Linux goes straight to syscalls, so there is no dynamic
+  loader and nothing to link at runtime. Only the vendored SQLite wants a
+  libc, and musl is linked statically into the binary.
+* **No `su-exec` and no shell.** Dropping to `PUID:PGID` was the
+  entrypoint shim's job; we call `setgid`/`setgroups`/`setuid` in-process
+  before starting the reactor.
+* **No `ca-certificates`.** The CA bundle is compiled into the binary, so
+  TLS to a provider does not depend on a file existing.
+* **No `tzdata`.** Timestamps are stored and logged in UTC and rendered in
+  the browser's zone, which is where a user's timezone actually lives.
+* **No frontend directory.** The bundle is embedded, gzipped at level 9 at
+  build time — 318 KB of assets become 92 KB, and the daemon never runs a
+  compressor.
 
 233 KB with no libc is the result of two decisions. Linux uses raw
 syscalls via `std.os.linux` instead of libc, so there is no dynamic
@@ -147,6 +172,5 @@ These are in the goal and still owed:
 
 - HTTP requests/s on `/api/queue`
 - Resident memory at idle, Go vs Zig
-- Container image size, Go vs Zig
 - Cold start to first served request
 - `epoll` numbers from a Linux host, alongside the `poll` ones above
