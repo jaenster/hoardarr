@@ -39,3 +39,7 @@ config.local.yaml
 # skips gracefully when these are absent; copy from the live host
 # (e.g. `scp opslagbeest:/path/to/file.tmp testdata/...`) to repro.
 /testdata/repair-bug-job38/
+
+# Zig
+.zig-cache/
+zig-out/
