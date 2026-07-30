@@ -1073,11 +1073,16 @@ test "the transport reader reassembles a payload delivered one byte at a time" {
     try testing.expectEqual(payload.len, body.n);
     try testing.expectEqualStrings(payload, &body.got);
     // The whole point: it got there by parking, not by blocking the loop.
-    // The whole point: it got there by parking, not by blocking the loop.
-    // The exact count depends on how the kernel interleaves the two ends —
-    // it measured 108 for 400 bytes here — so this asserts "many", not a
-    // number.
-    try testing.expect(session.transport.read_parks > 50);
+    //
+    // Only ">= 1" is asserted, deliberately. The park count is a function of
+    // how the kernel interleaves the two ends: under a lightly loaded run
+    // it measured 108 for these 400 bytes, but when the rest of the suite is
+    // competing for the CPU the peer's writes accumulate in the socket
+    // buffer before the reader is scheduled, several trickled bytes are
+    // coalesced into one read, and the count collapses. An earlier "> 50"
+    // here was flaky in the full suite for exactly that reason. One park
+    // proves the mechanism; the count would only be measuring the scheduler.
+    try testing.expect(session.transport.read_parks >= 1);
     try testing.expectEqual(@as(u64, payload.len), session.transport.bytes_in);
 }
 

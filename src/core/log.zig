@@ -963,7 +963,7 @@ pub const FileWriter = struct {
         self.* = .{ .opts = opts };
         @memcpy(self.dir_buf[0..dir.len], dir);
         self.dir_len = dir.len;
-        try mkdirPath(self.dirSlice());
+        try sys.mkdirPath(self.dirSlice());
         try self.openActive();
     }
 
@@ -988,8 +988,8 @@ pub const FileWriter = struct {
         // O_APPEND is what makes concurrent writers (us plus, say, a
         // sidecar) safe at the kernel level: each write is positioned
         // at the current end atomically.
-        self.fd = try openFile(p, .{ .create = true, .append = true });
-        self.written = try fileSize(self.fd);
+        self.fd = try sys.open(p, .{ .mode = .write_only, .create = true, .append = true });
+        self.written = try sys.fileSize(self.fd);
         self.opened_on = dateOf(self.opts.clock());
     }
 
@@ -1032,7 +1032,7 @@ pub const FileWriter = struct {
         };
         const src = try self.joinZ(&from, self.opts.active_name);
         const dst = try self.joinZ(&to, target);
-        renameFile(src, dst) catch {};
+        sys.rename(src, dst) catch {};
         self.pruneOld();
         try self.openActive();
     }
@@ -1074,7 +1074,7 @@ pub const FileWriter = struct {
 
             var probe: [path_max]u8 = undefined;
             const full = try self.joinZ(&probe, candidate);
-            if (!pathExists(full)) return candidate;
+            if (!sys.exists(full)) return candidate;
         }
         return error.NameTooLong;
     }
@@ -1087,7 +1087,7 @@ pub const FileWriter = struct {
         var lens: [prune_scan_max]u8 = undefined;
         var n: usize = 0;
 
-        var it = DirIter.open(self.dirSlice()) catch return;
+        var it = sys.DirIter.open(self.dirSlice()) catch return;
         defer it.close();
         while (it.next()) |entry| {
             if (n == prune_scan_max) break;
@@ -1120,7 +1120,7 @@ pub const FileWriter = struct {
         for (order[0..drop]) |idx| {
             var path: [path_max]u8 = undefined;
             const p = self.joinZ(&path, names[idx][0..lens[idx]]) catch continue;
-            unlinkFile(p) catch {};
+            sys.unlink(p) catch {};
         }
     }
 
@@ -1161,239 +1161,6 @@ pub fn safeName(name: []const u8, opts: FileWriter.Options) bool {
 // ---------------------------------------------------------------------
 
 const linux = std.os.linux;
-
-const O = if (sys.is_linux) linux.O else std.c.O;
-
-/// `sys.Error` covers errno but not our own path-length limit.
-pub const PathError = error{NameTooLong} || sys.Error;
-
-fn errnoOf(rc: usize) sys.E {
-    return linux.errno(rc);
-}
-
-const OpenFlags = struct {
-    create: bool = false,
-    append: bool = false,
-    directory: bool = false,
-};
-
-fn openFile(path: [:0]const u8, flags: OpenFlags) sys.Error!sys.Fd {
-    while (true) {
-        if (sys.is_linux) {
-            var o: O = .{ .CLOEXEC = true };
-            if (flags.directory) {
-                o.ACCMODE = .RDONLY;
-                o.DIRECTORY = true;
-            } else {
-                o.ACCMODE = .WRONLY;
-                o.CREAT = flags.create;
-                o.APPEND = flags.append;
-            }
-            const rc = linux.open(path.ptr, o, 0o644);
-            switch (errnoOf(rc)) {
-                .SUCCESS => return @intCast(rc),
-                .INTR => continue,
-                else => |e| return sys.mapError(e),
-            }
-        } else {
-            var o: O = .{ .CLOEXEC = true };
-            if (flags.directory) {
-                o.ACCMODE = .RDONLY;
-                o.DIRECTORY = true;
-            } else {
-                o.ACCMODE = .WRONLY;
-                o.CREAT = flags.create;
-                o.APPEND = flags.append;
-            }
-            const rc = std.c.open(path.ptr, o, @as(c_uint, 0o644));
-            if (rc >= 0) return rc;
-            const e = cErrno();
-            if (e == .INTR) continue;
-            return sys.mapError(e);
-        }
-    }
-}
-
-fn cErrno() sys.E {
-    return @enumFromInt(std.c._errno().*);
-}
-
-fn fileSize(fd: sys.Fd) sys.Error!u64 {
-    // lseek to END rather than fstat: one syscall, no `struct stat`
-    // layout differences between Linux and Darwin to reproduce, and the
-    // fd is O_APPEND so the offset is meaningless for writing anyway.
-    if (sys.is_linux) {
-        const SEEK_END: usize = 2;
-        const rc = linux.lseek(fd, 0, SEEK_END);
-        switch (errnoOf(rc)) {
-            .SUCCESS => return @intCast(rc),
-            else => |e| return sys.mapError(e),
-        }
-    }
-    const rc = std.c.lseek(fd, 0, @as(std.c.whence_t, 2));
-    if (rc < 0) return sys.mapError(cErrno());
-    return @intCast(rc);
-}
-
-fn pathExists(path: [:0]const u8) bool {
-    if (sys.is_linux) {
-        const F_OK: u32 = 0;
-        return errnoOf(linux.access(path.ptr, F_OK)) == .SUCCESS;
-    }
-    return std.c.access(path.ptr, 0) == 0;
-}
-
-fn renameFile(from: [:0]const u8, to: [:0]const u8) sys.Error!void {
-    if (sys.is_linux) {
-        const rc = linux.rename(from.ptr, to.ptr);
-        switch (errnoOf(rc)) {
-            .SUCCESS => return,
-            else => |e| return sys.mapError(e),
-        }
-    }
-    if (std.c.rename(from.ptr, to.ptr) != 0) return sys.mapError(cErrno());
-}
-
-fn unlinkFile(path: [:0]const u8) sys.Error!void {
-    if (sys.is_linux) {
-        const rc = linux.unlink(path.ptr);
-        switch (errnoOf(rc)) {
-            .SUCCESS => return,
-            else => |e| return sys.mapError(e),
-        }
-    }
-    if (std.c.unlink(path.ptr) != 0) return sys.mapError(cErrno());
-}
-
-fn mkdirOne(path: [:0]const u8) sys.Error!void {
-    if (sys.is_linux) {
-        const rc = linux.mkdir(path.ptr, 0o755);
-        switch (errnoOf(rc)) {
-            .SUCCESS, .EXIST => return,
-            else => |e| return sys.mapError(e),
-        }
-    } else {
-        if (std.c.mkdir(path.ptr, 0o755) == 0) return;
-        const e = cErrno();
-        if (e == .EXIST) return;
-        return sys.mapError(e);
-    }
-}
-
-/// `mkdir -p`. Walks the path creating each component; the log
-/// directory is `<data_dir>/logs` and neither level is guaranteed to
-/// exist on a fresh volume.
-fn mkdirPath(dir: []const u8) PathError!void {
-    var buf: [path_max]u8 = undefined;
-    if (dir.len + 1 > path_max) return error.NameTooLong;
-    @memcpy(buf[0..dir.len], dir);
-    buf[dir.len] = 0;
-
-    var i: usize = if (dir[0] == '/') 1 else 0;
-    while (i < dir.len) : (i += 1) {
-        if (buf[i] != '/') continue;
-        buf[i] = 0;
-        // Intermediate failures are ignored: a component may already
-        // exist in a form we cannot stat but can still traverse. Only
-        // the final mkdir has to succeed.
-        mkdirOne(buf[0..i :0]) catch {};
-        buf[i] = '/';
-    }
-    try mkdirOne(buf[0..dir.len :0]);
-}
-
-/// Directory iteration. Linux uses `getdents64`; Darwin uses
-/// `getdirentries` with its own `dirent` layout (16-bit `namlen`
-/// instead of a NUL-terminated name).
-const DirIter = struct {
-    fd: sys.Fd,
-    buf: [4096]u8 align(8) = undefined,
-    index: usize = 0,
-    end: usize = 0,
-    seek: i64 = 0,
-    done: bool = false,
-
-    fn open(dir: []const u8) PathError!DirIter {
-        var buf: [path_max]u8 = undefined;
-        if (dir.len + 1 > path_max) return error.NameTooLong;
-        @memcpy(buf[0..dir.len], dir);
-        buf[dir.len] = 0;
-        const fd = try openFile(buf[0..dir.len :0], .{ .directory = true });
-        return .{ .fd = fd };
-    }
-
-    fn close(self: *DirIter) void {
-        sys.close(self.fd);
-        self.fd = sys.invalid_fd;
-    }
-
-    fn refill(self: *DirIter) bool {
-        if (self.done) return false;
-        while (true) {
-            const n: usize = if (sys.is_linux) blk: {
-                const rc = linux.getdents64(self.fd, &self.buf, self.buf.len);
-                switch (errnoOf(rc)) {
-                    .SUCCESS => break :blk @intCast(rc),
-                    .INTR => continue,
-                    else => {
-                        self.done = true;
-                        return false;
-                    },
-                }
-            } else blk: {
-                const rc = std.c.getdirentries(self.fd, &self.buf, self.buf.len, &self.seek);
-                if (rc < 0) {
-                    if (cErrno() == .INTR) continue;
-                    self.done = true;
-                    return false;
-                }
-                break :blk @intCast(rc);
-            };
-            if (n == 0) {
-                self.done = true;
-                return false;
-            }
-            self.index = 0;
-            self.end = n;
-            return true;
-        }
-    }
-
-    /// Returns a name borrowed from the internal buffer, valid until
-    /// the next `next()` call.
-    fn next(self: *DirIter) ?[]const u8 {
-        while (true) {
-            if (self.index >= self.end) {
-                if (!self.refill()) return null;
-            }
-            if (sys.is_linux) {
-                const e: *align(1) const linux.dirent64 = @ptrCast(&self.buf[self.index]);
-                if (e.reclen == 0) {
-                    self.done = true;
-                    return null;
-                }
-                const name_ptr: [*:0]const u8 = @ptrCast(&self.buf[self.index + @offsetOf(linux.dirent64, "name")]);
-                self.index += e.reclen;
-                const name = std.mem.span(name_ptr);
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-                return name;
-            } else {
-                const e: *align(1) const std.c.dirent = @ptrCast(&self.buf[self.index]);
-                if (e.reclen == 0) {
-                    self.done = true;
-                    return null;
-                }
-                const base = self.index + @offsetOf(std.c.dirent, "name");
-                const namlen = e.namlen;
-                self.index += e.reclen;
-                if (e.ino == 0) continue;
-                const name = self.buf[base..][0..namlen];
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-                return name;
-            }
-        }
-    }
-};
 
 // ---------------------------------------------------------------------
 // tests
@@ -1876,7 +1643,7 @@ fn readActive(dir: []const u8, w: *FileWriter) ![]u8 {
 }
 
 fn countFiles(dir: []const u8, prefix: []const u8) !usize {
-    var it = try DirIter.open(dir);
+    var it = try sys.DirIter.open(dir);
     defer it.close();
     var n: usize = 0;
     while (it.next()) |name| {
@@ -1964,7 +1731,7 @@ test "file writer rotates at the size threshold and preserves order" {
     // Every byte written must still be on disk somewhere, and no record
     // may be split across a rotation boundary.
     var total: usize = 0;
-    var it = try DirIter.open(dir);
+    var it = try sys.DirIter.open(dir);
     defer it.close();
     while (it.next()) |name| {
         if (!std.mem.endsWith(u8, name, ".log")) continue;
@@ -1990,7 +1757,7 @@ test "rotated names get a uniquifier within the same day" {
 
     // The clock is frozen, so every rotation stamps the same date and
     // the uniquifier is the only thing separating them.
-    var it = try DirIter.open(dir);
+    var it = try sys.DirIter.open(dir);
     defer it.close();
     var saw_plain = false;
     var saw_suffixed = false;

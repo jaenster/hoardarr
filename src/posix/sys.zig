@@ -731,3 +731,454 @@ test "dropping to our own ids is a no-op that succeeds" {
     };
     try testing.expectEqual(uid, getuid());
 }
+
+// ---------------------------------------------------------------------
+// Filesystem
+// ---------------------------------------------------------------------
+//
+// `std.Io.Dir` / `std.Io.File` exist in 0.16 but every call wants an
+// `std.Io`, whose vtable has ~117 members — adopting it would mean
+// pulling in one of the backends this file exists to avoid. So the
+// handful of path operations the daemon actually performs live here, the
+// same way the socket calls do.
+//
+// Paths are NUL-terminated on the way in. That is the kernel's ABI, and
+// making it explicit at the boundary means no helper silently allocates
+// to append a NUL in the middle of a hot path.
+
+pub const path_max = 4096;
+
+/// `Error` covers errno; the path-length limit is ours.
+pub const PathError = error{NameTooLong} || Error;
+
+const O = if (is_linux) linux.O else std.c.O;
+
+pub const OpenFlags = struct {
+    /// `.read_only` for reading, `.write_only` for a log or an output
+    /// file, `.read_write` for a database.
+    mode: enum { read_only, write_only, read_write } = .read_only,
+    create: bool = false,
+    /// Append-only. Combined with a single `write` per record, this is
+    /// what makes concurrent appends to a log file non-interleaving.
+    append: bool = false,
+    truncate: bool = false,
+    /// Fail if the path already exists. With `create`, gives an atomic
+    /// "create or fail", which is how a lock file is claimed.
+    exclusive: bool = false,
+    directory: bool = false,
+};
+
+pub fn open(path: [:0]const u8, flags: OpenFlags) Error!Fd {
+    var o: O = .{ .CLOEXEC = true };
+    if (flags.directory) {
+        o.ACCMODE = .RDONLY;
+        o.DIRECTORY = true;
+    } else {
+        o.ACCMODE = switch (flags.mode) {
+            .read_only => .RDONLY,
+            .write_only => .WRONLY,
+            .read_write => .RDWR,
+        };
+        o.CREAT = flags.create;
+        o.APPEND = flags.append;
+        o.TRUNC = flags.truncate;
+        o.EXCL = flags.exclusive;
+    }
+
+    while (true) {
+        if (is_linux) {
+            const rc = linux.open(path.ptr, o, 0o644);
+            const e = linux.errno(rc);
+            if (e == .SUCCESS) return @intCast(rc);
+            if (e == .INTR) continue;
+            return mapError(e);
+        }
+        const rc = std.c.open(path.ptr, o, @as(c_uint, 0o644));
+        if (rc >= 0) return rc;
+        const e = cErrno();
+        if (e == .INTR) continue;
+        return mapError(e);
+    }
+}
+
+/// Size of an open file.
+///
+/// `lseek` to the end rather than `fstat`: one syscall, and no `struct
+/// stat` layout to reproduce for two platforms. Safe on an append-only
+/// fd because the write offset is the end regardless.
+pub fn fileSize(fd: Fd) Error!u64 {
+    const SEEK_END = 2;
+    if (is_linux) {
+        const rc = linux.lseek(fd, 0, SEEK_END);
+        const e = linux.errno(rc);
+        if (e != .SUCCESS) return mapError(e);
+        return @intCast(rc);
+    }
+    const rc = std.c.lseek(fd, 0, @as(std.c.whence_t, SEEK_END));
+    if (rc < 0) return mapError(cErrno());
+    return @intCast(rc);
+}
+
+/// Flush a file's data to the device.
+///
+/// The store needs this on its own terms — SQLite issues its own fsyncs
+/// via the VFS — but the outbox's "written before acknowledged" property
+/// and a completed download's rename both depend on being able to force
+/// durability at a chosen point.
+pub fn fsync(fd: Fd) Error!void {
+    while (true) {
+        if (is_linux) {
+            const rc = linux.fsync(fd);
+            const e = linux.errno(rc);
+            if (e == .SUCCESS) return;
+            if (e == .INTR) continue;
+            return mapError(e);
+        }
+        if (std.c.fsync(fd) == 0) return;
+        const e = cErrno();
+        if (e == .INTR) continue;
+        return mapError(e);
+    }
+}
+
+pub fn exists(path: [:0]const u8) bool {
+    const F_OK: u32 = 0;
+    if (is_linux) return linux.errno(linux.access(path.ptr, F_OK)) == .SUCCESS;
+    return std.c.access(path.ptr, 0) == 0;
+}
+
+/// Rename, which within one filesystem is atomic. That is what makes
+/// "write to a temporary name, then rename into place" safe: a reader
+/// sees either the old file or the complete new one, never a partial.
+pub fn rename(from: [:0]const u8, to: [:0]const u8) Error!void {
+    if (is_linux) {
+        const e = linux.errno(linux.rename(from.ptr, to.ptr));
+        if (e != .SUCCESS) return mapError(e);
+        return;
+    }
+    if (std.c.rename(from.ptr, to.ptr) != 0) return mapError(cErrno());
+}
+
+pub fn unlink(path: [:0]const u8) Error!void {
+    if (is_linux) {
+        const e = linux.errno(linux.unlink(path.ptr));
+        if (e != .SUCCESS) return mapError(e);
+        return;
+    }
+    if (std.c.unlink(path.ptr) != 0) return mapError(cErrno());
+}
+
+pub fn rmdir(path: [:0]const u8) Error!void {
+    if (is_linux) {
+        const e = linux.errno(linux.rmdir(path.ptr));
+        if (e != .SUCCESS) return mapError(e);
+        return;
+    }
+    if (std.c.rmdir(path.ptr) != 0) return mapError(cErrno());
+}
+
+/// Create one directory. An existing directory is success, because every
+/// caller wants "make sure it's there" rather than "be the one to make
+/// it".
+pub fn mkdir(path: [:0]const u8) Error!void {
+    if (is_linux) {
+        const e = linux.errno(linux.mkdir(path.ptr, 0o755));
+        if (e == .SUCCESS or e == .EXIST) return;
+        return mapError(e);
+    }
+    if (std.c.mkdir(path.ptr, 0o755) == 0) return;
+    const e = cErrno();
+    if (e == .EXIST) return;
+    return mapError(e);
+}
+
+/// `mkdir -p`. A fresh volume has neither `<data_dir>` nor its
+/// subdirectories, and the daemon should create what it needs rather
+/// than making the operator do it.
+pub fn mkdirPath(dir: []const u8) PathError!void {
+    if (dir.len == 0) return;
+    if (dir.len + 1 > path_max) return error.NameTooLong;
+
+    var buf: [path_max]u8 = undefined;
+    @memcpy(buf[0..dir.len], dir);
+    buf[dir.len] = 0;
+
+    var i: usize = if (dir[0] == '/') 1 else 0;
+    while (i < dir.len) : (i += 1) {
+        if (buf[i] != '/') continue;
+        buf[i] = 0;
+        // Intermediate failures are ignored on purpose: a component can
+        // be traversable without being one we're allowed to stat. Only
+        // the final component has to succeed.
+        mkdir(buf[0..i :0]) catch {};
+        buf[i] = '/';
+    }
+    return mkdir(buf[0..dir.len :0]);
+}
+
+/// Copy `path` into a NUL-terminated stack buffer.
+///
+/// Every path call here wants a sentinel, and the alternative — an
+/// allocation per call — would put the allocator on the path of a log
+/// rotation and a file move.
+pub fn pathZ(buf: *[path_max]u8, path: []const u8) PathError![:0]const u8 {
+    if (path.len + 1 > path_max) return error.NameTooLong;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
+}
+
+/// Join two path components into a NUL-terminated stack buffer.
+pub fn joinZ(buf: *[path_max]u8, dir: []const u8, name: []const u8) PathError![:0]const u8 {
+    const sep: usize = if (dir.len > 0 and dir[dir.len - 1] != '/') 1 else 0;
+    if (dir.len + sep + name.len + 1 > path_max) return error.NameTooLong;
+    @memcpy(buf[0..dir.len], dir);
+    if (sep == 1) buf[dir.len] = '/';
+    @memcpy(buf[dir.len + sep ..][0..name.len], name);
+    buf[dir.len + sep + name.len] = 0;
+    return buf[0 .. dir.len + sep + name.len :0];
+}
+
+test "open, write, size, rename, unlink" {
+    var buf: [path_max]u8 = undefined;
+    const dir = "/tmp/hoardarr-systest";
+    try mkdirPath(dir);
+
+    const a = try joinZ(&buf, dir, "a.txt");
+    const fd = try open(a, .{ .mode = .write_only, .create = true, .truncate = true });
+    try writeAll(fd, "hello");
+    try fsync(fd);
+    try testing.expectEqual(@as(u64, 5), try fileSize(fd));
+    close(fd);
+
+    try testing.expect(exists(a));
+
+    var buf2: [path_max]u8 = undefined;
+    const b = try joinZ(&buf2, dir, "b.txt");
+    try rename(a, b);
+    // The atomicity is the point: after a rename a reader sees either the
+    // old name or the new one, never a half-written file under either.
+    try testing.expect(!exists(a));
+    try testing.expect(exists(b));
+
+    try unlink(b);
+    try testing.expect(!exists(b));
+    try rmdir(try pathZ(&buf, dir));
+}
+
+test "mkdirPath creates every level and is idempotent" {
+    var buf: [path_max]u8 = undefined;
+    const deep = "/tmp/hoardarr-systest2/incomplete/nested";
+    try mkdirPath(deep);
+    try testing.expect(exists(try pathZ(&buf, deep)));
+
+    // Called again on every start-up, so it must not fail once the tree
+    // is there.
+    try mkdirPath(deep);
+    try testing.expect(exists(try pathZ(&buf, deep)));
+
+    try rmdir(try pathZ(&buf, "/tmp/hoardarr-systest2/incomplete/nested"));
+    try rmdir(try pathZ(&buf, "/tmp/hoardarr-systest2/incomplete"));
+    try rmdir(try pathZ(&buf, "/tmp/hoardarr-systest2"));
+}
+
+test "exclusive create is how a lock file is claimed" {
+    var buf: [path_max]u8 = undefined;
+    const p = try pathZ(&buf, "/tmp/hoardarr-systest-lock");
+    unlink(p) catch {};
+
+    const fd = try open(p, .{ .mode = .write_only, .create = true, .exclusive = true });
+    close(fd);
+    // Two daemons pointed at one data directory must not both start, and
+    // O_CREAT|O_EXCL is the primitive that decides which one wins.
+    try testing.expectError(error.Exists, open(p, .{ .mode = .write_only, .create = true, .exclusive = true }));
+    try unlink(p);
+}
+
+test "paths longer than the limit are refused, not truncated" {
+    var buf: [path_max]u8 = undefined;
+    const long = "x" ** (path_max + 10);
+    // Truncating would silently operate on a different path than asked.
+    try testing.expectError(error.NameTooLong, pathZ(&buf, long));
+    try testing.expectError(error.NameTooLong, joinZ(&buf, "/tmp", long));
+    try testing.expectError(error.NameTooLong, mkdirPath(long));
+}
+
+test "joinZ handles a trailing slash without doubling it" {
+    var buf: [path_max]u8 = undefined;
+    try testing.expectEqualStrings("/data/logs", try joinZ(&buf, "/data", "logs"));
+    try testing.expectEqualStrings("/data/logs", try joinZ(&buf, "/data/", "logs"));
+    try testing.expectEqualStrings("logs", try joinZ(&buf, "", "logs"));
+}
+
+test "opening a missing file reports NoSuchFileOrDirectory" {
+    var buf: [path_max]u8 = undefined;
+    const p = try pathZ(&buf, "/tmp/hoardarr-definitely-not-here-9f2a");
+    try testing.expectError(error.NoSuchFileOrDirectory, open(p, .{}));
+}
+
+// `DirIter` declares its own `open`/`close`, which shadow the module-level
+// ones inside its methods. Aliases rather than a self-import keep the call
+// sites readable.
+const openPath = open;
+const closeFd = close;
+
+/// Directory iteration. Linux uses `getdents64`; Darwin uses
+/// `getdirentries` with its own `dirent` layout (16-bit `namlen`
+/// instead of a NUL-terminated name).
+pub const DirIter = struct {
+    fd: Fd,
+    buf: [4096]u8 align(8) = undefined,
+    index: usize = 0,
+    end: usize = 0,
+    seek: i64 = 0,
+    done: bool = false,
+
+    pub fn open(dir: []const u8) PathError!DirIter {
+        var buf: [path_max]u8 = undefined;
+        const fd = try openPath(try pathZ(&buf, dir), .{ .directory = true });
+        return .{ .fd = fd };
+    }
+
+    pub fn close(self: *DirIter) void {
+        closeFd(self.fd);
+        self.fd = invalid_fd;
+    }
+
+    fn refill(self: *DirIter) bool {
+        if (self.done) return false;
+        while (true) {
+            const n: usize = if (is_linux) blk: {
+                const rc = linux.getdents64(self.fd, &self.buf, self.buf.len);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => break :blk @intCast(rc),
+                    .INTR => continue,
+                    else => {
+                        self.done = true;
+                        return false;
+                    },
+                }
+            } else blk: {
+                const rc = std.c.getdirentries(self.fd, &self.buf, self.buf.len, &self.seek);
+                if (rc < 0) {
+                    if (cErrno() == .INTR) continue;
+                    self.done = true;
+                    return false;
+                }
+                break :blk @intCast(rc);
+            };
+            if (n == 0) {
+                self.done = true;
+                return false;
+            }
+            self.index = 0;
+            self.end = n;
+            return true;
+        }
+    }
+
+    /// Returns a name borrowed from the internal buffer, valid until
+    /// the next `next()` call.
+    pub fn next(self: *DirIter) ?[]const u8 {
+        while (true) {
+            if (self.index >= self.end) {
+                if (!self.refill()) return null;
+            }
+            if (is_linux) {
+                const e: *align(1) const linux.dirent64 = @ptrCast(&self.buf[self.index]);
+                if (e.reclen == 0) {
+                    self.done = true;
+                    return null;
+                }
+                const name_ptr: [*:0]const u8 = @ptrCast(&self.buf[self.index + @offsetOf(linux.dirent64, "name")]);
+                self.index += e.reclen;
+                const name = std.mem.span(name_ptr);
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+                return name;
+            } else {
+                const e: *align(1) const std.c.dirent = @ptrCast(&self.buf[self.index]);
+                if (e.reclen == 0) {
+                    self.done = true;
+                    return null;
+                }
+                const base = self.index + @offsetOf(std.c.dirent, "name");
+                const namlen = e.namlen;
+                self.index += e.reclen;
+                if (e.ino == 0) continue;
+                const name = self.buf[base..][0..namlen];
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+                return name;
+            }
+        }
+    }
+};
+
+test "DirIter lists what was created and nothing else" {
+    var buf: [path_max]u8 = undefined;
+    const dir = "/tmp/hoardarr-diritertest";
+    try mkdirPath(dir);
+
+    for ([_][]const u8{ "one.log", "two.log", "three.log" }) |name| {
+        var pb: [path_max]u8 = undefined;
+        const p = try joinZ(&pb, dir, name);
+        close(try open(p, .{ .mode = .write_only, .create = true }));
+    }
+
+    var it = try DirIter.open(dir);
+    defer it.close();
+
+    var found: usize = 0;
+    var saw_dot = false;
+    while (it.next()) |name| {
+        // "." and ".." must be filtered, or a prune walking this would
+        // try to unlink the directory it is standing in.
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) saw_dot = true;
+        if (std.mem.endsWith(u8, name, ".log")) found += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), found);
+    try testing.expect(!saw_dot);
+
+    for ([_][]const u8{ "one.log", "two.log", "three.log" }) |name| {
+        var pb: [path_max]u8 = undefined;
+        try unlink(try joinZ(&pb, dir, name));
+    }
+    try rmdir(try pathZ(&buf, dir));
+}
+
+test "DirIter over many entries spans several refills" {
+    var buf: [path_max]u8 = undefined;
+    const dir = "/tmp/hoardarr-diriterbig";
+    try mkdirPath(dir);
+
+    // The read buffer is 4 KiB, so 200 entries force multiple getdents
+    // calls and exercise the boundary between them.
+    const n = 200;
+    for (0..n) |i| {
+        var pb: [path_max]u8 = undefined;
+        var name: [32]u8 = undefined;
+        const nm = try std.fmt.bufPrint(&name, "entry-{d:0>4}.log", .{i});
+        close(try open(try joinZ(&pb, dir, nm), .{ .mode = .write_only, .create = true }));
+    }
+
+    var it = try DirIter.open(dir);
+    var count: usize = 0;
+    while (it.next()) |name| {
+        if (std.mem.startsWith(u8, name, "entry-")) count += 1;
+    }
+    it.close();
+    try testing.expectEqual(@as(usize, n), count);
+
+    for (0..n) |i| {
+        var pb: [path_max]u8 = undefined;
+        var name: [32]u8 = undefined;
+        const nm = try std.fmt.bufPrint(&name, "entry-{d:0>4}.log", .{i});
+        try unlink(try joinZ(&pb, dir, nm));
+    }
+    try rmdir(try pathZ(&buf, dir));
+}
+
+test "DirIter on a missing directory is an error, not an empty listing" {
+    // An empty listing would make a prune silently do nothing while
+    // reporting success.
+    try testing.expectError(error.NoSuchFileOrDirectory, DirIter.open("/tmp/hoardarr-no-such-dir-4b1c"));
+}
