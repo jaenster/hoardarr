@@ -105,6 +105,43 @@ image size vs Go, cold start to first served request, and the whole table
 re-run on a Linux host so the `epoll` backend is measured rather than
 `poll`.
 
+## Does it actually work yet?
+
+**No. Not end to end.** The components are built and tested; they are not
+yet connected, so the daemon serves a health check and the web UI and
+cannot download anything.
+
+| | Go | Zig |
+|-|-|-|
+| HTTP routes wired into the daemon | 56 | 3 |
+| Add an NZB and download it | yes | **no** |
+| e2e tests passing | 22 | **0** |
+| Unit/integration tests | 269 funcs | 1142 |
+
+What *is* proven: every component has real tests — yEnc, PAR2 (against a
+`par2cmdline` fixture), NZB, RAR, the NNTP connection and pool against a
+scripted server, the store with its outbox and thirteen repositories, the
+SAB handler against goldens captured from Go's own JSON encoder, the HTTP
+server, notify. Plus the daemon starts, migrates, serves, and survives both
+a clean `SIGTERM` and a `SIGKILL` with WAL replay.
+
+What that does **not** prove is that the pieces work together. A restart
+test passes trivially when there are no jobs in flight to lose.
+
+### The parity gate
+
+`internal/bootstrap/` holds 22 end-to-end tests that boot the real binary
+against an in-process NNTP server and drive a complete download — NZB in,
+segments fetched, yEnc decoded, PAR2 verified and repaired, RAR extracted,
+delivered, history written — plus crash recovery mid-download, multi-server
+failover, throttling, auth, and webhooks.
+
+**Nothing in this port claims functional parity until those 22 pass.** They
+are the only thing that answers "is it truly the same". Porting them is
+tracked as its own task, and `src/testserver/` (fixture generator +
+content-addressed NNTP server with missing-fraction, throttle, latency and
+connection-limit knobs) is the harness they need.
+
 ## Known debt
 
 * `src/core/log.zig` carries `open`/`lseek`/`rename`/`unlink`/`mkdir`/
