@@ -54,27 +54,11 @@ pub const domain = struct {
 
 pub const nntp = struct {
     pub const protocol = @import("nntp/protocol.zig");
+    pub const conn = @import("nntp/conn.zig");
 };
 
 pub const store = struct {
     pub const sqlite_c = @import("store/sqlite_c.zig");
-    pub const sqlite = @import("store/sqlite.zig");
-    pub const tx = @import("store/tx.zig");
-    pub const migrate = @import("store/migrate.zig");
-    pub const outbox = @import("store/outbox.zig");
-    pub const repo_download = @import("store/repo_download.zig");
-    pub const repo_verify = @import("store/repo_verify.zig");
-    pub const repo_repair = @import("store/repo_repair.zig");
-    pub const repo_extract = @import("store/repo_extract.zig");
-    pub const repo_deliver = @import("store/repo_deliver.zig");
-    pub const repo_server = @import("store/repo_server.zig");
-    pub const repo_auth = @import("store/repo_auth.zig");
-    pub const repo_schedule = @import("store/repo_schedule.zig");
-    pub const repo_command = @import("store/repo_command.zig");
-    pub const repo_subscription = @import("store/repo_subscription.zig");
-    pub const repo_category = @import("store/repo_category.zig");
-    pub const repo_settings = @import("store/repo_settings.zig");
-    pub const repo_speed_history = @import("store/repo_speed_history.zig");
 };
 
 pub const app = struct {
@@ -134,24 +118,8 @@ test {
     _ = domain.extract;
     _ = domain.deliver;
     _ = nntp.protocol;
+    _ = nntp.conn;
     _ = store.sqlite_c;
-    _ = store.sqlite;
-    _ = store.tx;
-    _ = store.migrate;
-    _ = store.outbox;
-    _ = store.repo_download;
-    _ = store.repo_verify;
-    _ = store.repo_repair;
-    _ = store.repo_extract;
-    _ = store.repo_deliver;
-    _ = store.repo_server;
-    _ = store.repo_auth;
-    _ = store.repo_schedule;
-    _ = store.repo_command;
-    _ = store.repo_subscription;
-    _ = store.repo_category;
-    _ = store.repo_settings;
-    _ = store.repo_speed_history;
     _ = app.notify.render;
     _ = app.notify.transport;
     _ = app.notify.discord;
