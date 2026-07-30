@@ -89,13 +89,25 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- benchmarks ----
+    //
+    // The library gets its own ReleaseFast module rather than reusing
+    // `hoardarr` above: that one is built at the user-selected optimize
+    // level, and linking a Debug library into a ReleaseFast harness
+    // measures the bounds checks instead of the code.
+    const hoardarr_fast = b.addModule("hoardarr_fast", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    hoardarr_fast.addOptions("build_info", build_info);
+
     const bench = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/main.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{.{ .name = "hoardarr", .module = hoardarr }},
+            .imports = &.{.{ .name = "hoardarr", .module = hoardarr_fast }},
         }),
     });
     b.installArtifact(bench);
