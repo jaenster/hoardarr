@@ -18,6 +18,13 @@ pub const codec = struct {
     pub const yenc = @import("codec/yenc.zig");
     pub const xml = @import("codec/xml.zig");
     pub const nzb = @import("codec/nzb.zig");
+    pub const par2 = struct {
+        pub const gf16 = @import("codec/par2/gf16.zig");
+        pub const matrix = @import("codec/par2/matrix.zig");
+        pub const par2 = @import("codec/par2/par2.zig");
+        pub const rs = @import("codec/par2/rs.zig");
+        pub const verifier = @import("codec/par2/verifier.zig");
+    };
 };
 
 pub const posix = struct {
@@ -32,6 +39,11 @@ test {
     _ = codec.yenc;
     _ = codec.xml;
     _ = codec.nzb;
+    _ = codec.par2.gf16;
+    _ = codec.par2.matrix;
+    _ = codec.par2.par2;
+    _ = codec.par2.rs;
+    _ = codec.par2.verifier;
     _ = posix.sys;
     _ = posix.reactor;
 }
