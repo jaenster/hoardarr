@@ -128,7 +128,33 @@ a clean `SIGTERM` and a `SIGKILL` with WAL replay.
 What that does **not** prove is that the pieces work together. A restart
 test passes trivially when there are no jobs in flight to lose.
 
-### The parity gate
+#### What is wired, as of now
+
+61 HTTP routes are live and the daemon accepts an NZB — the job lands in the
+queue, in the SAB API's `mode=queue`, and `download.job.created` reaches the
+outbox. Auth, backups, settings and the SSE hubs work.
+
+**No segment is fetched yet**, because of three things that are genuine
+architectural mismatches rather than missing plumbing:
+
+* **No DNS.** Providers are configured by hostname, and there is no way to
+  turn one into an address. `std.Io.net.IpAddress.resolve` needs an
+  `std.Io`, and on Linux the binary links no libc, so `getaddrinfo` is not
+  available either. Being written as `src/net/dns.zig`.
+* **`ArticleFetcher` is synchronous** while the NNTP pool and connection are
+  callback-based on the reactor. The bridge is `src/posix/fiber.zig`, which
+  already exists for exactly this shape of problem — it was built so TLS's
+  synchronous handshake could run on a single-threaded loop.
+* **The outbox dispatchers are OS threads** while the reactor, both SSE hubs
+  and every SQLite connection are single-threaded, so the
+  verify/repair/extract/deliver/notify subscribers are not subscribed.
+
+Three REST ports are deliberately null and asserted so in a test — wiring
+one without deleting its excuse fails the build: `probe` (needs the NNTP
+client on a fiber), `health` (no service in the app layer yet), and `disk`
+(needs `statfs`, which belongs in the syscall layer).
+
+## The parity gate
 
 `internal/bootstrap/` holds 22 end-to-end tests that boot the real binary
 against an in-process NNTP server and drive a complete download — NZB in,
