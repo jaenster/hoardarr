@@ -261,8 +261,8 @@ test "hand-named shapes are recognised" {
 
 test "excluded extensions are case blind and cover the archive set" {
     const excluded = [_][]const u8{
-        "movie.rar",     "movie.RAR",  "set.vol01.par2", "disc.bdmv",
-        "chapter.vob",   "index.ifo",  "subs.srt",       "a.SUB",
+        "movie.rar",   "movie.RAR", "set.vol01.par2", "disc.bdmv",
+        "chapter.vob", "index.ifo", "subs.srt",       "a.SUB",
     };
     for (excluded) |n| try testing.expect(isExcludedExt(n));
 

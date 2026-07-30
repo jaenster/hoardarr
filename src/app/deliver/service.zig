@@ -112,7 +112,7 @@ pub const Service = struct {
             swept += 1;
         }
         if (swept > 0) {
-            self.logger.info("deliver: startup recovery swept jobs", &.{ log.uint("count", swept) });
+            self.logger.info("deliver: startup recovery swept jobs", &.{log.uint("count", swept)});
         }
         return swept;
     }

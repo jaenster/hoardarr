@@ -264,10 +264,10 @@ fn normaliseSource(s: []const u8) []const u8 {
     }
     const key = buf[0..n];
     const table = .{
-        .{ "webdl", "WEB-DL" },   .{ "webrip", "WEBRip" }, .{ "web", "WEB" },
-        .{ "bluray", "BluRay" },  .{ "bdrip", "BDRip" },   .{ "brrip", "BRRip" },
-        .{ "hdrip", "HDRip" },    .{ "dvdrip", "DVDRip" }, .{ "hdtv", "HDTV" },
-        .{ "pdtv", "PDTV" },      .{ "remux", "REMUX" },
+        .{ "webdl", "WEB-DL" },  .{ "webrip", "WEBRip" }, .{ "web", "WEB" },
+        .{ "bluray", "BluRay" }, .{ "bdrip", "BDRip" },   .{ "brrip", "BRRip" },
+        .{ "hdrip", "HDRip" },   .{ "dvdrip", "DVDRip" }, .{ "hdtv", "HDTV" },
+        .{ "pdtv", "PDTV" },     .{ "remux", "REMUX" },
     };
     inline for (table) |row| {
         if (std.mem.eql(u8, key, row[0])) return row[1];
@@ -360,7 +360,7 @@ pub fn rfc3339(buf: *Rfc3339Buf, ms: event.Timestamp) []const u8 {
     const d = log.civilFromDays(days);
     const year: u64 = if (d.year < 0) 0 else if (d.year > 9999) 9999 else @intCast(d.year);
     _ = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        year,       d.month,          d.day,
+        year,       d.month,           d.day,
         sod / 3600, (sod % 3600) / 60, sod % 60,
     }) catch unreachable;
     return buf;

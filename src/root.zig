@@ -96,6 +96,36 @@ pub const store = struct {
 };
 
 pub const app = struct {
+    pub const ports = @import("app/ports.zig");
+    pub const naming = @import("app/naming.zig");
+    pub const verify = @import("app/verify.zig");
+    pub const repair = @import("app/repair.zig");
+    pub const extract = @import("app/extract.zig");
+    pub const schedule = @import("app/schedule.zig");
+    pub const auth = @import("app/auth.zig");
+    pub const download = struct {
+        pub const ports = @import("app/download/ports.zig");
+        pub const orchestrator = @import("app/download/orchestrator.zig");
+        pub const add_job = @import("app/download/add_job.zig");
+        pub const queue = @import("app/download/queue.zig");
+        pub const service = @import("app/download/service.zig");
+        pub const bandwidth = @import("app/download/bandwidth.zig");
+        pub const byte_accounter = @import("app/download/byte_accounter.zig");
+        pub const tiered_fetcher = @import("app/download/tiered_fetcher.zig");
+    };
+    pub const deliver = struct {
+        pub const obfuscation = @import("app/deliver/obfuscation.zig");
+        pub const postprocess = @import("app/deliver/postprocess.zig");
+        pub const service = @import("app/deliver/service.zig");
+    };
+    pub const system = struct {
+        pub const throughput = @import("app/system/throughput.zig");
+        pub const service = @import("app/system/service.zig");
+    };
+    pub const command = struct {
+        pub const service = @import("app/command/service.zig");
+        pub const handlers = @import("app/command/handlers.zig");
+    };
     pub const notify = struct {
         pub const render = @import("app/notify/render.zig");
         pub const transport = @import("app/notify/transport.zig");
@@ -216,6 +246,28 @@ test {
     _ = store.repo_category;
     _ = store.repo_settings;
     _ = store.repo_speed_history;
+    _ = app.ports;
+    _ = app.naming;
+    _ = app.verify;
+    _ = app.repair;
+    _ = app.extract;
+    _ = app.schedule;
+    _ = app.auth;
+    _ = app.download.ports;
+    _ = app.download.orchestrator;
+    _ = app.download.add_job;
+    _ = app.download.queue;
+    _ = app.download.service;
+    _ = app.download.bandwidth;
+    _ = app.download.byte_accounter;
+    _ = app.download.tiered_fetcher;
+    _ = app.deliver.obfuscation;
+    _ = app.deliver.postprocess;
+    _ = app.deliver.service;
+    _ = app.system.throughput;
+    _ = app.system.service;
+    _ = app.command.service;
+    _ = app.command.handlers;
     _ = app.notify.render;
     _ = app.notify.transport;
     _ = app.notify.discord;

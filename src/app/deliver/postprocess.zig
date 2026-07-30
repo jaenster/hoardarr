@@ -226,7 +226,7 @@ pub fn deobfuscateRename(
         return .{};
     }
     try fs.move(largest.path, target);
-    logger.info("deobfuscate: renamed obfuscated file", &.{ log.str("dir", dir) });
+    logger.info("deobfuscate: renamed obfuscated file", &.{log.str("dir", dir)});
     return .{ .renamed_to = target };
 }
 

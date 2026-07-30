@@ -457,7 +457,6 @@ const nzb_dupe_segments =
     \\</nzb>
 ;
 
-
 const Harness = struct {
     store: ports.FakeJobStore = undefined,
     sink: app_ports.FakeSink(devents.Event) = .{},

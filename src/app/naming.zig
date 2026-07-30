@@ -107,8 +107,8 @@ const testing = std.testing;
 
 test "RAR detection covers .rar and the classic numbered split" {
     const yes = [_][]const u8{
-        "release.rar",     "RELEASE.RAR",     "release.part01.rar",
-        "release.r00",     "release.r99",     "release.R42",
+        "release.rar", "RELEASE.RAR", "release.part01.rar",
+        "release.r00", "release.r99", "release.R42",
     };
     for (yes) |n| try testing.expect(looksLikeRAR(n));
 
