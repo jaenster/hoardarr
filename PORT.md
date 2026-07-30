@@ -137,10 +137,21 @@ outbox. Auth, backups, settings and the SSE hubs work.
 **No segment is fetched yet**, because of three things that are genuine
 architectural mismatches rather than missing plumbing:
 
-* **No DNS.** Providers are configured by hostname, and there is no way to
-  turn one into an address. `std.Io.net.IpAddress.resolve` needs an
-  `std.Io`, and on Linux the binary links no libc, so `getaddrinfo` is not
-  available either. Being written as `src/net/dns.zig`.
+* ~~No DNS.~~ **Done** — `src/net/dns.zig`, 56 tests. Callback-based like
+  everything else, so a job fiber resolves its provider the way it fetches
+  an article. With no `/etc/resolv.conf` it falls back to Docker's embedded
+  resolver first, then public ones, and flags that it did so. TTL floor 30 s,
+  ceiling 1 h, 256 entries.
+
+  It parses attacker-influenced bytes, so the hostile cases are the tests
+  that matter: self-referential and two-pointer compression cycles, names
+  over 253 bytes, rdlength past the message, ID and question mismatches,
+  answers for names outside the CNAME chain. A forged datagram is *ignored*
+  rather than fatal — treating it as an error would let anyone who can spoof
+  a packet turn a lookup into a denial of service.
+
+  Not implemented: EDNS0 (so 512-byte UDP, with TC→TCP as the only route to
+  bigger answers), negative caching, `search`/`ndots` suffixing, DNSSEC.
 * **`ArticleFetcher` is synchronous** while the NNTP pool and connection are
   callback-based on the reactor. The bridge is `src/posix/fiber.zig`, which
   already exists for exactly this shape of problem — it was built so TLS's
