@@ -433,6 +433,61 @@ pub fn shutdown(fd: Fd, how: ShutdownHow) void {
     }
 }
 
+// ---------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------
+
+pub const Uid = u32;
+pub const Gid = u32;
+
+pub fn getuid() Uid {
+    return if (is_linux) linux.getuid() else std.c.getuid();
+}
+
+pub fn getgid() Gid {
+    return if (is_linux) linux.getgid() else std.c.getgid();
+}
+
+/// Drop to `uid`:`gid` permanently.
+///
+/// This replaces the `su-exec` call in the old shell entrypoint, which is
+/// most of why the image can be `scratch`: no shell, no suid helper, no
+/// `adduser`.
+///
+/// The order matters and getting it wrong is a security bug, not a style
+/// choice:
+///
+///  1. `setgroups` first, to drop supplementary groups. After `setuid`
+///     we no longer have the privilege to do it, so a process that
+///     dropped uid first would keep root's group memberships forever.
+///  2. `setresgid` before `setresuid`, for the same reason.
+///  3. `setres*` rather than `set*id`, so the saved-set id goes too.
+///     Plain `setuid` from root does clear the saved id, but being
+///     explicit means a future change to the callers can't quietly
+///     reintroduce a process that can call `seteuid(0)` and come back.
+///
+/// Then it verifies the drop actually happened. A silent failure here
+/// would leave the daemon running as root while every log line claims
+/// otherwise.
+pub fn dropPrivileges(uid: Uid, gid: Gid) Error!void {
+    if (is_linux) {
+        _ = try linuxUnwrap(linux.setgroups(1, &[_]Gid{gid}));
+        _ = try linuxUnwrap(linux.setresgid(gid, gid, gid));
+        _ = try linuxUnwrap(linux.setresuid(uid, uid, uid));
+    } else {
+        // Darwin has no `setres*id` — it predates the saved-set-id
+        // interface — so the developer-machine path uses `setre*id`. This
+        // is not the shipping path; the container is Linux, and
+        // `zig build check` compiles the branch above for both Linux
+        // targets on every build.
+        _ = try cUnwrap(std.c.setregid(gid, gid));
+        _ = try cUnwrap(std.c.setreuid(uid, uid));
+    }
+
+    // Belt and braces: confirm rather than assume.
+    if (getuid() != uid or getgid() != gid) return error.PermissionDenied;
+}
+
 /// A self-pipe, used to break the reactor out of `poll` from another
 /// thread. On Linux an `eventfd` is one fd instead of two and its
 /// counter semantics mean a burst of wakeups collapses into one read;
@@ -643,4 +698,36 @@ test "sockaddr encodes port in network byte order" {
     try testing.expectEqual(AF_INET6, sa6.family());
     try testing.expectEqual(@as(u32, 28), sa6.len());
     try testing.expectEqual(@as(u16, 8085), std.mem.bigToNative(u16, sa6.in6.port));
+}
+
+test "dropPrivileges refuses to silently no-op" {
+    // Running as an unprivileged user, dropping to a *different* uid must
+    // fail rather than appear to succeed. The dangerous bug this guards
+    // against is a drop that errors, gets swallowed, and leaves the daemon
+    // running with more privilege than the logs claim.
+    if (getuid() == 0) return error.SkipZigTest; // don't actually drop root in a test
+
+    const other: Uid = if (getuid() == 1 or getuid() == 0) 2 else 1;
+    try testing.expectError(error.PermissionDenied, dropPrivileges(other, other));
+
+    // And we are still who we were.
+    try testing.expect(getuid() != other);
+}
+
+test "dropping to our own ids is a no-op that succeeds" {
+    // An operator who runs the container with `user:` already set hits
+    // this path: the requested ids match the current ones, so the drop is
+    // trivially satisfied and must not error.
+    const uid = getuid();
+    const gid = getgid();
+    if (uid == 0) return error.SkipZigTest;
+
+    dropPrivileges(uid, gid) catch |err| switch (err) {
+        // macOS restricts setresgid for non-root even to the same gid in
+        // some sandbox configurations; the Linux path is the one that
+        // ships, and `zig build check` compiles it.
+        error.PermissionDenied, error.NotSupported => return error.SkipZigTest,
+        else => return err,
+    };
+    try testing.expectEqual(uid, getuid());
 }

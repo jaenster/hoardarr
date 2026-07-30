@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 
     if (std.mem.eql(u8, cmd, "version")) return cmdVersion();
-    if (std.mem.eql(u8, cmd, "serve")) return cmdServe(gpa);
+    if (std.mem.eql(u8, cmd, "serve")) return cmdServe(gpa, init.environ);
     if (std.mem.eql(u8, cmd, "healthcheck")) return cmdHealthcheck();
 
     try writeStderr(usage);
@@ -60,7 +60,13 @@ fn cmdVersion() !u8 {
     return 0;
 }
 
-fn cmdServe(gpa: std.mem.Allocator) !u8 {
+fn cmdServe(gpa: std.mem.Allocator, env: std.process.Environ) !u8 {
+    // Drop privileges before anything else touches the network or the
+    // filesystem. This is what the old shell entrypoint used `su-exec`
+    // for, and doing it in-process is most of why the image can be
+    // `scratch`: no shell, no suid helper, no `adduser`.
+    try dropPrivilegesFromEnv(env);
+
     // The daemon is one reactor thread. Subsystems register their fds and
     // timers with it during startup and the process then blocks here
     // until something happens or a signal arrives.
@@ -70,6 +76,42 @@ fn cmdServe(gpa: std.mem.Allocator) !u8 {
 
     try writeStderr("hoardarr: serve is not wired up yet\n");
     return 1;
+}
+
+/// Honour the linuxserver-style `PUID`/`PGID` convention.
+///
+/// The homelab expectation is that you bind-mount a host directory into
+/// `/data` and the files come out owned by your host user, so the ids have
+/// to be settable without rebuilding the image.
+///
+/// Doing nothing when we are already unprivileged is deliberate: an
+/// operator who started the container with compose's `user:` has opted
+/// into explicit-uid semantics, and none of this applies. Silently trying
+/// and failing would be worse than not trying.
+fn dropPrivilegesFromEnv(env: std.process.Environ) !void {
+    if (sys.getuid() != 0) return;
+
+    const uid = envInt(env, "PUID") orelse 1000;
+    const gid = envInt(env, "PGID") orelse 1000;
+
+    // Refuse to keep running as root when asked to. A daemon that parses
+    // files off the internet should not be uid 0, and quietly continuing
+    // as root because a setuid failed is exactly the outcome to avoid.
+    sys.dropPrivileges(uid, gid) catch |err| {
+        var buf: [160]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try w.print("hoardarr: refusing to run as root: could not drop to {d}:{d}: {s}\n", .{ uid, gid, @errorName(err) });
+        try writeStderr(w.buffered());
+        return error.PrivilegeDropFailed;
+    };
+}
+
+fn envInt(env: std.process.Environ, name: []const u8) ?u32 {
+    // getPosix rather than getAlloc: we're POSIX-only and the value is
+    // already a NUL-terminated string in the process's environment block,
+    // so there is nothing to allocate.
+    const raw = env.getPosix(name) orelse return null;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t\r\n"), 10) catch null;
 }
 
 fn cmdHealthcheck() !u8 {

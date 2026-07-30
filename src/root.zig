@@ -38,6 +38,18 @@ pub const domain = struct {
         pub const job = @import("domain/download/job.zig");
         pub const ports = @import("domain/download/ports.zig");
     };
+
+    pub const event = @import("domain/event.zig");
+    pub const tx = @import("domain/tx.zig");
+    pub const server = @import("domain/server.zig");
+    pub const auth = @import("domain/auth.zig");
+    pub const command = @import("domain/command.zig");
+    pub const schedule = @import("domain/schedule.zig");
+    pub const notify = @import("domain/notify.zig");
+    pub const verify = @import("domain/verify.zig");
+    pub const repair = @import("domain/repair.zig");
+    pub const extract = @import("domain/extract.zig");
+    pub const deliver = @import("domain/deliver.zig");
 };
 
 pub const nntp = struct {
@@ -46,6 +58,16 @@ pub const nntp = struct {
 
 pub const store = struct {
     pub const sqlite_c = @import("store/sqlite_c.zig");
+};
+
+pub const app = struct {
+    pub const notify = struct {
+        pub const render = @import("app/notify/render.zig");
+        pub const transport = @import("app/notify/transport.zig");
+        pub const discord = @import("app/notify/discord.zig");
+        pub const slack = @import("app/notify/slack.zig");
+        pub const service = @import("app/notify/service.zig");
+    };
 };
 
 pub const net = struct {
@@ -77,8 +99,24 @@ test {
     _ = domain.download.events;
     _ = domain.download.job;
     _ = domain.download.ports;
+    _ = domain.event;
+    _ = domain.tx;
+    _ = domain.server;
+    _ = domain.auth;
+    _ = domain.command;
+    _ = domain.schedule;
+    _ = domain.notify;
+    _ = domain.verify;
+    _ = domain.repair;
+    _ = domain.extract;
+    _ = domain.deliver;
     _ = nntp.protocol;
     _ = store.sqlite_c;
+    _ = app.notify.render;
+    _ = app.notify.transport;
+    _ = app.notify.discord;
+    _ = app.notify.slack;
+    _ = app.notify.service;
     _ = net.socket;
     _ = posix.sys;
     _ = posix.reactor;
