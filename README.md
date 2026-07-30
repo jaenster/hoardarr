@@ -61,7 +61,7 @@ Honest positioning — pick the row that matches what you actually care about.
 | SAB API drop-in | Yes (`/sabnzbd/api`) | Native | Compat shim |
 | Sonarr/Radarr | Drop-in | Native | Drop-in |
 | PAR2 verify + repair | Native Go | par2cmdline (external) | Built-in C++ |
-| RAR extraction | `nwaples/rardecode` (Go) | `unrar` (external) | Built-in C++ |
+| RAR extraction | Built-in (stored/multi-volume) | `unrar` (external) | Built-in C++ |
 | Per-segment retry budget | Yes (durable across restart) | Global queue retry | Per-job retry |
 | Multi-server priority + backup | Yes | Yes | Yes |
 | Metered providers (byte caps) | Yes (persisted) | No | No |

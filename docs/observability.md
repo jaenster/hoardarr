@@ -25,9 +25,15 @@ content-negotiated default for Prometheus 2.x+).
 
 ## Exposed metrics
 
-Process / Go runtime metrics come from `prometheus/client_golang`'s
-default collectors — useful for correlating workload against GC pressure
-and goroutine count. The hoardarr-specific gauges and counters:
+The Go and process collectors are gone: there is no runtime to report on,
+no GC pressure to correlate against, and no goroutine count. If you had a
+dashboard panel for `go_goroutines` or `go_gc_duration_seconds`, it will
+read empty — that is expected, not a regression.
+
+The hoardarr-specific gauges and counters are unchanged, deliberately:
+metric names, label sets and help strings are byte-identical to the
+previous release, because a renamed metric silently breaks a dashboard and
+the alerting hanging off it.
 
 | Metric | Type | Labels | Notes |
 |-|-|-|-|
