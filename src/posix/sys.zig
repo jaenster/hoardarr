@@ -203,6 +203,14 @@ pub const Sockaddr = union(enum) {
         };
     }
 
+    /// Port in host byte order.
+    pub fn port(self: Sockaddr) u16 {
+        return switch (self) {
+            .in => |a| std.mem.bigToNative(u16, a.port),
+            .in6 => |a| std.mem.bigToNative(u16, a.port),
+        };
+    }
+
     pub fn family(self: Sockaddr) u32 {
         return switch (self) {
             .in => AF_INET,

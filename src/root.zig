@@ -12,6 +12,8 @@ pub const core = struct {
     pub const crc32 = @import("core/crc32.zig");
     pub const toml = @import("core/toml.zig");
     pub const config = @import("core/config.zig");
+    pub const log = @import("core/log.zig");
+    pub const logring = @import("core/logring.zig");
 };
 
 pub const codec = struct {
@@ -46,6 +48,10 @@ pub const store = struct {
     pub const sqlite_c = @import("store/sqlite_c.zig");
 };
 
+pub const net = struct {
+    pub const socket = @import("net/socket.zig");
+};
+
 pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
@@ -55,6 +61,8 @@ test {
     _ = core.crc32;
     _ = core.toml;
     _ = core.config;
+    _ = core.log;
+    _ = core.logring;
     _ = codec.yenc;
     _ = codec.xml;
     _ = codec.nzb;
@@ -71,6 +79,7 @@ test {
     _ = domain.download.ports;
     _ = nntp.protocol;
     _ = store.sqlite_c;
+    _ = net.socket;
     _ = posix.sys;
     _ = posix.reactor;
 }
