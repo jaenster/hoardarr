@@ -130,7 +130,8 @@ embedding the frontend bundle:
 |-|-|-|-|
 | **Container image** | **38.8 MB** | **429 kB** | **90× smaller** |
 | Base image | `alpine:3.20` | `scratch` | |
-| Binary, stripped, static | — | 233 KB (no UI) | |
+| Binary, stripped, static x86_64-linux | — | 233 KB (no UI) | |
+| Binary, stripped, native macOS (incl. SQLite) | 15.4 MB | 189 KB | 81× smaller |
 | libc | musl, in the image | none — raw syscalls | |
 | Dynamic loader | present | none — static | |
 | Shell in image | yes (`/bin/sh`) | no | |
@@ -166,11 +167,37 @@ links a C library. Second, symbols are stripped, since a crash in a
 container is diagnosed from the structured log, not from a backtrace
 nobody can symbolise.
 
+## Process startup
+
+Native binaries, same machine, 300 executions of `hoardarr version` after
+a five-run warmup:
+
+| | Go | Zig | |
+|-|-|-|-|
+| Time per exec | 9.92 ms | 2.22 ms | **4.5× faster** |
+
+`version` does almost nothing, so this is very nearly pure process
+start-up: fork/exec, loader, runtime init, one formatted write, exit. Go
+spends most of it initialising a runtime — GC, scheduler, and the `init()`
+functions of every linked package, including the 15 MB of embedded assets.
+The Zig binary has no libc to initialise, no dynamic loader to run, and no
+runtime, so what's left is mostly the kernel's exec cost.
+
+This matters less than it looks for a daemon that starts once, but it is
+the honest measure of fixed overhead, and it's the number that shows up in
+`docker run ... healthcheck` — which the container runs every 30 seconds
+for the life of the deployment.
+
+Measuring the same thing *through* `docker run` gives 218 ms vs 230 ms,
+which is not a useful comparison: ~200 ms of that is container setup and it
+swamps the signal. Included here so nobody repeats the mistake.
+
 ## Not yet measured
 
 These are in the goal and still owed:
 
 - HTTP requests/s on `/api/queue`
-- Resident memory at idle, Go vs Zig
-- Cold start to first served request
+- Resident memory at idle, Go vs Zig — needs `serve` wired up
+- Cold start to *first served request* — needs `serve` wired up; the
+  process-startup figure above is the floor, not the whole number
 - `epoll` numbers from a Linux host, alongside the `poll` ones above
