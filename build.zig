@@ -26,6 +26,7 @@ pub fn build(b: *std.Build) void {
     });
     hoardarr.addOptions("build_info", build_info);
     addSqlite(b, hoardarr, target, optimize);
+    addAssets(b, hoardarr, embed_ui);
 
     const exe = b.addExecutable(.{
         .name = "hoardarr",
@@ -55,6 +56,7 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addOptions("build_info", build_info);
     addSqlite(b, tests.root_module, target, optimize);
+    addAssets(b, tests.root_module, embed_ui);
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run unit tests").dependOn(&run_tests.step);
 
@@ -82,6 +84,7 @@ pub fn build(b: *std.Build) void {
         });
         check_hoardarr.addOptions("build_info", build_info);
         addSqlite(b, check_hoardarr, resolved, .ReleaseFast);
+        addAssets(b, check_hoardarr, embed_ui);
         check_mod.addOptions("build_info", build_info);
         check_mod.addImport("hoardarr", check_hoardarr);
         const obj = b.addObject(.{
@@ -104,6 +107,7 @@ pub fn build(b: *std.Build) void {
     });
     hoardarr_fast.addOptions("build_info", build_info);
     addSqlite(b, hoardarr_fast, target, .ReleaseFast);
+    addAssets(b, hoardarr_fast, embed_ui);
 
     const bench = b.addExecutable(.{
         .name = "bench",
@@ -186,3 +190,37 @@ const sqlite_cflags = [_][]const u8{
     "-DSQLITE_OMIT_UTF16",
     "-DSQLITE_UNTESTABLE",
 };
+
+/// Generate the embedded-frontend module and attach it to `mod` as
+/// `assets`. Runs `tools/embed_assets.zig` over `frontend/dist`.
+///
+/// The generator runs at build time so gzip happens once at level 9 rather
+/// than per request at whatever level fits a latency budget. It also means
+/// the container needs no directory for the UI.
+fn addAssets(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    embed_ui: bool,
+) void {
+    // The generator is a build-time tool, so it targets the host and is
+    // built for speed of the build rather than of the product.
+    const tool = b.addExecutable(.{
+        .name = "embed_assets",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/embed_assets.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    const run = b.addRunArtifact(tool);
+    // Without -Dembed-ui the generator is pointed at a path that doesn't
+    // exist, which it treats as "no bundle" and emits a stub for. That
+    // keeps one code path in the server instead of a compile-time fork.
+    run.addArg(if (embed_ui) "frontend/dist" else "frontend/dist-absent");
+    const out_dir = run.addOutputDirectoryArg("assets");
+
+    mod.addAnonymousImport("assets", .{
+        .root_source_file = out_dir.path(b, "assets.zig"),
+    });
+}
