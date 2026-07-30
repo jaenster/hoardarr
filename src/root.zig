@@ -18,6 +18,12 @@ pub const bootstrap = @import("bootstrap.zig");
 /// bounded context's wiring is one file.
 pub const wiring = struct {
     pub const infra = @import("bootstrap/infra.zig");
+    pub const stores = @import("bootstrap/stores.zig");
+    pub const settings = @import("bootstrap/settings.zig");
+    pub const rest = @import("bootstrap/rest.zig");
+    pub const files = @import("bootstrap/files.zig");
+    pub const sab = @import("bootstrap/sab.zig");
+    pub const wiring_test = @import("bootstrap/wiring_test.zig");
 };
 
 pub const core = struct {
@@ -137,6 +143,7 @@ pub const app = struct {
         pub const transport = @import("app/notify/transport.zig");
         pub const discord = @import("app/notify/discord.zig");
         pub const slack = @import("app/notify/slack.zig");
+        pub const webhook = @import("app/notify/webhook.zig");
         pub const service = @import("app/notify/service.zig");
     };
 };
@@ -173,6 +180,16 @@ pub const api = struct {
     };
 };
 
+/// The subcommand bodies. `main.zig` only dispatches; everything a
+/// subcommand does — flag grammar, endpoint resolution, output — lives
+/// here, where it can be tested without a process.
+pub const cli = struct {
+    pub const api = @import("cli/api.zig");
+    pub const healthcheck = @import("cli/healthcheck.zig");
+    pub const download = @import("cli/download.zig");
+    pub const server = @import("cli/server.zig");
+};
+
 pub const net = struct {
     pub const socket = @import("net/socket.zig");
     pub const tls = @import("net/tls.zig");
@@ -189,6 +206,9 @@ pub const testserver = struct {
     pub const nntp = @import("testserver/nntp.zig");
 };
 
+/// The end-to-end suite: a booted `App` driven over its own HTTP
+/// surface. Lives here rather than beside the code it exercises because
+/// what it exercises is the composition root, not any one module.
 pub const posix = struct {
     pub const sys = @import("posix/sys.zig");
     pub const reactor = @import("posix/reactor.zig");
@@ -199,6 +219,12 @@ pub const posix = struct {
 test {
     _ = bootstrap;
     _ = wiring.infra;
+    _ = wiring.stores;
+    _ = wiring.settings;
+    _ = wiring.rest;
+    _ = wiring.files;
+    _ = wiring.sab;
+    _ = wiring.wiring_test;
     _ = core.crc32;
     _ = core.toml;
     _ = core.config;
@@ -284,6 +310,7 @@ test {
     _ = app.notify.transport;
     _ = app.notify.discord;
     _ = app.notify.slack;
+    _ = app.notify.webhook;
     _ = app.notify.service;
     _ = api.sse;
     _ = api.metrics;
@@ -310,6 +337,10 @@ test {
     _ = api.sab.dto;
     _ = api.sab.form;
     _ = api.sab.handler;
+    _ = cli.api;
+    _ = cli.healthcheck;
+    _ = cli.download;
+    _ = cli.server;
     _ = net.socket;
     _ = net.tls;
     _ = net.http.request;
