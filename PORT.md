@@ -130,40 +130,43 @@ test passes trivially when there are no jobs in flight to lose.
 
 #### What is wired, as of now
 
-61 HTTP routes are live and the daemon accepts an NZB — the job lands in the
-queue, in the SAB API's `mode=queue`, and `download.job.created` reaches the
-outbox. Auth, backups, settings and the SSE hubs work.
+**A real download completes end to end.** NZB in, segments fetched over
+NNTP, yEnc decoded, PAR2 verified, delivered — with the delivered bytes
+compared against the original, not merely a status checked. 61 HTTP routes,
+auth, backups, settings, SSE, metrics, the SAB API, and a clean restart with
+a stable API key.
 
-**No segment is fetched yet**, because of three things that are genuine
-architectural mismatches rather than missing plumbing:
+TLS works and is genuinely interoperable: exercised by hand against a real
+OpenSSL TLS 1.3 server — handshake, chain verification, AUTHINFO, and a
+128 KiB multi-record body byte-exact. Being `net/tls.zig`'s first caller
+found two bugs in it (aliased plaintext/ciphertext buffers corrupting the
+first byte of every connection, and a default write buffer below the size
+`Client.flush` asserts on, which panicked), both since fixed.
 
-* ~~No DNS.~~ **Done** — `src/net/dns.zig`, 56 tests. Callback-based like
-  everything else, so a job fiber resolves its provider the way it fetches
-  an article. With no `/etc/resolv.conf` it falls back to Docker's embedded
-  resolver first, then public ones, and flags that it did so. TTL floor 30 s,
-  ceiling 1 h, 256 entries.
+Hostnames resolve, through our own DNS client.
 
-  It parses attacker-influenced bytes, so the hostile cases are the tests
-  that matter: self-referential and two-pointer compression cycles, names
-  over 253 bytes, rdlength past the message, ID and question mismatches,
-  answers for names outside the CNAME chain. A forged datagram is *ignored*
-  rather than fatal — treating it as an error would let anyone who can spoof
-  a packet turn a lookup into a denial of service.
+**The idle property survived all of it**: one thread, 7.0 MB resident, and
+0.000% CPU with the whole surface wired.
 
-  Not implemented: EDNS0 (so 512-byte UDP, with TC→TCP as the only route to
-  bigger answers), negative caching, `search`/`ndots` suffixing, DNSSEC.
-* **`ArticleFetcher` is synchronous** while the NNTP pool and connection are
-  callback-based on the reactor. The bridge is `src/posix/fiber.zig`, which
-  already exists for exactly this shape of problem — it was built so TLS's
-  synchronous handshake could run on a single-threaded loop.
-* **The outbox dispatchers are OS threads** while the reactor, both SSE hubs
-  and every SQLite connection are single-threaded, so the
-  verify/repair/extract/deliver/notify subscribers are not subscribed.
+### Still missing
 
-Three REST ports are deliberately null and asserted so in a test — wiring
-one without deleting its excuse fails the build: `probe` (needs the NNTP
-client on a fiber), `health` (no service in the app layer yet), and `disk`
-(needs `statfs`, which belongs in the syscall layer).
+* **PAR2 repair is a stub.** `pipeline.Repairer` returns `UnrecoverableSet`,
+  so `RepairNeeded` goes straight to `repair.failed` and never `RepairOK`.
+  The Reed-Solomon reconstruct and the verifier exist and are tested;
+  nothing calls them. A damaged release is not repaired — which on Usenet is
+  the normal case, not an edge one.
+* **Notify never fires.** `Transport.post` blocks and its retry path
+  *sleeps*, neither of which can run on the loop, so nothing is subscribed.
+  The webhook, Discord and Slack senders are complete and tested but never
+  called.
+* **Verify and extract run inline on the reactor thread.** Hashing or
+  decompressing a large release stalls HTTP and every other job for the
+  duration.
+
+Three REST ports remain null, each asserted so in a test — wiring one
+without deleting its excuse fails the build: `health` (no service in the app
+layer) and `disk` (needs `statfs` in the syscall layer). `probe` is now
+wired.
 
 ## The parity gate
 
