@@ -226,6 +226,62 @@ pub fn loadOrCreate(
     return .{ .arena = arena_ptr, .config = cfg };
 }
 
+/// Decode a configuration from bytes the caller already read.
+///
+/// `loadOrCreate` needs an `std.Io` for its file access. The daemon
+/// deliberately has none — `posix/sys.zig` explains why — so `serve` reads
+/// the file with its own syscalls and decodes here. Same precedence as
+/// `loadOrCreate`: file, then environment, then normalise, then validate.
+///
+/// `src` null means "no config file present", which is not an error: every
+/// setting has a default, and a fresh container should start.
+///
+/// `base_dir` is required rather than defaulting to the working directory,
+/// because resolving that also needs an `std.Io`.
+pub fn loadFromBytes(
+    gpa: Allocator,
+    src: ?[]const u8,
+    base_dir: []const u8,
+    opts: Options,
+) LoadError!Loaded {
+    const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_ptr);
+    arena_ptr.* = .init(gpa);
+    errdefer arena_ptr.deinit();
+    const arena = arena_ptr.allocator();
+
+    var cfg = default();
+
+    if (src) |text| {
+        var tdiag: toml.Diagnostic = .{};
+        var parsed = toml.parse(gpa, text, &tdiag) catch |err| {
+            if (opts.diag) |d| {
+                d.toml = tdiag;
+                d.set("config: {t} at line {d} column {d}", .{ err, tdiag.line, tdiag.column });
+            }
+            return error.ParseFailed;
+        };
+        defer parsed.deinit();
+        try decodeTable(Config, "", arena, parsed.root, &cfg, opts.diag);
+    }
+
+    if (opts.env) |env| try applyEnvOverrides(arena, &cfg, env);
+
+    // A first start has no file and therefore no key, and `validate`
+    // rightly refuses an empty one. `loadOrCreate` generates it inline
+    // because it has an `std.Io` to write the file with; here the caller
+    // generates it and is responsible for persisting it, so the same key
+    // is still there on the next start.
+    if (cfg.auth.api_key.len == 0) {
+        if (opts.api_key_fallback) |k| cfg.auth.api_key = try arena.dupe(u8, k);
+    }
+
+    try normalize(arena, &cfg, base_dir);
+    try validate(&cfg, opts.diag);
+
+    return .{ .arena = arena_ptr, .config = cfg };
+}
+
 pub const Options = struct {
     /// Environment to take `HOARDARR_*` overrides from. Null applies no
     /// overrides at all, which is what most tests want.
@@ -234,6 +290,10 @@ pub const Options = struct {
     /// working directory.
     base_dir: ?[]const u8 = null,
     diag: ?*Diagnostic = null,
+    /// Used by `loadFromBytes` when the decoded config carries no API key.
+    /// The caller must persist it, or a new one is minted every start and
+    /// every existing client's key stops working.
+    api_key_fallback: ?[]const u8 = null,
 };
 
 /// Check invariants, returning the first violation. Runs after
@@ -991,4 +1051,55 @@ test "save then load preserves every value" {
     try t.expectEqual(@as(i64, 0), loaded.config.server.max_concurrent_jobs);
     try t.expectEqual(@as(f64, 0.1), loaded.config.server.fail_hopeless_ratio);
     try t.expectEqual(false, loaded.config.server.delete_samples);
+}
+
+test "loadFromBytes decodes without needing an Io" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\[server]
+        \\listen = ":9999"
+        \\log_level = "debug"
+        \\
+    ;
+    var loaded = try loadFromBytes(gpa, src, "/data", .{ .api_key_fallback = "k" ** 32 });
+    defer loaded.deinit();
+
+    try std.testing.expectEqualStrings(":9999", loaded.config.server.listen);
+    try std.testing.expectEqualStrings("debug", loaded.config.server.log_level);
+    // normalize ran, so relative paths resolved against base_dir.
+    try std.testing.expect(std.mem.startsWith(u8, loaded.config.server.data_dir, "/"));
+}
+
+test "a missing key without a fallback is refused, not defaulted" {
+    const gpa = std.testing.allocator;
+    // Silently running with an empty API key would leave the instance
+    // open to anything that can reach the port.
+    try std.testing.expectError(
+        error.EmptyAPIKey,
+        loadFromBytes(gpa, null, "/data", .{}),
+    );
+}
+
+test "a missing config file is not an error" {
+    const gpa = std.testing.allocator;
+    // A fresh container has no config.toml and must still start; every
+    // setting has a default.
+    var loaded = try loadFromBytes(gpa, null, "/data", .{ .api_key_fallback = "k" ** 32 });
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings(default().server.listen, loaded.config.server.listen);
+}
+
+test "loadFromBytes still validates" {
+    const gpa = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    // Skipping validation would let a bad value through to a subsystem
+    // that reports it far less clearly.
+    try std.testing.expectError(
+        error.EmptyListen,
+        loadFromBytes(gpa, "[server]\nlisten = \"\"\n", "/data", .{
+            .diag = &diag,
+            .api_key_fallback = "k" ** 32,
+        }),
+    );
+    try std.testing.expect(diag.msg.len > 0);
 }

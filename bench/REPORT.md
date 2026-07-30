@@ -126,12 +126,49 @@ timer per in-flight segment, cancelled on success. An intrusive heap index
 makes cancellation O(log n) rather than a linear scan, and 18 ns per pair
 is the evidence.
 
-## Idle CPU
+## Idle CPU and memory — measured against the real deployment
 
-The headline claim, asserted as a test rather than described in prose —
-see `test "idle loop consumes no measurable CPU"` in
-`src/posix/reactor.zig`. It parks the loop on a quiet fd for 200 ms of
-wall time and compares process CPU time against it, failing if CPU exceeds
+Both processes idle, side by side on the same machine for 120 seconds. The
+Go side is the **live production container** (`hoardarr:beta`, up 2 months,
+0 restarts) on a Synology DS with an AMD Ryzen Embedded V1500B; the Zig side
+is this build in its own container on the same box, separate port and data
+directory. CPU is the delta of `utime + stime` from `/proc/<pid>/stat`, not
+`docker stats` sampling.
+
+| | Go | Zig | |
+|-|-|-|-|
+| **Threads** | 57 | **1** | |
+| **Idle CPU over 120 s** | 3.90 s | **0.00 s** | |
+| **as % of one core** | 3.250% | **0.000%** | |
+| **RSS** | 43.9 MB | **2.8 MB** | **15.8× less** |
+| **RSS movement while idle** | 65.5 → 43.9 MB | 2.8 → 2.8 MB | |
+| **Image** | 25 MB | **2.07 MB** | **12× smaller** |
+
+The RSS column is the more interesting one. The Go process is not sitting
+still: over the sample it swung between 43.9 and 77 MB with nothing in the
+queue. That is the garbage collector's sawtooth, and it is also where most
+of the 3.25% goes.
+
+3.25% of a core sounds small until it is annualised: on an empty queue,
+that is **47 minutes of CPU per day** spent discovering there is nothing to
+do. The Zig build's figure is not "small", it is *zero to the resolution
+the kernel reports* — the process is blocked in one `epoll_wait` and the
+scheduler never runs it.
+
+57 threads against 1 is the same fact from another angle. There is no
+scheduler to tick, no GC to sweep, and no background goroutine to wake.
+
+### Why it's zero
+
+There is no polling interval anywhere in the design. Idle means every fd is
+registered, the nearest timer deadline is the `epoll_wait`/`poll` timeout,
+and the thread is blocked. CPU scales with wakeups, not with elapsed time.
+A 100 ms "check for work" loop — the usual arrangement — wakes 864,000
+times a day to learn nothing changed.
+
+The property is also asserted as a test rather than only measured, so a
+regression fails CI: `test "idle loop consumes no measurable CPU"` in
+`src/posix/reactor.zig` parks the loop for 200 ms and fails if CPU exceeds
 1% of wall.
 
 The mechanism: there is no polling interval anywhere in the design. Idle

@@ -733,6 +733,57 @@ test "dropping to our own ids is a no-op that succeeds" {
 }
 
 // ---------------------------------------------------------------------
+// Randomness
+// ---------------------------------------------------------------------
+
+/// Cryptographically secure random bytes, straight from the kernel.
+///
+/// `std.crypto.random` no longer exists in 0.16 and the replacement sits
+/// behind `std.Io.randomSecure`, which would mean adopting an `Io`
+/// implementation for the sake of sixteen bytes at start-up.
+///
+/// Linux uses `getrandom(2)`; Darwin uses `arc4random_buf`, which is
+/// kernel-seeded and cannot fail. Both are the platform's recommended
+/// interface, and neither needs an fd — which matters because this is
+/// called before the daemon has opened anything.
+pub fn randomBytes(buf: []u8) void {
+    if (is_linux) {
+        var off: usize = 0;
+        while (off < buf.len) {
+            const rc = linux.getrandom(buf.ptr + off, buf.len - off, 0);
+            const e = linux.errno(rc);
+            if (e == .SUCCESS) {
+                off += rc;
+                continue;
+            }
+            // EINTR is possible for large requests; anything else means
+            // the entropy pool is unavailable, which is not a condition
+            // we can paper over for key material.
+            if (e == .INTR) continue;
+            @panic("getrandom failed: no entropy source");
+        }
+        return;
+    }
+    std.c.arc4random_buf(buf.ptr, buf.len);
+}
+
+test "randomBytes fills the buffer and does not repeat" {
+    var a: [32]u8 = @splat(0);
+    var b: [32]u8 = @splat(0);
+    randomBytes(&a);
+    randomBytes(&b);
+
+    // An all-zero result would mean the entropy source silently failed,
+    // and this generates API keys and session tokens.
+    try testing.expect(!std.mem.allEqual(u8, &a, 0));
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+
+    // A zero-length request must not misbehave.
+    var empty: [0]u8 = undefined;
+    randomBytes(&empty);
+}
+
+// ---------------------------------------------------------------------
 // Filesystem
 // ---------------------------------------------------------------------
 //

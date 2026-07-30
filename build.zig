@@ -38,7 +38,9 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         }),
     });
-    exe.root_module.addOptions("build_info", build_info);
+    // Deliberately not addOptions here: the exe imports `hoardarr`, which
+    // already has it, and adding it again would make the same generated
+    // file the root of two different modules — which Zig rejects.
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -85,7 +87,6 @@ pub fn build(b: *std.Build) void {
         check_hoardarr.addOptions("build_info", build_info);
         addSqlite(b, check_hoardarr, resolved, .ReleaseFast);
         addAssets(b, check_hoardarr, embed_ui);
-        check_mod.addOptions("build_info", build_info);
         check_mod.addImport("hoardarr", check_hoardarr);
         const obj = b.addObject(.{
             .name = b.fmt("check-{s}-{s}", .{ @tagName(query.cpu_arch.?), @tagName(query.abi.?) }),

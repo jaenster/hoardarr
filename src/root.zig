@@ -8,6 +8,12 @@
 //! new file means adding a line there — deliberate, so a file can never
 //! silently drop out of the test run.
 
+/// Re-exported so `main.zig` reads version metadata through this module
+/// rather than importing the generated options file a second time.
+pub const build_info = @import("build_info");
+
+pub const bootstrap = @import("bootstrap.zig");
+
 pub const core = struct {
     pub const crc32 = @import("core/crc32.zig");
     pub const toml = @import("core/toml.zig");
@@ -20,6 +26,16 @@ pub const codec = struct {
     pub const yenc = @import("codec/yenc.zig");
     pub const xml = @import("codec/xml.zig");
     pub const nzb = @import("codec/nzb.zig");
+    pub const rar = struct {
+        pub const cursor = @import("codec/rar/cursor.zig");
+        pub const source = @import("codec/rar/source.zig");
+        pub const path = @import("codec/rar/path.zig");
+        pub const volume = @import("codec/rar/volume.zig");
+        pub const rar3 = @import("codec/rar/rar3.zig");
+        pub const rar5 = @import("codec/rar/rar5.zig");
+        pub const rar = @import("codec/rar/rar.zig");
+        pub const extract = @import("codec/rar/extract.zig");
+    };
     pub const par2 = struct {
         pub const gf16 = @import("codec/par2/gf16.zig");
         pub const matrix = @import("codec/par2/matrix.zig");
@@ -89,6 +105,18 @@ pub const app = struct {
     };
 };
 
+pub const api = struct {
+    pub const sab = struct {
+        pub const fmt = @import("api/sab/fmt.zig");
+        pub const nzo = @import("api/sab/nzo.zig");
+        pub const sort_eval = @import("api/sab/sort_eval.zig");
+        pub const ports = @import("api/sab/ports.zig");
+        pub const dto = @import("api/sab/dto.zig");
+        pub const form = @import("api/sab/form.zig");
+        pub const handler = @import("api/sab/handler.zig");
+    };
+};
+
 pub const net = struct {
     pub const socket = @import("net/socket.zig");
     pub const tls = @import("net/tls.zig");
@@ -108,6 +136,7 @@ pub const posix = struct {
 };
 
 test {
+    _ = bootstrap;
     _ = core.crc32;
     _ = core.toml;
     _ = core.config;
@@ -116,6 +145,14 @@ test {
     _ = codec.yenc;
     _ = codec.xml;
     _ = codec.nzb;
+    _ = codec.rar.cursor;
+    _ = codec.rar.source;
+    _ = codec.rar.path;
+    _ = codec.rar.volume;
+    _ = codec.rar.rar3;
+    _ = codec.rar.rar5;
+    _ = codec.rar.rar;
+    _ = codec.rar.extract;
     _ = codec.par2.gf16;
     _ = codec.par2.matrix;
     _ = codec.par2.par2;
@@ -164,6 +201,13 @@ test {
     _ = app.notify.discord;
     _ = app.notify.slack;
     _ = app.notify.service;
+    _ = api.sab.fmt;
+    _ = api.sab.nzo;
+    _ = api.sab.sort_eval;
+    _ = api.sab.ports;
+    _ = api.sab.dto;
+    _ = api.sab.form;
+    _ = api.sab.handler;
     _ = net.socket;
     _ = net.tls;
     _ = net.http.request;
