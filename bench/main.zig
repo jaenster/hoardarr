@@ -26,6 +26,8 @@ const crc32 = hoardarr.core.crc32;
 const yenc = hoardarr.codec.yenc;
 const nzb = hoardarr.codec.nzb;
 const toml = hoardarr.core.toml;
+const protocol = hoardarr.nntp.protocol;
+const gf16 = hoardarr.codec.par2.gf16;
 const reactor = hoardarr.posix.reactor;
 
 /// Timed rounds per benchmark. Odd so the median is a real sample.
@@ -281,6 +283,99 @@ fn benchTomlParse(gpa: std.mem.Allocator) !Result {
 }
 
 // ---------------------------------------------------------------------
+// NNTP body reader
+// ---------------------------------------------------------------------
+
+/// A dot-stuffed multi-line block the size of an article body. Every byte
+/// of every article passes through the unstuffing scan, so this sits
+/// directly on the download path.
+fn makeStuffedBody(gpa: std.mem.Allocator) ![]const u8 {
+    var buf: std.Io.Writer.Allocating = .init(gpa);
+    const w = &buf.writer;
+    var prng = std.Random.DefaultPrng.init(0xD07);
+    const rand = prng.random();
+
+    var written: usize = 0;
+    while (written < article_payload) {
+        // 128-byte lines, matching the yEnc wrap width articles actually
+        // arrive with.
+        var line: [128]u8 = undefined;
+        for (&line) |*b| b.* = rand.intRangeAtMost(u8, 0x21, 0x7E);
+        // Every 64th line starts with a dot, so the stuffing path is
+        // exercised at a realistic rate rather than never or always.
+        if (written % (64 * 130) == 0) line[0] = '.';
+        try w.writeAll(&line);
+        try w.writeAll("\r\n");
+        written += line.len + 2;
+    }
+    try w.writeAll(".\r\n");
+    return buf.toOwnedSlice();
+}
+
+fn benchNntpBodyRead(gpa: std.mem.Allocator) !Result {
+    const body = try makeStuffedBody(gpa);
+    const dst = try gpa.alloc(u8, body.len);
+
+    const Ctx = struct { body: []const u8, dst: []u8 };
+    var ctx = Ctx{ .body = body, .dst = dst };
+    return measure(Ctx, &ctx, struct {
+        fn f(c: *Ctx) anyerror!usize {
+            var r: protocol.BodyReader = .{};
+            const step = r.push(c.body, c.dst);
+            return step.written;
+        }
+    }.f, @floatFromInt(body.len), .mb_per_s);
+}
+
+/// The scalar reference, for the ratio the SIMD path is claimed to win by.
+fn benchNntpBodyReadScalar(gpa: std.mem.Allocator) !Result {
+    const body = try makeStuffedBody(gpa);
+    const dst = try gpa.alloc(u8, body.len);
+
+    const Ctx = struct { body: []const u8, dst: []u8 };
+    var ctx = Ctx{ .body = body, .dst = dst };
+    return measure(Ctx, &ctx, struct {
+        fn f(c: *Ctx) anyerror!usize {
+            var r: protocol.BodyReader = .{};
+            const step = r.pushByteAtATime(c.body, c.dst);
+            return step.written;
+        }
+    }.f, @floatFromInt(body.len), .mb_per_s);
+}
+
+// ---------------------------------------------------------------------
+// GF(2^16) Reed-Solomon
+// ---------------------------------------------------------------------
+
+/// The repair hot loop: multiply a slice by a constant and XOR it into an
+/// accumulator. A PAR2 repair does this once per (damaged slice x
+/// recovery slice) pair, so it is the whole cost of a repair.
+///
+/// One slice of a real PAR2 set — the vendored fixture uses 1.5 MiB
+/// slices — expressed as GF(2^16) elements.
+const rs_slice_elements = (1536 * 1024) / 2;
+
+fn benchGf16MulAdd(gpa: std.mem.Allocator) !Result {
+    const acc = try gpa.alloc(u16, rs_slice_elements);
+    const src = try gpa.alloc(u16, rs_slice_elements);
+    var prng = std.Random.DefaultPrng.init(0x6F16);
+    prng.random().bytes(std.mem.sliceAsBytes(acc));
+    prng.random().bytes(std.mem.sliceAsBytes(src));
+
+    const Ctx = struct { acc: []u16, src: []const u16, c: u16 = 0 };
+    var ctx = Ctx{ .acc = acc, .src = src };
+    return measure(Ctx, &ctx, struct {
+        fn f(c: *Ctx) anyerror!usize {
+            // Vary the constant: a fixed one would let the optimiser hoist
+            // table lookups out of the timed region.
+            c.c +%= 0x9E37;
+            gf16.mulAddSlice(c.acc, c.src, c.c | 1);
+            return c.acc.len;
+        }
+    }.f, @floatFromInt(rs_slice_elements * 2), .mb_per_s);
+}
+
+// ---------------------------------------------------------------------
 // Reactor
 // ---------------------------------------------------------------------
 
@@ -366,6 +461,9 @@ const all_benchmarks = [_]Benchmark{
     .{ .name = "yenc decode, no crc", .unit = "MB/s", .run = benchYencDecodeNoCrc },
     .{ .name = "nzb parse (50f x 200seg)", .unit = "MB/s", .run = benchNzbParse },
     .{ .name = "toml parse", .unit = "MB/s", .run = benchTomlParse },
+    .{ .name = "nntp body read (750 KiB)", .unit = "MB/s", .run = benchNntpBodyRead },
+    .{ .name = "nntp body read, scalar ref", .unit = "MB/s", .run = benchNntpBodyReadScalar },
+    .{ .name = "gf16 mul-add (1.5 MiB slice)", .unit = "MB/s", .run = benchGf16MulAdd },
     .{ .name = "reactor timer arm+cancel", .unit = "ops/s", .run = benchTimerChurn },
     .{ .name = "reactor dispatch (64 fds)", .unit = "ops/s", .run = benchReactorDispatch },
 };

@@ -19,15 +19,23 @@ throughput measurement that is what has to be equal.
 
 | Benchmark | Go | Zig | Ratio |
 |-|-|-|-|
-| CRC-32 (750 KiB) | 9409 MB/s | 9448 MB/s | 1.00× |
-| yEnc decode + CRC (750 KiB) | 1830 MB/s | 3650 MB/s | **2.00×** |
-| yEnc decode, CRC skipped | — | 6190 MB/s | — |
-| NZB parse (50 files × 200 segments) | 49.5 MB/s | 367 MB/s | **7.4×** |
-| TOML parse (config document) | 26.1 MB/s | 300 MB/s | **11.5×** |
+| CRC-32 (750 KiB) | 9948 MB/s | 9766 MB/s | 0.98× |
+| yEnc decode + CRC (750 KiB) | 1902 MB/s | 3571 MB/s | **1.88×** |
+| yEnc decode, CRC skipped | — | 6115 MB/s | — |
+| NNTP body read, dot-unstuffing (750 KiB) | 7569 MB/s | 10720 MB/s | **1.42×** |
+| NNTP body read, scalar reference | — | 879 MB/s | — |
+| GF(2^16) multiply-accumulate (1.5 MiB slice) | 1445 MB/s | 4576 MB/s | **3.17×** |
+| NZB parse (50 files × 200 segments) | 52.7 MB/s | 400 MB/s | **7.6×** |
+| TOML parse (config document) | 24.9 MB/s | 304 MB/s | **12.2×** |
+
+Run-to-run variance on this machine is a few percent, so treat the last
+digit as noise. CRC-32 in particular lands either side of parity depending
+on the run.
 
 ### Reading these honestly
 
-**CRC-32 is a tie, and that's the expected result.** Go's
+**CRC-32 is a tie — Go was marginally ahead in this run — and that's the
+expected result.** Go's
 `hash/crc32` already dispatches to the ARMv8 `crc32` instructions, and so
 do we. There is no win available here — both implementations are limited
 by the same instruction throughput. It's in the table precisely because a
@@ -48,6 +56,28 @@ re-entry instead of 16 scalar iterations.
 With CRC skipped the decoder reaches 6190 MB/s, which shows the combined
 figure is roughly half decode and half checksum. On a real download the
 CRC is not optional, so 3650 MB/s is the number that counts.
+
+**The NNTP body reader's 1.46× is against an already-fast Go version.**
+Commit `2fcb663` replaced Go's stdlib `textproto` reader with a
+line-batched one and got ~15× out of it; that optimised version is what
+7346 MB/s measures, not the stdlib's 0.32 GB/s. So this is a vectorised
+scan against a good scalar one. The Zig scalar reference is in the table
+at 879 MB/s to show what the vectorisation itself is worth — 12× — and to
+make clear the 1.42× is the honest number against a fair opponent.
+
+One caveat on that baseline: `internal/adapter/nntp` has two body-read
+benchmarks with different framing, and they disagree —
+`BenchmarkBodyRead_Fast` reports 4927 MB/s while the one added for this
+comparison reports 7569 MB/s, because the former includes per-call reader
+construction (29 allocs/op). The faster figure is quoted, since the point
+is to measure the scan against the strongest version of the Go scan.
+
+**GF(2^16)'s 3.17× is partly an implementation gap, and that's worth
+saying plainly.** Go has no bulk multiply at all: `internal/adapter/par2/rs.go`
+does `acc[k] ^= gf16.Mul(coef, d)` element by element, and that loop is
+what the baseline measures, because it is what a Go repair actually runs.
+Some of the 3.17× is SIMD and some is simply that nobody wrote the bulk
+path in Go. Either way it's the real before-and-after for a repair.
 
 **NZB and TOML are large ratios against small absolute costs.** 7.4× and
 11.5× look dramatic, and the mechanism is real — no reflection, no
@@ -115,8 +145,6 @@ nobody can symbolise.
 
 These are in the goal and still owed:
 
-- NNTP body read (dot-unstuffing) throughput
-- GF(2^16) Reed-Solomon repair throughput
 - HTTP requests/s on `/api/queue`
 - Resident memory at idle, Go vs Zig
 - Container image size, Go vs Zig

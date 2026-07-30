@@ -42,8 +42,11 @@ echo " go baseline"
 echo "=============================================================="
 # -benchtime=2s so each case gets enough iterations to settle; Go's
 # default 1s leaves the fast cases noisy.
+# internal/adapter/nntp is included because fastBodyReader is unexported,
+# so its benchmark has to live in-package rather than under bench/go/.
+go_pkgs=(./bench/go/ ./internal/adapter/nntp/)
 if [[ -n "$filter" ]]; then
-    go test -run '^$' -bench "$filter" -benchtime=2s ./bench/go/
+    go test -run '^$' -bench "$filter" -benchtime=2s "${go_pkgs[@]}"
 else
-    go test -run '^$' -bench . -benchtime=2s ./bench/go/
+    go test -run '^$' -bench . -benchtime=2s "${go_pkgs[@]}"
 fi

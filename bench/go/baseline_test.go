@@ -16,10 +16,12 @@ import (
 	"crypto/rand"
 	"fmt"
 	"hash/crc32"
+	mrand "math/rand"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/jaenster/hoardarr/internal/adapter/par2/gf16"
 	"github.com/jaenster/hoardarr/internal/adapter/nzb"
 	"github.com/jaenster/hoardarr/internal/adapter/yenc"
 )
@@ -150,6 +152,37 @@ hosts = ["news.example.invalid", "news2.example.invalid"]
 tls = true
 port = 563
 `
+
+// One PAR2 slice's worth of GF(2^16) elements. The vendored fixture uses
+// 1.5 MiB slices, and a repair multiplies-and-accumulates once per
+// (damaged slice x recovery slice) pair, so this loop is the whole cost.
+const rsSliceElements = (1536 * 1024) / 2
+
+// BenchmarkGF16MulAdd is the honest Go baseline: the Go implementation has
+// no bulk multiply at all. internal/adapter/par2/rs.go does exactly this,
+// `acc[k] ^= gf16.Mul(coef, d)` element by element, so that is what the
+// Zig bulk path is measured against.
+func BenchmarkGF16MulAdd(b *testing.B) {
+	acc := make([]uint16, rsSliceElements)
+	src := make([]uint16, rsSliceElements)
+	rng := mrand.New(mrand.NewSource(0x6F16))
+	for i := range acc {
+		acc[i] = uint16(rng.Uint32())
+		src[i] = uint16(rng.Uint32())
+	}
+	b.SetBytes(int64(rsSliceElements * 2))
+	b.ResetTimer()
+	var c uint16
+	for i := 0; i < b.N; i++ {
+		// Vary the constant, matching the Zig harness, so the compiler
+		// can't hoist anything out of the timed region.
+		c += 0x9E37
+		coef := c | 1
+		for k := range acc {
+			acc[k] ^= gf16.Mul(coef, src[k])
+		}
+	}
+}
 
 func BenchmarkTOMLParse(b *testing.B) {
 	b.SetBytes(int64(len(tomlDoc)))
