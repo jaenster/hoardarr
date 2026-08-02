@@ -93,6 +93,22 @@ pub fn build(b: *std.Build) void {
             .root_module = check_mod,
         });
         check.dependOn(&obj.step);
+
+        // The load generator ships to the same NAS as the daemon, so it
+        // has to survive the same cross-compile. It reuses the library
+        // module above rather than the leaner one it links against for
+        // real: type-checking against the superset is strictly stronger.
+        const check_loadgen = b.createModule(.{
+            .root_source_file = b.path("tools/loadgen.zig"),
+            .target = resolved,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "hoardarr", .module = check_hoardarr }},
+        });
+        const loadgen_obj = b.addObject(.{
+            .name = b.fmt("check-loadgen-{s}-{s}", .{ @tagName(query.cpu_arch.?), @tagName(query.abi.?) }),
+            .root_module = check_loadgen,
+        });
+        check.dependOn(&loadgen_obj.step);
     }
 
     // ---- benchmarks ----
@@ -125,6 +141,37 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     if (b.args) |args| run_bench.addArgs(args);
     b.step("bench", "Run microbenchmarks").dependOn(&run_bench.step);
+
+    // ---- load generator ----
+    //
+    // Its own library module, without SQLite and without the frontend:
+    // loadgen touches only the fixture generator, the fake NNTP server
+    // and the reactor, so linking the amalgamation into it would add a
+    // C compile and a megabyte of image for code it never calls.
+    const loadgen_lib = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    loadgen_lib.addOptions("build_info", build_info);
+    addAssets(b, loadgen_lib, false);
+
+    const loadgen = b.addExecutable(.{
+        .name = "loadgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/loadgen.zig"),
+            .target = target,
+            // Always ReleaseFast: a load generator that is itself the
+            // bottleneck measures nothing about the daemon.
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "hoardarr", .module = loadgen_lib }},
+            .strip = strip,
+        }),
+    });
+    // Installed only on demand, like bench: `zig build` is a product
+    // build and the product image does not carry a load harness.
+    const install_loadgen = b.addInstallArtifact(loadgen, .{});
+    b.step("loadgen", "Build the NNTP load generator").dependOn(&install_loadgen.step);
 }
 
 /// Compile the vendored SQLite amalgamation and attach it to `mod`.

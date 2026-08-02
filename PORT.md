@@ -293,14 +293,55 @@ Order:
   are done.
 * The CA bundle for TLS has to be embedded at build time; the container
   has no `/etc/ssl/certs` to read.
-* **TLS has never completed a handshake against a real server.** `std.crypto.tls`
-  ships a client and no server, so the tests reach an inspected ClientHello
-  and can drive server records back in (a fatal alert becomes `TlsAlert`,
-  garbage becomes a protocol error, a truncated record becomes a transport
-  failure), but nothing gets as far as ServerHello, the key schedule, or
-  certificate verification. `reader()`/`writer()` compile and cross-compile
-  but have never moved a plaintext byte. **This must be validated against a
-  real provider before anyone relies on it.**
+* TLS now completes a handshake against a real provider, and is covered.
+  It did not before, and the reason it did not was a missing second flush:
+  `std.crypto.tls.Client.flush` only *stages* a record — it encrypts into
+  the ciphertext writer's buffer and advances it, leaving the syscall to
+  whoever owns that writer, the same pair `std.http.Client.Connection.flush`
+  performs. Both TLS callers flushed the plaintext side alone, so every
+  command after the greeting sat in the ciphertext buffer and the session
+  blocked waiting for an answer the provider had never been asked for. The
+  connection died on the 30 s per-command deadline as `Network`, which
+  looked like a socket problem and was not. Fixed in `nntp/transport.zig`
+  (`Tls.flush`), `net/tls.zig` (`Conn.flush`, `Conn.close`) and
+  `bootstrap/notify.zig` (`Sink.flush`, for `https://` webhooks).
+
+  Coverage is hermetic and runs on every build. `std.crypto.tls` still
+  ships no server, but in TLS 1.3 every client secret comes out of
+  `Options.entropy`, so pinning those 240 bytes makes the ClientHello, the
+  ECDHE share and the transcript hash identical on every run — and a server
+  flight captured against them decrypts forever. `nntp/transport.zig`
+  replays one recorded from `news.eweka.nl:563` (greeting, `AUTHINFO
+  USER`/`PASS`, rejection) through both `Tls` and `net/tls.zig`'s `Conn`,
+  against a peer that counts the client's bytes before releasing each
+  answer, so a command that never left the process fails the test instead
+  of being answered anyway. The one thing a recording cannot be is a second
+  implementation; the `openssl s_server` recipe in `nntp/transport.zig` is
+  the manual live check, and nothing in CI runs it.
+* `https://` webhooks had a *second*, unrelated defect, which the flush fix
+  did not touch: every delivery failed at the handshake with
+  `TransportFailed`, on Linux only. `bootstrap/notify.zig` dials on the
+  dispatch fiber and hands the fd to a `tls.Conn`, which parks it on its
+  own fiber — but `Fiber.park` deliberately keeps its registration alive
+  between parks, so the dialling fiber was still the fd's registered owner.
+  `epoll_ctl(ADD)` answers `EEXIST` for the second registration, the
+  handshake's first read failed before a byte was read, and the whole thing
+  surfaced as "the peer went away". Fixed in `net/tls.zig`: `dial` now
+  releases the watch (`Fiber.unwatch`) before returning the fd, which is
+  what its contract said all along.
+
+  It could only ship because no test on a development machine can see it:
+  the reactor's `poll(2)` backend accepts a duplicate fd registration
+  silently. `posix/reactor.zig` now refuses it there too, so the portable
+  backend enforces what the shipping one enforces for free.
+
+  Covered the same way as the NNTP path, by a recording made through a
+  relay against `example.com:443` and replayed through `Dispatch.post`
+  itself — DNS, dial, the fd handoff, the handshake, the request, the
+  status line. `Host` carries no port, so the request is byte-identical
+  whatever ephemeral port the replay peer lands on, and the peer withholds
+  the response until it has counted the request's bytes. A 405 arriving is
+  proof the request reached the far end.
 * Fiber stacks are 1 MiB. The canary test measured a real `Client.init` at
   148 KB under ReleaseFast and 506 KB under Debug, and 256 KiB actually
   crashed on the guard page. It is virtual address space, so 40 connections
