@@ -156,7 +156,10 @@ fn expectWired(c: Fixture.Captured, path: []const u8) !void {
 
 test "every route group answers from a freshly booted daemon" {
     const gpa = testing.allocator;
-    var fx = try Fixture.init(gpa, "/tmp/hoardarr-wiring-test");
+    // The fixture borrows this path for its whole life, so the buffer has
+    // to outlive it. See `sys.scratchDir` for why it is not a fixed path.
+    var dir_buf: [sys.path_max]u8 = undefined;
+    var fx = try Fixture.init(gpa, try sys.scratchDir(&dir_buf, "wiring"));
     defer fx.deinit();
 
     const Case = struct {
@@ -222,7 +225,8 @@ test "every route group answers from a freshly booted daemon" {
 
 test "an unauthenticated request is refused before it reaches a handler" {
     const gpa = testing.allocator;
-    var fx = try Fixture.init(gpa, "/tmp/hoardarr-wiring-auth-test");
+    var dir_buf: [sys.path_max]u8 = undefined;
+    var fx = try Fixture.init(gpa, try sys.scratchDir(&dir_buf, "wiring-auth"));
     defer fx.deinit();
 
     // Same request, no key. The API key is checked by the server, so this
@@ -248,7 +252,8 @@ test "an unauthenticated request is refused before it reaches a handler" {
 
 test "an NZB posted through the SAB API lands in the queue both APIs read" {
     const gpa = testing.allocator;
-    var fx = try Fixture.init(gpa, "/tmp/hoardarr-wiring-add-test");
+    var dir_buf: [sys.path_max]u8 = undefined;
+    var fx = try Fixture.init(gpa, try sys.scratchDir(&dir_buf, "wiring-add"));
     defer fx.deinit();
 
     // The smallest NZB that describes something fetchable. Posted as a
@@ -297,7 +302,9 @@ test "an NZB posted through the SAB API lands in the queue both APIs read" {
 
 test "the api key survives a restart" {
     const gpa = testing.allocator;
-    const dir = "/tmp/hoardarr-wiring-key-test";
+    // `dir` points into `dir_buf`, so the join below must write elsewhere.
+    var dir_buf: [sys.path_max]u8 = undefined;
+    const dir = try sys.scratchDir(&dir_buf, "wiring-key");
 
     var fs_impl = @import("infra.zig").RealFs{ .gpa = gpa };
     try fs_impl.filesystem().removeAll(dir);
@@ -335,7 +342,8 @@ test "the api key survives a restart" {
 
 test "the config file is written 0600 because it holds a credential" {
     const gpa = testing.allocator;
-    const dir = "/tmp/hoardarr-wiring-mode-test";
+    var dir_buf: [sys.path_max]u8 = undefined;
+    const dir = try sys.scratchDir(&dir_buf, "wiring-mode");
 
     var fs_impl = @import("infra.zig").RealFs{ .gpa = gpa };
     try fs_impl.filesystem().removeAll(dir);
@@ -387,7 +395,8 @@ fn fileMode(path: [:0]const u8) !u32 {
 
 test "the ports left null are the documented ones and nothing else" {
     const gpa = testing.allocator;
-    var fx = try Fixture.init(gpa, "/tmp/hoardarr-wiring-null-test");
+    var dir_buf: [sys.path_max]u8 = undefined;
+    var fx = try Fixture.init(gpa, try sys.scratchDir(&dir_buf, "wiring-null"));
     defer fx.deinit();
 
     const api = &fx.app.api;

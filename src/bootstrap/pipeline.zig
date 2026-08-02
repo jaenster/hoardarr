@@ -480,7 +480,8 @@ test "a verifier over a real PAR2 set reports per-file verdicts" {
 
     // Lay the release out the way a finished download would have.
     const sys = @import("../posix/sys.zig");
-    const dir = "/tmp/hoardarr-pipeline-verify";
+    var dir_buf: [sys.path_max]u8 = undefined;
+    const dir = try sys.scratchDir(&dir_buf, "pipeline-verify");
     var fs_impl = @import("infra.zig").RealFs{ .gpa = gpa };
     const fs = fs_impl.filesystem();
     try fs.removeAll(dir);

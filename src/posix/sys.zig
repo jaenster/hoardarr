@@ -621,6 +621,41 @@ pub fn eventfd() Error!Fd {
 }
 
 // ---------------------------------------------------------------------
+// Descriptor accounting
+// ---------------------------------------------------------------------
+
+/// How many descriptors this process currently holds open, found by
+/// probing every slot below `ceiling` with `F_GETFD`.
+///
+/// A descriptor leak is the failure that survives every functional
+/// assertion: the pipeline keeps delivering exact bytes right up to the
+/// point where `accept` starts answering EMFILE, and by then the daemon
+/// has been up for days. Measuring it needs a number that means the same
+/// thing everywhere, and `/proc/self/fd` — the obvious source — does not
+/// exist on Darwin, so the probe is used on both rather than the
+/// assertion being Linux-only.
+///
+/// One syscall per slot, so this belongs in a test or a diagnostic and
+/// nowhere near the data path. Slots at or above `ceiling` are not
+/// counted; a caller comparing two readings wants the same ceiling for
+/// both, which is why it is a parameter rather than the rlimit of the
+/// moment.
+pub fn openFdCount(ceiling: Fd) usize {
+    const F_GETFD: i32 = if (is_linux) linux.F.GETFD else std.c.F.GETFD;
+    var n: usize = 0;
+    var fd: Fd = 0;
+    while (fd < ceiling) : (fd += 1) {
+        if (is_linux) {
+            _ = linuxUnwrap(linux.fcntl(fd, F_GETFD, 0)) catch continue;
+        } else {
+            _ = cUnwrap(std.c.fcntl(fd, F_GETFD, @as(c_int, 0))) catch continue;
+        }
+        n += 1;
+    }
+    return n;
+}
+
+// ---------------------------------------------------------------------
 // poll
 // ---------------------------------------------------------------------
 
@@ -746,6 +781,17 @@ test "pipe round-trips and reports WouldBlock when empty" {
     try testing.expectEqual(@as(usize, 3), try write(p.write_end, "abc"));
     try testing.expectEqual(@as(usize, 3), try read(p.read_end, &buf));
     try testing.expectEqualStrings("abc", buf[0..3]);
+}
+
+test "openFdCount moves by exactly what was opened and closed" {
+    // Absolute numbers depend on what the rest of the process holds, so
+    // only the delta is asserted — which is also all a leak test reads.
+    const before = openFdCount(4096);
+    const p = try pipe();
+    try testing.expectEqual(before + 2, openFdCount(4096));
+    close(p.read_end);
+    close(p.write_end);
+    try testing.expectEqual(before, openFdCount(4096));
 }
 
 test "poll reports a readable pipe and times out on an idle one" {
@@ -1111,11 +1157,15 @@ pub fn joinZ(buf: *[path_max]u8, dir: []const u8, name: []const u8) PathError![:
 /// Fixed `/tmp` paths were a mistake: a test that fails partway leaves the
 /// directory behind, and the *next* run then fails on a stale entry count
 /// rather than on the thing that actually broke — which is exactly how a
-/// real failure ends up looking like a flake. The pid plus a counter makes
-/// each run and each test disjoint.
+/// real failure ends up looking like a flake. Two suites running at once
+/// collide the same way, and that one reads as a flake too. The pid plus a
+/// counter makes each run, each process and each test disjoint.
+///
+/// Public because the same trap catches every module that touches the real
+/// filesystem, and a second implementation elsewhere would drift.
 var scratch_counter: u32 = 0;
 
-fn scratchDir(buf: *[path_max]u8, comptime tag: []const u8) ![:0]const u8 {
+pub fn scratchDir(buf: *[path_max]u8, comptime tag: []const u8) ![:0]const u8 {
     scratch_counter += 1;
     const pid: u32 = @intCast(if (is_linux) linux.getpid() else std.c.getpid());
     var w = std.Io.Writer.fixed(buf);

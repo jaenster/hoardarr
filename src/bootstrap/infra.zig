@@ -605,20 +605,35 @@ test "the real filesystem writes at an offset and preallocates" {
     var fs_impl: RealFs = .{ .gpa = testing.allocator };
     const fs = fs_impl.filesystem();
 
-    const dir = "/tmp/hoardarr-infra-test";
-    try fs.removeAll(dir);
-    try fs.mkdirAll(dir ++ "/nested");
+    // A path unique to this process, not a fixed one: two suites running
+    // at once would otherwise remove each other's tree mid-assertion and
+    // fail in a way that reads like a filesystem bug. See `sys.scratchDir`.
+    var dir_buf: [sys.path_max]u8 = undefined;
+    const dir = try sys.scratchDir(&dir_buf, "infra");
 
-    try fs.writeAt(dir ++ "/nested/a.tmp", 4, "abcd", 16);
-    try testing.expectEqual(@as(?i64, 16), try fs.sizeOf(dir ++ "/nested/a.tmp"));
+    // `dir` points into `dir_buf`, so every join must write elsewhere.
+    var nested_buf: [sys.path_max]u8 = undefined;
+    const nested = try sys.joinZ(&nested_buf, dir, "nested");
+    var a_buf: [sys.path_max]u8 = undefined;
+    const a_tmp = try sys.joinZ(&a_buf, nested, "a.tmp");
+    var b_buf: [sys.path_max]u8 = undefined;
+    const b_tmp = try sys.joinZ(&b_buf, nested, "b.tmp");
+    var ghost_buf: [sys.path_max]u8 = undefined;
+    const ghost = try sys.joinZ(&ghost_buf, dir, "ghost");
+
+    try fs.removeAll(dir);
+    try fs.mkdirAll(nested);
+
+    try fs.writeAt(a_tmp, 4, "abcd", 16);
+    try testing.expectEqual(@as(?i64, 16), try fs.sizeOf(a_tmp));
     // A second segment at its own offset must not disturb the first —
     // this is the property crash recovery relies on.
-    try fs.writeAt(dir ++ "/nested/a.tmp", 0, "ZZZZ", 16);
-    try testing.expectEqual(@as(?i64, 16), try fs.sizeOf(dir ++ "/nested/a.tmp"));
+    try fs.writeAt(a_tmp, 0, "ZZZZ", 16);
+    try testing.expectEqual(@as(?i64, 16), try fs.sizeOf(a_tmp));
 
     try testing.expectEqual(@as(?i64, null), try fs.sizeOf(dir));
     try testing.expect(fs.isDir(dir));
-    try testing.expect(!fs.exists(dir ++ "/ghost"));
+    try testing.expect(!fs.exists(ghost));
 
     const kids = try fs.list(testing.allocator, dir);
     defer {
@@ -629,8 +644,8 @@ test "the real filesystem writes at an offset and preallocates" {
     try testing.expectEqualStrings("nested", kids[0].name);
     try testing.expect(kids[0].is_dir);
 
-    try fs.move(dir ++ "/nested/a.tmp", dir ++ "/nested/b.tmp");
-    try testing.expect(fs.exists(dir ++ "/nested/b.tmp"));
+    try fs.move(a_tmp, b_tmp);
+    try testing.expect(fs.exists(b_tmp));
 
     // A whole subtree, and a second call on the same path is success.
     try fs.removeAll(dir);

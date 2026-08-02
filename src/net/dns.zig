@@ -1930,7 +1930,7 @@ test "more nameservers than the cap keeps the first few" {
 
 test "loadResolvConf reads a real file, and falls back when there isn't one" {
     var buf: [sys.path_max]u8 = undefined;
-    const path = try sys.pathZ(&buf, "/tmp/hoardarr-dns-resolv.conf");
+    const path = try sys.scratchDir(&buf, "dns-resolv");
     sys.unlink(path) catch {};
 
     const fd = try sys.open(path, .{ .mode = .write_only, .create = true, .truncate = true });

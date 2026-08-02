@@ -247,7 +247,9 @@ test "a name that needed sanitising is refused, not sanitised" {
 }
 
 test "backups list, run and read round-trip on disk" {
-    const dir = "/tmp/hoardarr-backup-test";
+    // `dir` points into `dir_buf`, so every join must write elsewhere.
+    var dir_buf: [sys.path_max]u8 = undefined;
+    const dir = try sys.scratchDir(&dir_buf, "backup");
     var rm: infra.RealFs = .{ .gpa = testing.allocator };
     try rm.filesystem().removeAll(dir);
 
@@ -256,6 +258,9 @@ test "backups list, run and read round-trip on disk" {
     const db_path = try sys.joinZ(&db_buf, dir, "src.db");
     sys.unlink(db_path) catch {};
 
+    var backups_buf: [sys.path_max]u8 = undefined;
+    const backups_dir = try sys.joinZ(&backups_buf, dir, "backups");
+
     const conn = try Conn.open(testing.allocator, db_path, .{});
     defer conn.close();
     try migrate.migrate(conn);
@@ -263,7 +268,7 @@ test "backups list, run and read round-trip on disk" {
     var backups: Backups = .{
         .gpa = testing.allocator,
         .conn = conn,
-        .dir = dir ++ "/backups",
+        .dir = backups_dir,
     };
     const p = backups.port();
 
@@ -294,7 +299,8 @@ test "backups list, run and read round-trip on disk" {
 }
 
 test "log files list only .log and flag the active one" {
-    const dir = "/tmp/hoardarr-logfiles-test";
+    var dir_buf: [sys.path_max]u8 = undefined;
+    const dir = try sys.scratchDir(&dir_buf, "logfiles");
     var rm: infra.RealFs = .{ .gpa = testing.allocator };
     try rm.filesystem().removeAll(dir);
     try sys.mkdirPath(dir);

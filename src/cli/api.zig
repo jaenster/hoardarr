@@ -374,7 +374,8 @@ test "listenPort accepts every shape a listen spec takes" {
 
 test "readFileAlloc returns the whole file, not an empty prefix" {
     const gpa = testing.allocator;
-    const path: [:0]const u8 = "/tmp/hoardarr-cli-readfile-test.toml";
+    var path_buf: [sys.path_max]u8 = undefined;
+    const path = try sys.scratchDir(&path_buf, "cli-readfile");
     const want =
         \\[auth]
         \\api_key = "0123456789abcdef0123456789abcdef"
