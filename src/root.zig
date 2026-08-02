@@ -112,6 +112,7 @@ pub const store = struct {
     pub const repo_category = @import("store/repo_category.zig");
     pub const repo_settings = @import("store/repo_settings.zig");
     pub const repo_speed_history = @import("store/repo_speed_history.zig");
+    pub const foreign_corpus = @import("store/foreign_corpus.zig");
 };
 
 pub const app = struct {
@@ -315,6 +316,7 @@ test {
     _ = store.repo_category;
     _ = store.repo_settings;
     _ = store.repo_speed_history;
+    _ = store.foreign_corpus;
     _ = app.ports;
     _ = app.naming;
     _ = app.verify;

@@ -217,6 +217,32 @@ test "a malformed failed-files column is reported, not silently dropped" {
 
     try conn.execute("UPDATE par2_sets SET failed_files = ? WHERE id = ?", .{ "not json", v.id });
     try t.expectError(error.MalformedFailedFiles, r.byId(t.allocator, v.id));
+
+    // Well-formed JSON of the wrong shape is just as wrong, and is the
+    // more likely accident.
+    try conn.execute("UPDATE par2_sets SET failed_files = ? WHERE id = ?", .{ "{\"a\":1}", v.id });
+    try t.expectError(error.MalformedFailedFiles, r.byId(t.allocator, v.id));
+}
+
+test "a failed-files column holding JSON null loads as an empty list" {
+    const conn = try migrate.openMigrated();
+    defer conn.close();
+    const r = VerifyRepo.init(t.allocator, conn);
+    try migrate.seedJob(conn, 12);
+    var v = try VerifySet.init(t.allocator, 12, 1);
+    defer v.deinit();
+    try r.save(&v);
+
+    // The shape every row written by the predecessor has: its JSON
+    // encoder turned a nil slice into `null` instead of `[]`, so the
+    // column's DEFAULT never got a chance to apply. Rejecting it stranded
+    // the job, because recovery re-drives the verify stage by loading
+    // this row.
+    try conn.execute("UPDATE par2_sets SET failed_files = ? WHERE id = ?", .{ "null", v.id });
+
+    var loaded = try r.byId(t.allocator, v.id);
+    defer loaded.deinit();
+    try t.expectEqual(@as(usize, 0), loaded.failed_files.len);
 }
 
 test "updating a row that has been deleted underneath us is reported" {

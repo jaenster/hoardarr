@@ -64,6 +64,7 @@ pub const all = [_]Migration{
     m(20, "commands"),
     m(21, "segment_retry"),
     m(22, "speed_history"),
+    m(23, "null_string_arrays"),
 };
 
 /// Build a `Migration` from its version and name, deriving the embedded
@@ -310,6 +311,65 @@ test "an applied version is skipped on the next run" {
     try t.expectEqual(latest_version, try currentVersion(conn));
 }
 
+test "the null-list normalisation rewrites Go-written rows and re-runs cleanly" {
+    const conn = try openMigrated();
+    defer conn.close();
+
+    // The shape a database written by the predecessor arrives in: its
+    // JSON encoder spelled an empty list `null`, so the columns'
+    // "JSON array" contract is violated on the majority of rows.
+    try seedJob(conn, 71);
+    try conn.execute(
+        \\INSERT INTO par2_sets(job_id, state, failed_files) VALUES (?, 'ok', 'null')
+    , .{@as(i64, 71)});
+    try conn.execute(
+        \\INSERT INTO files(job_id, filename, groups, size_bytes, state, segment_count)
+        \\VALUES (?, 'a.rar', 'null', 0, 'complete', 1)
+    , .{@as(i64, 71)});
+    try conn.execute(
+        \\INSERT INTO subscriptions(name, url, topics, created_at, updated_at)
+        \\VALUES ('hook', 'http://localhost/', 'null', 0, 0)
+    , .{});
+
+    // A row that already says `[]`, and one carrying real content: the
+    // rewrite must not touch either.
+    try conn.execute(
+        \\INSERT INTO files(job_id, filename, groups, size_bytes, state, segment_count)
+        \\VALUES (?, 'b.rar', '["alt.binaries.test"]', 0, 'complete', 1)
+    , .{@as(i64, 71)});
+
+    const normalise = all[22];
+    try t.expectEqual(@as(u32, 23), normalise.version);
+    try conn.exec(normalise.sql);
+
+    try t.expectEqual(@as(i64, 0), try conn.scalarInt(
+        \\SELECT (SELECT COUNT(*) FROM par2_sets WHERE failed_files = 'null')
+        \\     + (SELECT COUNT(*) FROM files WHERE groups = 'null')
+        \\     + (SELECT COUNT(*) FROM subscriptions WHERE topics = 'null')
+    , .{}));
+    try t.expectEqual(@as(i64, 3), try conn.scalarInt(
+        \\SELECT (SELECT COUNT(*) FROM par2_sets WHERE failed_files = '[]')
+        \\     + (SELECT COUNT(*) FROM files WHERE groups = '[]')
+        \\     + (SELECT COUNT(*) FROM subscriptions WHERE topics = '[]')
+    , .{}));
+    try t.expectEqual(@as(i64, 1), try conn.scalarInt(
+        "SELECT COUNT(*) FROM files WHERE groups = '[\"alt.binaries.test\"]'",
+        .{},
+    ));
+
+    // Idempotent: startup applies migrations unconditionally on a
+    // database that has already seen this one.
+    try conn.exec(normalise.sql);
+    try t.expectEqual(@as(i64, 1), try conn.scalarInt(
+        "SELECT COUNT(*) FROM files WHERE groups = '[\"alt.binaries.test\"]'",
+        .{},
+    ));
+    try t.expectEqual(@as(i64, 1), try conn.scalarInt(
+        "SELECT COUNT(*) FROM files WHERE groups = '[]'",
+        .{},
+    ));
+}
+
 test "unknownApplied reports versions this binary does not carry" {
     const conn = try openMigrated();
     defer conn.close();
@@ -331,8 +391,8 @@ test "unknownApplied reports versions this binary does not carry" {
 test "migration versions are unique, ordered, and match their filenames" {
     // The comptime block enforces ordering; this pins the count and the
     // derived paths so a hand-edited entry cannot drift from its file.
-    try t.expectEqual(@as(usize, 22), all.len);
-    try t.expectEqual(@as(u32, 22), latest_version);
+    try t.expectEqual(@as(usize, 23), all.len);
+    try t.expectEqual(@as(u32, 23), latest_version);
     for (all, 1..) |mig, want_version| {
         try t.expectEqual(@as(u32, @intCast(want_version)), mig.version);
         try t.expect(mig.sql.len > 0);

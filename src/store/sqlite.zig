@@ -878,9 +878,23 @@ pub const string_array = struct {
     /// Decode into `arena`. An empty column decodes to an empty list
     /// rather than an error: a row written before the column existed has
     /// nothing to say, and refusing to load it would strand the row.
+    ///
+    /// A literal JSON `null` decodes to an empty list for the same
+    /// reason. The predecessor implementation encoded these columns with
+    /// Go's `encoding/json`, which writes a nil slice as `null` rather
+    /// than `[]`, so live databases carry `null` in the majority of
+    /// `par2_sets.failed_files` rows — and in any other list column a nil
+    /// slice ever reached. `null` there means "no entries", exactly what
+    /// the column's own `DEFAULT '[]'` says; rejecting it would strand
+    /// every such row forever.
+    ///
+    /// Leniency stops there. A JSON object, or an array whose elements
+    /// are not strings, is a genuine disagreement about the shape of the
+    /// data and still an error.
     pub fn decode(arena: Allocator, json: []const u8) DecodeError![]const []const u8 {
         const trimmed = std.mem.trim(u8, json, " \t\r\n");
         if (trimmed.len == 0) return &.{};
+        if (std.mem.eql(u8, trimmed, "null")) return &.{};
         return std.json.parseFromSliceLeaky(
             []const []const u8,
             arena,
@@ -1271,6 +1285,24 @@ test "an empty string array column decodes to an empty list, garbage to an error
     try t.expectEqual(@as(usize, 0), (try string_array.decode(arena, "[]")).len);
     try t.expectError(error.MalformedJsonArray, string_array.decode(arena, "{\"not\":\"an array\"}"));
     try t.expectError(error.MalformedJsonArray, string_array.decode(arena, "[1,2,3]"));
+}
+
+test "a JSON null column decodes to an empty list" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Go's encoding/json wrote a nil slice as `null`, so live databases
+    // are full of these. Whitespace around it because the column is
+    // trimmed before parsing and both spellings must land the same way.
+    try t.expectEqual(@as(usize, 0), (try string_array.decode(arena, "null")).len);
+    try t.expectEqual(@as(usize, 0), (try string_array.decode(arena, " null ")).len);
+    try t.expectEqual(@as(usize, 0), (try string_array.decode(arena, "\n null\t")).len);
+
+    // Only the bare literal. A string that merely contains it is not an
+    // absent list, and neither is a differently-cased token.
+    try t.expectError(error.MalformedJsonArray, string_array.decode(arena, "NULL"));
+    try t.expectError(error.MalformedJsonArray, string_array.decode(arena, "nullish"));
 }
 
 test "double-quoted identifiers stay rejected through the wrapper" {
