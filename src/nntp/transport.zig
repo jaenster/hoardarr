@@ -639,6 +639,16 @@ pub const Tls = struct {
     ///
     /// Nothing queued means nothing to do — not even a `flush` on the TLS
     /// writer, which would be a syscall per turn of the session loop.
+    ///
+    /// The two flushes at the end are both load-bearing.
+    /// `std.crypto.tls.Client.flush` only *stages* a record: it encrypts
+    /// into the ciphertext writer's buffer and advances it, leaving the
+    /// syscall to whoever owns that writer. Stopping after the first one
+    /// left every command after the greeting sitting in the ciphertext
+    /// buffer, and the session then blocked in a read waiting for the
+    /// answer to something the provider had never received — a hang that
+    /// only ended on the owner's deadline. `std.http.Client.Connection`
+    /// pairs the two the same way.
     fn flush(self: *Tls) Error!void {
         if (self.out.items.len == 0) return;
         while (self.out.items.len != 0) {
@@ -655,6 +665,10 @@ pub const Tls = struct {
             self.sending.clearRetainingCapacity();
         }
         self.client.writer.flush() catch |err| {
+            self.detail = err;
+            return self.writeError();
+        };
+        self.transport.writer.flush() catch |err| {
             self.detail = err;
             return self.writeError();
         };
@@ -876,13 +890,13 @@ test "every certificate error stays distinguishable from a protocol error" {
 }
 
 // ---------------------------------------------------------------------
-// Interop, verified by hand
+// Interop against a live peer
 // ---------------------------------------------------------------------
 //
-// `std.crypto.tls` ships a client and no server, so a completed handshake
-// cannot be tested in tree. It was instead driven by hand against
-// OpenSSL 3.4.1 speaking TLS 1.3, in both Debug and ReleaseFast, and this
-// is how to repeat it. Nothing in CI does.
+// The replay tests below shake hands for real on every run, but against a
+// recording. This is the live counterpart — a second, independent
+// implementation on the other side, which a recording cannot be. Nothing
+// in CI does it.
 //
 //   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
 //       -keyout key.pem -out cert.pem -days 36500 -nodes \
@@ -894,22 +908,13 @@ test "every certificate error stays distinguishable from a protocol error" {
 // then a `Conn` with `security = .tls`, `host = "nntp.test.invalid"` and
 // `trust = .{ .ca_bundle = &store }`, where `store` holds `test_ca_pem`.
 //
-// What that established:
-//
-//   * A full TLS 1.3 handshake, chain verification against an in-memory
-//     PEM bundle included, and a complete NNTP conversation over it:
-//     greeting, AUTHINFO USER/PASS, MODE READER, and two `BODY` fetches
-//     — the second of them served from the idle park, which is the wake
-//     path a pooled connection uses for every segment after its first.
-//   * A 128 KiB body spanning many TLS records reassembled byte-exact,
-//     dot-unstuffing and all.
-//   * Each trust mode behaving as named: the right root connects, an
-//     empty bundle gives `TlsCertificateNotTrusted`, the wrong hostname
-//     gives `TlsCertificateHostMismatch`, and `self_signed_only` and the
-//     insecure mode both connect.
-//
-// What it did not: a real provider, a chain deeper than one certificate,
-// session resumption, or TLS 1.2.
+// Read the earlier claim that this had established a complete NNTP
+// conversation with scepticism: `s_server -quiet` answers from a script
+// regardless of what the client sends, so it could not tell a command
+// that reached the wire from one still sitting in the ciphertext buffer —
+// which is exactly what every command after the greeting was doing. A
+// peer that only speaks when spoken to is what catches that, and the
+// replay peer counts the client's bytes before releasing each answer.
 
 test "the trust modes are three, and the unsafe one has to be named" {
     // A compile-time assertion in test form: if someone adds a default to
@@ -921,4 +926,501 @@ test "the trust modes are three, and the unsafe one has to be named" {
         if (std.mem.eql(u8, f.name, "insecure_skip_verification_dangerous")) found = true;
     }
     try testing.expect(found);
+}
+
+// ---------------------------------------------------------------------
+// A recorded provider handshake
+// ---------------------------------------------------------------------
+//
+// `std.crypto.tls` ships a client and no server, so nothing in tree can
+// shake hands with `Client` — which is exactly why a handshake that had
+// never completed could ship. A recording closes that: in TLS 1.3 every
+// client secret comes out of `Options.entropy`, so pinning those 240
+// bytes makes the ClientHello, the ECDHE share and the transcript hash
+// byte-identical on every run, and server bytes captured against them
+// decrypt again forever. `Options.realtime_now` pins the clock inside the
+// certificate's validity window so the fixture does not rot.
+//
+// Captured from news.eweka.nl:563 against deliberately wrong credentials,
+// so the conversation it drives is greeting, AUTHINFO USER, AUTHINFO PASS,
+// rejection — the whole shape a provider connection has before it fetches
+// anything, and every one of those commands is a write that has to reach
+// the wire.
+//
+// To re-record: run the same exchange against a real provider with
+// `replay_entropy` and `replay_realtime_ns` pinned, dump the socket bytes
+// in order, and rewrite the flights below. The client byte counts are the
+// lengths of its records and change if the credentials do.
+
+const replay_host = "news.eweka.nl";
+const replay_user = "probe-not-real";
+const replay_pass = "probe-not-real";
+
+/// The moment of capture. The leaf certificate was valid then and the
+/// anchor below is valid until 2035, so verification is reproducible.
+const replay_realtime_ns: i128 = 1785488807081942000;
+
+/// Arbitrary but fixed. Any 240 bytes would do; what matters is that they
+/// are the same ones the flights were captured against.
+const replay_entropy: [tlsmod.entropy_len]u8 = blk: {
+    var e: [tlsmod.entropy_len]u8 = undefined;
+    for (&e, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    break :blk e;
+};
+
+/// ISRG Root X1, the anchor the captured chain terminates at. Embedded
+/// rather than read from the host so the test does not depend on the
+/// developer's certificate store.
+const replay_ca_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\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
+    \\-----END CERTIFICATE-----
+    \\
+;
+
+const unb64 = tlsmod.unb64;
+
+const replay_flight_1 = unb64(
+    "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" ++
+        "nQXuMiBS76BabUQF",
+);
+
+const replay_flight_2 = unb64(
+    "FwMDAQq8VDesecUl16dYiLur7kbmjXS4ndddnqC5WeqgdcytngRJnZFwoZyB5by+" ++
+        "QS68mTZ4Nacvj5/SPyelejXtkHAp9dBey2Et3N/KwPwPu5ai3k+woomHHzwYqC44" ++
+        "3vz3aBbPB0DZEeUMkZCsn4UtnQJkR42J3+l4oBdl76TpBlAwq5d+4LIX4A1fDdlj" ++
+        "WVMDWpldi/4CZJrWem+C+pSJXHpMtrlv8Ecs78TAMZA8phtWUEbAAOYsKILmEfmP" ++
+        "w92irtu/KFgZpdUfWhUPtzNdz3REFdTWxibAwdLnY9ZxTxJYpYj31w+iJAwQrflI" ++
+        "vWiy1zIhfNUuD5pSUsvjg1J3qnQ/Uj0OIF4zEAtyQxcDAwEKU5Gtw1MHX0rZEGFf" ++
+        "fxGFuYk7oVu+gZ7XJFlunKzfy9Xpho3HbFYzT9DsaG+DUS4oL4n72Ma/CcBkVwZ9" ++
+        "PQXyLEpPG4vXkPCc1cvYe+Y89WmPWrtMk7Rc53uNbLrtqOVnPNqknfQ8BaHRS68t" ++
+        "DrOdD9KCnHlrkpc0NRa3nGquPJZ6gypF6AaKoj4HGk0scC66P7Kd4Yby0BVN/J7V" ++
+        "hDo0aa45igQscJWFoqGJOkdLaZCZxNvG9LysVOXi44aC6rqWGuWxfaY4hkTO2v8u" ++
+        "gNj65NweTymmPp+wu52U7EWNEJQuzshNmjXLPPqb8M0pHNxAJW81HbLVeZzWiPKd" ++
+        "2CUiou4KCLIVZafURbUXAwMAJ3n5AVOIY/Uh65vAT4vTIoDSVBMN4TBP6gz/GiEq" ++
+        "0bJDlpAjgteYcQ==",
+);
+
+const replay_flight_3 = unb64(
+    "FwMDACRxUVqbaoIAyk50QUKeQoh+Qxpt6Mow0a5nBm3saeNVqvrURGA=",
+);
+
+const replay_flight_4 = unb64(
+    "FwMDACx3MAEvnU7CMyQSyesWCnhpRiHPAAkVgdlCpb3uWsue7wXziWQtJF7h19EA" ++
+        "eQ==",
+);
+
+/// The peer's side, keyed on how many bytes the client has to have sent
+/// before each flight is released. Releasing a flight early would let a
+/// client that never sent its command still receive the answer, which is
+/// precisely the bug this replays.
+const replay_script = [_]tlsmod.ScriptedPeer.Step{
+    .{ .expect_len = 1613 },
+    .{ .send = replay_flight_1 },
+    .{ .expect_len = 80 },
+    .{ .send = replay_flight_2 },
+    .{ .expect_len = 52 },
+    .{ .send = replay_flight_3 },
+    .{ .expect_len = 52 },
+    .{ .send = replay_flight_4 },
+};
+
+/// Drive `loop` until `done`, with a wall-clock ceiling. A session that
+/// never gets its answer hangs rather than fails, so nothing here loops
+/// unbounded — and a hang is exactly the failure being guarded against.
+fn pumpUntil(loop: *reactor.Loop, deadline_ms: u64, ctx: anytype, done: fn (@TypeOf(ctx)) bool) !void {
+    const start = sys.monotonicNanos();
+    while (!done(ctx)) {
+        if (sys.monotonicNanos() - start > deadline_ms * std.time.ns_per_ms) {
+            return error.TestTimeout;
+        }
+        _ = try loop.tick(5);
+    }
+}
+
+/// The transcript the replay is expected to produce, in full.
+const replay_transcript = "200 Welcome to Eweka\r\n381 PASS required\r\n502 Authentication Failed\r\n";
+
+/// A minimal NNTP client: answer the greeting with `AUTHINFO USER`, answer
+/// 381 with `AUTHINFO PASS`, and stop on anything else. Enough to make the
+/// session flush twice after the handshake, which is where the bug was.
+const ReplayDriver = struct {
+    tls: *Tls = undefined,
+    seen: [1024]u8 = undefined,
+    len: usize = 0,
+    scanned: usize = 0,
+    opened: bool = false,
+    sent_user: bool = false,
+    sent_pass: bool = false,
+    done: bool = false,
+    closed_err: ?Error = null,
+
+    fn driver(self: *ReplayDriver) Driver {
+        return .{
+            .ctx = self,
+            .on_open = onOpen,
+            .space = space,
+            .filled = filled,
+            .awaiting = awaiting,
+            .on_closed = onClosed,
+        };
+    }
+
+    fn onOpen(ctx: *anyopaque) void {
+        const self: *ReplayDriver = @ptrCast(@alignCast(ctx));
+        self.opened = true;
+    }
+
+    fn space(ctx: *anyopaque) []u8 {
+        const self: *ReplayDriver = @ptrCast(@alignCast(ctx));
+        return self.seen[self.len..];
+    }
+
+    fn filled(ctx: *anyopaque, n: usize) bool {
+        const self: *ReplayDriver = @ptrCast(@alignCast(ctx));
+        self.len += n;
+        while (std.mem.indexOfScalarPos(u8, self.seen[0..self.len], self.scanned, '\n')) |nl| {
+            const line = self.seen[self.scanned..nl];
+            self.scanned = nl + 1;
+            if (std.mem.startsWith(u8, line, "200")) {
+                self.tls.queue("AUTHINFO USER " ++ replay_user ++ "\r\n") catch return false;
+                self.sent_user = true;
+            } else if (std.mem.startsWith(u8, line, "381")) {
+                self.tls.queue("AUTHINFO PASS " ++ replay_pass ++ "\r\n") catch return false;
+                self.sent_pass = true;
+            } else {
+                self.done = true;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn awaiting(ctx: *anyopaque) bool {
+        const self: *ReplayDriver = @ptrCast(@alignCast(ctx));
+        return !self.done;
+    }
+
+    fn onClosed(ctx: *anyopaque, err: Error) void {
+        const self: *ReplayDriver = @ptrCast(@alignCast(ctx));
+        self.closed_err = err;
+        self.done = true;
+    }
+};
+
+test "a recorded provider handshake completes and every command after it reaches the wire" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    var store: CaStore = .init(gpa);
+    defer store.deinit();
+    const now_sec: i64 = @intCast(@divFloor(replay_realtime_ns, std.time.ns_per_s));
+    try testing.expectEqual(@as(usize, 1), try store.addPem(replay_ca_pem, now_sec));
+
+    var peer: tlsmod.ScriptedPeer = undefined;
+    const port = try peer.start(gpa, &loop, &replay_script);
+    defer peer.deinit();
+
+    var drv: ReplayDriver = .{};
+    const t = try Tls.create(gpa, &loop, try IpAddress.parse("127.0.0.1", port), .{
+        .host = replay_host,
+        .trust = .{ .ca_bundle = &store },
+    }, drv.driver());
+    defer t.deinit();
+    drv.tls = t;
+    t.entropy = &replay_entropy;
+    t.realtime_now = std.Io.Timestamp.fromNanoseconds(@intCast(replay_realtime_ns));
+    t.begin();
+
+    try pumpUntil(&loop, 20_000, &drv, struct {
+        fn f(d: *ReplayDriver) bool {
+            return d.done;
+        }
+    }.f);
+
+    // A real chain, verified against a real root, over the real record
+    // layer: this is the coverage nothing in tree had.
+    try testing.expect(drv.opened);
+    try testing.expect(drv.sent_user);
+    try testing.expect(drv.sent_pass);
+    try testing.expectEqualStrings(replay_transcript, drv.seen[0..drv.len]);
+    // The peer only released each answer after counting the command's
+    // bytes, so getting all three proves both commands left the process.
+    // Flushing only the plaintext side leaves them in the ciphertext
+    // buffer and this test times out instead.
+    try testing.expectEqual(@as(?Error, null), drv.closed_err);
+}
+
+/// The same recording, driven through `net/tls.zig`'s `Conn` — the shape
+/// `bootstrap/notify.zig` uses for `https://`, which has its own two-stage
+/// `flush` to get wrong.
+const ConnReplay = struct {
+    gpa: Allocator,
+    store: *CaStore,
+    conn: tlsmod.Conn = undefined,
+    cipher_read: []u8,
+    cipher_write: []u8,
+    seen: [1024]u8 = undefined,
+    len: usize = 0,
+    err: ?anyerror = null,
+    done: bool = false,
+
+    fn session(c: *tlsmod.Conn) void {
+        const self: *ConnReplay = @ptrCast(@alignCast(c.context.?));
+        defer self.done = true;
+
+        c.handshake(.{
+            .host = replay_host,
+            .trust = .{ .ca_bundle = .{
+                .gpa = self.store.gpa,
+                .io = dead_io,
+                .lock = &self.store.lock,
+                .bundle = &self.store.bundle,
+            } },
+            .read_buffer = self.cipher_read,
+            .write_buffer = self.cipher_write,
+            .gpa = self.gpa,
+            .entropy = &replay_entropy,
+            .realtime_now = std.Io.Timestamp.fromNanoseconds(@intCast(replay_realtime_ns)),
+        }) catch |e| {
+            self.err = e;
+            return;
+        };
+
+        self.take(c) catch return;
+        self.say(c, "AUTHINFO USER " ++ replay_user ++ "\r\n") catch return;
+        self.take(c) catch return;
+        self.say(c, "AUTHINFO PASS " ++ replay_pass ++ "\r\n") catch return;
+        self.take(c) catch return;
+        c.close();
+    }
+
+    fn take(self: *ConnReplay, c: *tlsmod.Conn) !void {
+        const line = c.reader().takeDelimiterInclusive('\n') catch |e| {
+            self.err = e;
+            return e;
+        };
+        @memcpy(self.seen[self.len..][0..line.len], line);
+        self.len += line.len;
+    }
+
+    fn say(self: *ConnReplay, c: *tlsmod.Conn, line: []const u8) !void {
+        c.writer().writeAll(line) catch |e| {
+            self.err = e;
+            return e;
+        };
+        c.flush() catch |e| {
+            self.err = e;
+            return e;
+        };
+    }
+};
+
+test "the same recording drives a tls.Conn session end to end" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    var store: CaStore = .init(gpa);
+    defer store.deinit();
+    const now_sec: i64 = @intCast(@divFloor(replay_realtime_ns, std.time.ns_per_s));
+    try testing.expectEqual(@as(usize, 1), try store.addPem(replay_ca_pem, now_sec));
+
+    var peer: tlsmod.ScriptedPeer = undefined;
+    const port = try peer.start(gpa, &loop, &replay_script);
+    defer peer.deinit();
+
+    const cipher_read = try gpa.alloc(u8, tlsmod.min_read_buffer);
+    defer gpa.free(cipher_read);
+    const cipher_write = try gpa.alloc(u8, tlsmod.default_write_buffer);
+    defer gpa.free(cipher_write);
+
+    var replay: ConnReplay = .{
+        .gpa = gpa,
+        .store = &store,
+        .cipher_read = cipher_read,
+        .cipher_write = cipher_write,
+    };
+
+    // Loopback cannot meaningfully block on connect, and `dial` would need
+    // the fiber we are about to build around this fd.
+    const addr = try IpAddress.parse("127.0.0.1", port);
+    var sa = sys.Sockaddr.fromIp(addr);
+    const fd = try sys.socket(sa.family(), sys.SOCK_STREAM, 0);
+    sys.connect(fd, &sa) catch |err| switch (err) {
+        error.InProgress, error.WouldBlock, error.AlreadyConnected => {},
+        else => |e| return e,
+    };
+    try replay.conn.init(gpa, &loop, fd, ConnReplay.session, &replay, fiber_mod.default_stack_size);
+    defer replay.conn.deinit();
+    replay.conn.start();
+
+    try pumpUntil(&loop, 20_000, &replay, struct {
+        fn f(r: *ConnReplay) bool {
+            return r.done;
+        }
+    }.f);
+
+    try testing.expectEqual(@as(?anyerror, null), replay.err);
+    try testing.expectEqualStrings(replay_transcript, replay.seen[0..replay.len]);
 }

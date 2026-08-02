@@ -352,6 +352,22 @@ pub const Fiber = struct {
         };
     }
 
+    /// Drop this fiber's reactor registration entirely, releasing the fd it
+    /// was watching.
+    ///
+    /// `park` deliberately leaves the source registered at `.none` so a
+    /// fiber that parks repeatedly on one fd pays a single `epoll_ctl`, but
+    /// that makes the fiber the fd's registered owner until it parks on a
+    /// different one. A fd handed to *another* fiber has to be released
+    /// first: exactly one thing may own readiness for an fd, and
+    /// `epoll_ctl(ADD)` enforces it with `EEXIST`.
+    ///
+    /// The next `park` re-registers, so this costs one syscall and is never
+    /// a correctness hazard for the fiber calling it.
+    pub fn unwatch(self: *Fiber) void {
+        if (self.source.isRegistered()) self.loop.remove(&self.source);
+    }
+
     /// Called *from inside the fiber*. Switch back to the resumer without
     /// registering anything; only an explicit `enter` brings the fiber
     /// back. Used by cooperative drivers and by the tests.

@@ -155,6 +155,18 @@ pub const Notifier = struct {
     dispatched: usize = 0,
     refused: usize = 0,
 
+    /// Injectable clock and entropy for the TLS handshake, so a test can
+    /// pin a moment inside a fixture's validity window and get a
+    /// reproducible ClientHello. Null everywhere but the replay test,
+    /// which is the only thing in tree that can complete a handshake.
+    ///
+    /// Nanoseconds rather than an `std.Io.Timestamp`, which holds an `i96`
+    /// and would raise this struct's alignment to 16 — enough to break
+    /// every `@fieldParentPtr` that reaches a `Notifier` from one of its
+    /// eight-byte-aligned timers.
+    tls_entropy: ?*const [tls.entropy_len]u8 = null,
+    tls_realtime_ns: ?i64 = null,
+
     fn defaultNow() i64 {
         return @intCast(@divFloor(sys.realtimeNanos(), std.time.ns_per_ms));
     }
@@ -633,7 +645,7 @@ const Dispatch = struct {
         var write_buf: [4 << 10]u8 = undefined;
         var tr = tls.Transport.init(&self.fiber, fd, &read_buf, &write_buf);
 
-        return exchange(&tr.reader, &tr.writer, url, req) catch |e| {
+        return exchange(&tr.reader, .{ .w = &tr.writer }, url, req) catch |e| {
             if (self.timed_out) return error.Timeout;
             if (self.canceled or tr.canceled) return error.Canceled;
             return e;
@@ -758,6 +770,11 @@ const TlsAttempt = struct {
             .read_buffer = &read_buf,
             .write_buffer = &write_buf,
             .gpa = c.gpa,
+            .entropy = self.d.n.tls_entropy,
+            .realtime_now = if (self.d.n.tls_realtime_ns) |ns|
+                std.Io.Timestamp.fromNanoseconds(ns)
+            else
+                null,
         }) catch |e| {
             self.d.n.logger.warn("notify: TLS handshake failed", &.{
                 log.str("host", self.url.host),
@@ -772,7 +789,7 @@ const TlsAttempt = struct {
         };
         defer c.close();
 
-        self.status = try exchange(c.reader(), c.writer(), self.url, self.req);
+        self.status = try exchange(c.reader(), .{ .w = c.writer(), .under = &c.transport.writer }, self.url, self.req);
     }
 
     /// Fires on the loop's stack once the session has returned. Records
@@ -799,14 +816,32 @@ const max_head_bytes: usize = 8 << 10;
 /// the connection is `Connection: close` so there is no pipeline to keep
 /// consistent, and a subscriber that answers a 500 with a megabyte of
 /// HTML should not get to spend our memory on it.
+/// The write side of an exchange.
+///
+/// Two writers, because TLS has two. `std.crypto.tls.Client.flush` only
+/// *stages* a record — it encrypts into the ciphertext writer's buffer and
+/// advances it, leaving the syscall to whoever owns that writer — so a
+/// request flushed on the plaintext side alone never leaves the process and
+/// the response never comes. `under` is that ciphertext writer, and is null
+/// on `http://`, which has only one stage.
+const Sink = struct {
+    w: *Writer,
+    under: ?*Writer = null,
+
+    fn flush(self: Sink) Writer.Error!void {
+        try self.w.flush();
+        if (self.under) |u| try u.flush();
+    }
+};
+
 fn exchange(
     r: *Reader,
-    w: *Writer,
+    sink: Sink,
     url: http.Url,
     req: ntransport.Request,
 ) ntransport.Error!u16 {
-    writeHead(w, url, req) catch return error.Io;
-    w.flush() catch return error.Io;
+    writeHead(sink.w, url, req) catch return error.Io;
+    sink.flush() catch return error.Io;
 
     var consumed: usize = 0;
     const status_line = r.takeDelimiterInclusive('\n') catch |e| return mapReadError(e);
@@ -949,7 +984,11 @@ const Harness = struct {
     fn body(f: *Fiber, ctx: ?*anyopaque) void {
         _ = f;
         const self: *Harness = @ptrCast(@alignCast(ctx.?));
-        self.result = self.d.post(.{ .url = self.url, .body = "{\"ok\":true}" });
+        // `replay_body` rather than a literal because the replay test's
+        // byte counts are the length of the record this produces: a body
+        // changed here and nowhere else would strand that test waiting for
+        // bytes it had already been sent.
+        self.result = self.d.post(.{ .url = self.url, .body = replay_body });
     }
 
     fn done(self: *Harness) bool {
@@ -1085,4 +1124,318 @@ test "an https subscription with no CA roots fails loudly instead of downgrading
 
     // Never a silent plaintext POST of a bearer-credential URL.
     try testing.expectError(error.Tls, h.result.?);
+}
+
+// ---------------------------------------------------------------------
+// A recorded https:// exchange
+// ---------------------------------------------------------------------
+//
+// The tests above prove the HTTP layer and the plaintext transport. What
+// they never proved is the one thing every real subscriber needs, because
+// `std.crypto.tls` ships a client and no server: a handshake that
+// *completes*. Both of the bugs that made this path fail in production
+// lived past that point, and neither could have been caught by a peer
+// that answers from a script no matter what it is sent.
+//
+// A recording closes it. In TLS 1.3 every client secret is derived from
+// `Options.entropy`, so pinning those 240 bytes makes the ClientHello,
+// the ECDHE share and the transcript hash byte-identical on every run,
+// and the server bytes captured against them decrypt forever.
+// `Options.realtime_now` pins the clock inside the leaf's validity window
+// so the fixture does not rot.
+//
+// Captured from example.com:443 through a recording relay, driving the
+// same `Dispatch.post` the notifier uses: DNS, dial, the fd handoff to
+// the `tls.Conn` fiber, the handshake, the request and the status line.
+// A 405 is the answer example.com gives a POST, and a 405 that arrives is
+// a complete success here — it can only exist if the request reached the
+// far end.
+//
+// To re-record: run the same exchange against a real host through a relay
+// that logs each direction change, with `replay_entropy` and
+// `replay_realtime_ns` pinned, then rewrite the flights and the byte
+// counts below. The counts are the lengths of the client's records; they
+// change if the host name, the path or the body do.
+
+const replay_host = "example.com";
+const replay_path = "/hook";
+const replay_body = "{\"ok\":true}";
+
+/// The moment of capture. The leaf was valid then and the anchor below
+/// until the end of 2028, so verification is reproducible.
+const replay_realtime_ns: i128 = 1785490877783949000;
+
+/// Arbitrary but fixed. Any 240 bytes would do; what matters is that they
+/// are the same ones the flights were captured against.
+const replay_entropy: [tls.entropy_len]u8 = blk: {
+    var e: [tls.entropy_len]u8 = undefined;
+    for (&e, 0..) |*b, i| b.* = @truncate(i *% 11 +% 5);
+    break :blk e;
+};
+
+/// AAA Certificate Services, the anchor the captured chain terminates at.
+/// Embedded rather than read from the host so the test does not depend on
+/// the developer's certificate store.
+const replay_ca_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIEMjCCAxqgAwIBAgIBATANBgkqhkiG9w0BAQUFADB7MQswCQYDVQQGEwJHQjEb
+    \\MBkGA1UECAwSR3JlYXRlciBNYW5jaGVzdGVyMRAwDgYDVQQHDAdTYWxmb3JkMRow
+    \\GAYDVQQKDBFDb21vZG8gQ0EgTGltaXRlZDEhMB8GA1UEAwwYQUFBIENlcnRpZmlj
+    \\YXRlIFNlcnZpY2VzMB4XDTA0MDEwMTAwMDAwMFoXDTI4MTIzMTIzNTk1OVowezEL
+    \\MAkGA1UEBhMCR0IxGzAZBgNVBAgMEkdyZWF0ZXIgTWFuY2hlc3RlcjEQMA4GA1UE
+    \\BwwHU2FsZm9yZDEaMBgGA1UECgwRQ29tb2RvIENBIExpbWl0ZWQxITAfBgNVBAMM
+    \\GEFBQSBDZXJ0aWZpY2F0ZSBTZXJ2aWNlczCCASIwDQYJKoZIhvcNAQEBBQADggEP
+    \\ADCCAQoCggEBAL5AnfRu4ep2hxxNRUSOvkbIgwadwSr+GB+O5AL686tdUIoWMQua
+    \\BtDFcCLNSS1UY8y2bmhGC1Pqy0wkwLxyTurxFa70VJoSCsN6sjNg4tqJVfMiWPPe
+    \\3M/vg4aijJRPn2jymJBGhCfHdr/jzDUsi14HZGWCwEiwqJH5YZ92IFCokcdmtet4
+    \\YgNW8IoaE+oxox6gmf049vYnMlhvB/VruPsUK6+3qszWY19zjNoFmag4qMsXeDZR
+    \\rOme9Hg6jc8P2ULimAyrL58OAd7vn5lJ8S3frHRNG5i1R8XlKdH5kBjHYpy+g8cm
+    \\ez6KJcfA3Z3mNWgQIJ2P2N7Sw4ScDV7oL8kCAwEAAaOBwDCBvTAdBgNVHQ4EFgQU
+    \\oBEKIz6W8Qfs4q8p74Klf9AwpLQwDgYDVR0PAQH/BAQDAgEGMA8GA1UdEwEB/wQF
+    \\MAMBAf8wewYDVR0fBHQwcjA4oDagNIYyaHR0cDovL2NybC5jb21vZG9jYS5jb20v
+    \\QUFBQ2VydGlmaWNhdGVTZXJ2aWNlcy5jcmwwNqA0oDKGMGh0dHA6Ly9jcmwuY29t
+    \\b2RvLm5ldC9BQUFDZXJ0aWZpY2F0ZVNlcnZpY2VzLmNybDANBgkqhkiG9w0BAQUF
+    \\AAOCAQEACFb8AvCb6P+k+tZ7xkSAzk/ExfYAWMymtrwUSWgEdujm7l3sAg9g1o1Q
+    \\GE8mTgHj5rCl7r+8dFRBv/38ErjHT1r0iWAFf2C3BUrz9vHCv8S5dIa2LX1rzNLz
+    \\Rt0vxuBqw8M0Ayx9lt1awg6nCpnBBYurDC/zXDrPbDdVCYfeU0BsWO/8tqtlbgT2
+    \\G9w84FoVxp7Z8VlIMCFlA2zs6SFz7JsDoeA3raAVGI/6ugLOpyypEBMs1OUIJqsi
+    \\l2D4kF501KKaU73yqWjgom7C12yxow+ev+to51byrvLjKzg6CYG1a4XXvi3tPxq3
+    \\smPi9WIsgtRqAEFQ8TmDn5XpNpaYbg==
+    \\-----END CERTIFICATE-----
+    \\
+;
+
+/// ServerHello through the server's Finished, certificate chain and all.
+const replay_flight_1 = tls.unb64(
+    "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" ++
+        "aWPtpRp2fD/9KErvNg==",
+);
+
+/// Session tickets and the HTTP response.
+const replay_flight_2 = tls.unb64(
+    "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" ++
+        "KFcGfYTExkk=",
+);
+
+/// The peer's side, keyed on how many bytes the client has to have sent
+/// before each flight is released.
+///
+/// 1611 is the ClientHello. 178 is the client's Finished *plus* the
+/// request record — the client sends them back to back — so the response
+/// is unreachable to a request that never left the process, which is
+/// exactly the failure this replays. Releasing a flight on a timer
+/// instead would answer a client that had sent nothing.
+const replay_script = [_]tls.ScriptedPeer.Step{
+    .{ .expect_len = 1611 },
+    .{ .send = replay_flight_1 },
+    .{ .expect_len = 178 },
+    .{ .send = replay_flight_2 },
+};
+
+test "a recorded https webhook completes its handshake and gets its status line" {
+    const gpa = testing.allocator;
+    var loop: reactor.Loop = undefined;
+    try loop.init(gpa);
+    defer loop.deinit();
+
+    var store: nntp_transport.CaStore = .init(gpa);
+    defer store.deinit();
+    const now_sec: i64 = @intCast(@divFloor(replay_realtime_ns, std.time.ns_per_s));
+    try testing.expectEqual(@as(usize, 1), try store.addPem(replay_ca_pem, now_sec));
+
+    var peer: tls.ScriptedPeer = undefined;
+    const port = try peer.start(gpa, &loop, &replay_script);
+    defer peer.deinit();
+
+    // The recorded ClientHello carries `example.com` as its server name
+    // and the recorded certificate was issued for it, so the URL has to
+    // say `example.com` too. Seeding the cache is what points that name at
+    // the replay peer without a packet leaving the machine.
+    var resolver: dns.Resolver = undefined;
+    resolver.init(gpa, &loop, .{});
+    defer resolver.deinit();
+    try resolver.cache.put(gpa, replay_host, &.{.{ .v4 = .{ 127, 0, 0, 1 } }}, std.math.maxInt(u64));
+
+    var h: Harness = .{ .gpa = gpa, .loop = &loop, .n = undefined };
+    h.n = .{ .gpa = gpa, .loop = &loop, .db = undefined };
+    h.n.ca = &store;
+    h.n.resolver = &resolver;
+    h.n.tls_entropy = &replay_entropy;
+    h.n.tls_realtime_ns = @intCast(replay_realtime_ns);
+    var logger: log.Logger = .{};
+    h.n.logger = &logger;
+
+    h.url = try std.fmt.bufPrint(&h.url_buf, "https://{s}:{d}{s}", .{ replay_host, port, replay_path });
+    h.pending = .{
+        .buf = &.{},
+        .topic = "deliver.complete",
+        .aggregate_id = "1",
+        .payload = "{}",
+        .occurred_at = 0,
+        .id = .nil,
+    };
+    h.d = .{ .n = &h.n, .pending = &h.pending };
+    try h.d.fiber.init(gpa, &loop, dispatch_stack_size, Harness.body, @ptrCast(&h));
+    defer h.d.fiber.deinit();
+    defer if (h.d.timer.isArmed()) loop.cancelTimer(&h.d.timer);
+    defer if (h.d.deadline.isArmed()) loop.cancelTimer(&h.d.deadline);
+
+    // `Host` carries no port, so the request is the same length whatever
+    // ephemeral port the peer landed on — which is what lets the byte
+    // counts in `replay_script` be constants. If `writeHead` ever changes
+    // shape, this fails here with something readable rather than as a
+    // twenty-second hang in the replay.
+    var head_buf: [256]u8 = undefined;
+    var head_w: Writer = .fixed(&head_buf);
+    try writeHead(&head_w, try http.Url.parse(h.url), .{ .url = h.url, .body = replay_body });
+    try testing.expectEqualStrings(
+        "POST /hook HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n" ++
+            "Content-Length: 11\r\n\r\n{\"ok\":true}",
+        head_w.buffered(),
+    );
+
+    h.d.fiber.enter();
+    try pumpUntil(&loop, 20_000, &h, Harness.done);
+
+    // A real chain verified against a real anchor, over the real record
+    // layer, reached through the same `dial`-then-hand-the-fd-to-a-`Conn`
+    // sequence production uses. The peer withheld this status until it had
+    // counted the request's bytes, so a request still sitting in the
+    // ciphertext buffer — or a socket the receiving fiber could never
+    // register — times this out instead.
+    const resp = try h.result.?;
+    try testing.expectEqual(@as(u16, 405), resp.status);
 }

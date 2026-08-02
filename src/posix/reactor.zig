@@ -479,6 +479,16 @@ const PollBackend = struct {
     }
 
     fn add(self: *PollBackend, gpa: Allocator, src: *Source) Error!void {
+        // `poll(2)` is perfectly happy to hold the same fd twice and will
+        // report it ready on both entries, but `epoll_ctl(ADD)` answers
+        // `EEXIST` — and epoll is what ships. Refusing the duplicate here
+        // is what stops a development host from proving code correct that
+        // cannot register a socket in production. The scan is over
+        // registrations, not over ticks, and a loop with hundreds of them
+        // is still cheaper than the syscall that follows.
+        for (self.fds.items) |p| {
+            if (p.fd == src.fd) return error.Exists;
+        }
         try self.fds.append(gpa, .{
             .fd = src.fd,
             .events = pollEvents(src.interest),

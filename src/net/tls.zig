@@ -42,7 +42,7 @@
 //!         };
 //!         const w = conn.writer();
 //!         w.writeAll("AUTHINFO USER bob\r\n") catch return;
-//!         w.flush() catch return;
+//!         conn.flush() catch return;
 //!         const line = conn.reader().takeDelimiterExclusive('\n') catch return;
 //!         ...
 //!     }
@@ -757,18 +757,38 @@ pub const Conn = struct {
         return &self.client.reader;
     }
 
-    /// The plaintext stream to the server. Buffered — `flush` is what puts
-    /// a record on the wire.
+    /// The plaintext stream to the server. Buffered — `Conn.flush` is what
+    /// puts a record on the wire. Not `writer().flush()`; see `flush`.
     pub fn writer(self: *Conn) *Writer {
         assert(self.state == .open);
         return &self.client.writer;
+    }
+
+    /// Put everything written to `writer()` on the wire.
+    ///
+    /// Two stages, and both are needed. `std.crypto.tls.Client.flush` only
+    /// *stages* a record: it encrypts into the ciphertext writer's buffer
+    /// and advances it, leaving the syscall to whoever owns that writer.
+    /// Flushing only the plaintext side leaves the record sitting in the
+    /// ciphertext buffer, and a request-response protocol then waits
+    /// forever for the answer to something the peer never received.
+    /// `std.http.Client.Connection.flush` pairs the two for the same
+    /// reason.
+    pub fn flush(self: *Conn) Writer.Error!void {
+        assert(self.state == .open);
+        try self.client.writer.flush();
+        try self.transport.writer.flush();
     }
 
     /// Send `close_notify` and flush. Without this the peer cannot tell an
     /// orderly shutdown from a truncation attack.
     pub fn close(self: *Conn) void {
         if (self.state != .open) return;
+        // `end` stages the alert the same way `flush` stages a record, so
+        // the ciphertext writer still has to be drained afterwards or the
+        // peer never sees it.
         self.client.end() catch {};
+        self.transport.writer.flush() catch {};
         self.state = .closed;
     }
 
@@ -803,7 +823,8 @@ pub const Conn = struct {
 /// too.
 ///
 /// The returned fd is owned by the caller and is ready to hand to
-/// `Conn.start`.
+/// `Conn.start` — including on a *different* fiber, which is what
+/// `unwatch` below is for.
 pub const DialError = Error || error{Canceled};
 
 pub fn dial(f: *Fiber, addr: std.Io.net.IpAddress) DialError!Fd {
@@ -819,6 +840,14 @@ pub fn dial(f: *Fiber, addr: std.Io.net.IpAddress) DialError!Fd {
     };
 
     if (pending) {
+        // Waiting for writability made this fiber the fd's registered
+        // owner, and `park` keeps that registration alive between parks.
+        // Hand the fd on in that state and the receiving fiber's first
+        // park fails with `EEXIST` — see the module header: exactly one
+        // thing may own readiness for an fd. That is how every `https://`
+        // webhook died on Linux while the same code passed on a host whose
+        // reactor uses `poll(2)`, which accepts the duplicate silently.
+        defer f.unwatch();
         const ready = try f.park(fd, .writable);
         if (ready.err) {
             try sys.socketError(fd);
@@ -875,13 +904,15 @@ pub fn osRandom(buf: []u8) sys.Error!void {
 //     server-side responses fed back are real TLS records: a fatal alert,
 //     garbage, and a truncated stream. So the record layer, the error
 //     mapping and the fiber plumbing are all genuinely exercised.
-//   * A *complete* handshake is not. `std.crypto.tls` ships a client and
-//     no server, so there is nothing in-tree to shake hands with, and no
-//     test here reaches ServerHello, key schedule, or certificate chain
-//     verification. Those paths are std's, but our stack-size choice and
-//     the plaintext `reader()`/`writer()` are untested against a real
-//     peer. That has to happen against an actual provider or an
-//     out-of-tree endpoint before this is trusted in production.
+//   * A *complete* handshake is not, here. `std.crypto.tls` ships a
+//     client and no server, so nothing in this file reaches ServerHello,
+//     the key schedule, or chain verification. That coverage lives in
+//     `nntp/transport.zig`, which replays a recorded provider handshake
+//     against `ScriptedPeer` — including one that drives `Conn` and its
+//     `flush`, because pinned entropy is what makes a recording decrypt
+//     and only `Options.entropy` can pin it. `bootstrap/notify.zig` does
+//     the same for `https://`, and additionally proves the fd handoff
+//     `dial` performs.
 
 const testing = std.testing;
 const IpAddress = std.Io.net.IpAddress;
@@ -909,7 +940,26 @@ fn pumpUntil(loop: *reactor.Loop, deadline_ms: u64, ctx: anytype, done: fn (@Typ
 /// This is the only mock in the file and it sits exactly at the wire: it
 /// speaks bytes over a real socket. Everything above it — the transport,
 /// the fiber, `std.crypto.tls.Client` — is the real implementation.
-const Peer = struct {
+///
+/// Base64 in the source, bytes at comptime: kilobytes of raw handshake as
+/// escaped literals is unreadable, and the decode is free at runtime.
+/// Lives here rather than in either replay test because both of them need
+/// it and the recordings are the same shape.
+pub fn unb64(comptime text: []const u8) []const u8 {
+    @setEvalBranchQuota(1 << 20);
+    const decoder = std.base64.standard.Decoder;
+    const len = decoder.calcSizeForSlice(text) catch unreachable;
+    var buf: [len]u8 = undefined;
+    decoder.decode(&buf, text) catch unreachable;
+    const frozen = buf;
+    return &frozen;
+}
+
+/// Public because the replay tests in `nntp/transport.zig` and
+/// `bootstrap/notify.zig` need the same wire: they hand it a recorded
+/// server handshake, which is the only way anything in tree reaches a
+/// *completed* one.
+pub const ScriptedPeer = struct {
     listener: socket.Listener = undefined,
     source: reactor.Source = undefined,
     loop: *reactor.Loop,
@@ -932,7 +982,7 @@ const Peer = struct {
     done: bool = false,
     write_failed: bool = false,
 
-    const Step = union(enum) {
+    pub const Step = union(enum) {
         /// Wait until this many further bytes have arrived.
         expect_len: usize,
         /// Send all of it, however many wakeups that takes.
@@ -944,7 +994,7 @@ const Peer = struct {
         close,
     };
 
-    fn start(self: *Peer, gpa: Allocator, loop: *reactor.Loop, script: []const Step) !u16 {
+    pub fn start(self: *ScriptedPeer, gpa: Allocator, loop: *reactor.Loop, script: []const Step) !u16 {
         self.* = .{ .loop = loop, .gpa = gpa, .script = script };
         try self.listener.listen(loopbackAny(), onAccept, socket.default_backlog);
         self.listener.context = self;
@@ -952,14 +1002,14 @@ const Peer = struct {
         return self.listener.boundPort();
     }
 
-    fn deinit(self: *Peer) void {
+    pub fn deinit(self: *ScriptedPeer) void {
         self.closeConn();
         if (self.listener.source.isRegistered()) self.loop.remove(&self.listener.source);
         self.listener.close();
         self.got.deinit(self.gpa);
     }
 
-    fn closeConn(self: *Peer) void {
+    fn closeConn(self: *ScriptedPeer) void {
         if (self.fd == sys.invalid_fd) return;
         if (self.source.isRegistered()) self.loop.remove(&self.source);
         sys.close(self.fd);
@@ -967,7 +1017,7 @@ const Peer = struct {
     }
 
     fn onAccept(l: *socket.Listener, fd: Fd) void {
-        const self: *Peer = @ptrCast(@alignCast(l.context.?));
+        const self: *ScriptedPeer = @ptrCast(@alignCast(l.context.?));
         if (self.fd != sys.invalid_fd) {
             sys.close(fd);
             return;
@@ -986,7 +1036,7 @@ const Peer = struct {
     }
 
     fn onReady(src: *reactor.Source, ready: reactor.Ready) void {
-        const self: *Peer = @fieldParentPtr("source", src);
+        const self: *ScriptedPeer = @fieldParentPtr("source", src);
         if (ready.read) {
             var buf: [16384]u8 = undefined;
             while (true) {
@@ -999,7 +1049,7 @@ const Peer = struct {
         self.advance();
     }
 
-    fn advance(self: *Peer) void {
+    fn advance(self: *ScriptedPeer) void {
         while (self.fd != sys.invalid_fd) {
             if (self.pending.len != 0) {
                 if (!self.pushPending()) return;
@@ -1037,7 +1087,7 @@ const Peer = struct {
 
     /// True once `pending` is empty. False means "come back on the next
     /// wakeup" — either the socket is full, or this is a drip step.
-    fn pushPending(self: *Peer) bool {
+    fn pushPending(self: *ScriptedPeer) bool {
         while (self.pending.len != 0) {
             const chunk = if (self.drip) self.pending[0..1] else self.pending;
             const n = sys.write(self.fd, chunk) catch |err| switch (err) {
@@ -1102,7 +1152,7 @@ test "the transport reader reassembles a payload delivered one byte at a time" {
     // 400 separate writes on the peer side means the reader under test has
     // to park and be resumed hundreds of times to see one logical payload.
     const payload = "0123456789abcdef" ** 25;
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .trickle = payload },
         .close,
@@ -1176,7 +1226,7 @@ test "the transport writer delivers more than the socket buffer, parking on back
     var prng = std.Random.DefaultPrng.init(0xB0A7);
     prng.random().bytes(payload);
 
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{.{ .expect_len = size }});
     defer peer.deinit();
 
@@ -1211,7 +1261,7 @@ test "the transport writer delivers more than the socket buffer, parking on back
 
     // Wait for the *peer* to have it all: the fiber finishing only means
     // the kernel accepted the last byte, not that it arrived.
-    const Ctx = struct { s: *RawSession, p: *Peer, want: usize };
+    const Ctx = struct { s: *RawSession, p: *ScriptedPeer, want: usize };
     var ctx = Ctx{ .s = &session, .p = &peer, .want = size };
     try pumpUntil(&loop, 60_000, &ctx, struct {
         fn done(c: *Ctx) bool {
@@ -1234,7 +1284,7 @@ test "a clean peer close surfaces as EndOfStream, and stays that way" {
     try loop.init(gpa);
     defer loop.deinit();
 
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .send = "half a message" },
         .close,
@@ -1292,7 +1342,7 @@ test "a fiber parked in the transport can be cancelled" {
 
     // A peer that accepts and then says nothing at all: the reader parks
     // and would stay parked forever.
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{.{ .expect_len = std.math.maxInt(usize) }});
     defer peer.deinit();
 
@@ -1427,7 +1477,7 @@ test "the handshake puts a well-formed ClientHello on the wire" {
     // Say nothing back, then hang up. The handshake will fail; the point is
     // what it emitted on the way there, which proves `Client.init` really
     // ran through our parking `Writer` and put bytes on a real socket.
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .expect_len = 1 },
         .close,
@@ -1490,7 +1540,7 @@ test "a fatal alert from the peer surfaces as TlsAlert with the peer's reason" {
     // length 2, level fatal (2), description handshake_failure (40).
     const alert_record = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
 
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .expect_len = 1 },
         .{ .send = &alert_record },
@@ -1534,7 +1584,7 @@ test "a peer that answers with garbage surfaces a protocol error, not a hang" {
     defer loop.deinit();
 
     // The classic misconfiguration: a plaintext service on the TLS port.
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .expect_len = 1 },
         .{ .send = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n" },
@@ -1581,7 +1631,7 @@ test "a peer that hangs up mid-handshake surfaces TransportFailed" {
 
     // Half a record, then gone: the record layer is left waiting for bytes
     // that never come.
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .expect_len = 1 },
         .{ .send = &[_]u8{ 0x16, 0x03, 0x03, 0x10, 0x00 } },
@@ -1621,7 +1671,7 @@ test "cancelling a handshake reports Canceled, not a transport fault" {
     defer loop.deinit();
 
     // Accept the ClientHello and then say nothing, forever.
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{.{ .expect_len = std.math.maxInt(usize) }});
     defer peer.deinit();
 
@@ -1661,7 +1711,7 @@ test "an undersized read buffer is refused before the handshake starts" {
     try loop.init(gpa);
     defer loop.deinit();
 
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{.{ .expect_len = std.math.maxInt(usize) }});
     defer peer.deinit();
 
@@ -1745,7 +1795,7 @@ test "dial from inside a fiber connects to a live listener" {
     try loop.init(gpa);
     defer loop.deinit();
 
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{.{ .expect_len = 5 }});
     defer peer.deinit();
 
@@ -1779,7 +1829,7 @@ test "dial from inside a fiber connects to a live listener" {
 
     f.enter();
     try pumpUntil(&loop, 10_000, &peer, struct {
-        fn done(p: *Peer) bool {
+        fn done(p: *ScriptedPeer) bool {
             return p.got.items.len >= 5;
         }
     }.done);
@@ -1802,7 +1852,7 @@ test "handshake stack high-water leaves the default stack size room to spare" {
     // certificate chain verification, because nothing in-tree can produce a
     // certificate to verify. Read the number as a floor, not a ceiling.
     const alert_record = [_]u8{ 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 };
-    var peer: Peer = undefined;
+    var peer: ScriptedPeer = undefined;
     const port = try peer.start(gpa, &loop, &.{
         .{ .expect_len = 1 },
         .{ .send = &alert_record },
