@@ -59,6 +59,35 @@ test "M1: an NZB in, segments fetched, and the assembled bytes are the original"
     try testing.expect(fx.provider().served >= @as(usize, @intCast(segments)));
     try testing.expect(fx.provider().accepted >= 1);
 
+    // What the client *sent*, which the reply bytes cannot show. Every
+    // article of the release was asked for by name, and nothing else
+    // was: a fetcher that asked for the wrong ids and a provider that
+    // served them anyway would be indistinguishable from a working one
+    // by the assertions above.
+    const provider = fx.provider();
+    for (fx.release.?.articles) |a| {
+        if (!provider.wasRequested(a.message_id)) {
+            std.debug.print("\nthe client never asked for {s}\n", .{a.message_id});
+            return error.ArticleNeverRequested;
+        }
+    }
+    const asked = try provider.requestedIds(gpa);
+    defer gpa.free(asked);
+    try testing.expectEqual(fx.release.?.articles.len, asked.len);
+
+    // The handshake: MODE READER on every connection the pool opened,
+    // and no AUTHINFO at all, because the server row carries no
+    // credentials. A client that authenticated anyway would be leaking
+    // an empty username at a provider that never asked.
+    try testing.expectEqual(provider.accepted, provider.countVerb("MODE READER"));
+    try testing.expect(!provider.sawVerb("AUTHINFO"));
+    // And nothing the client sent was refused as malformed.
+    try testing.expectEqual(@as(usize, 0), provider.rejected);
+
+    // The four contexts handed out four different ids, so the routing
+    // assertions above mean something.
+    try fx.expectIdsDistinct(id);
+
     // The assertion the whole file exists for.
     try fx.expectDeliveredMatchesRelease(release_name);
 
@@ -106,6 +135,43 @@ test "M1: the outbox timeline shows every stage actually ran" {
             return error.StageMissingFromTimeline;
         }
     }
+}
+
+test "the client authenticates, in order, on every connection a credentialled provider gets" {
+    // The provider refuses BODY until AUTHINFO succeeds, so a client that
+    // skipped the handshake could not download at all — but one that
+    // authenticated on the first connection only, or that sent PASS
+    // before USER, would still fetch *something* against a lenient fake.
+    // This asserts the sequence per connection instead.
+    const gpa = testing.allocator;
+    var fx = try h.Harness.init(gpa, "auth-nntp", .{});
+    defer fx.deinit();
+    try fx.withRelease(small, .{ .username = "hoardarr", .password = "s3cret" });
+
+    const id = try fx.addRelease(release_name);
+    try testing.expectEqual(h.JobState.completed, try fx.runUntilTerminal(id, 60_000));
+
+    const provider = fx.provider();
+    try testing.expect(provider.accepted > 0);
+    try testing.expectEqual(@as(usize, 0), provider.rejected);
+
+    var conn: usize = 1;
+    while (conn <= provider.accepted) : (conn += 1) {
+        const seq = try provider.commandSequence(gpa, conn);
+        defer gpa.free(seq);
+        if (seq.len == 0) continue;
+        try testing.expect(seq.len >= 2);
+        try testing.expectEqualStrings("AUTHINFO USER hoardarr", seq[0]);
+        try testing.expectEqualStrings("AUTHINFO PASS s3cret", seq[1]);
+        // One handshake per connection, not one per fetch.
+        var users: usize = 0;
+        for (seq) |line| {
+            if (std.mem.startsWith(u8, line, "AUTHINFO USER")) users += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), users);
+    }
+    try testing.expectEqual(provider.accepted, provider.countVerb("AUTHINFO USER"));
+    try testing.expectEqual(provider.accepted, provider.countVerb("AUTHINFO PASS"));
 }
 
 test "M2: the same pipeline driven entirely over HTTP" {
@@ -179,8 +245,46 @@ test "M3a: a clean download verifies against its PAR2 set and is delivered" {
         .recovery_slices = 4,
     }, .{});
 
+    // A first job runs to completion before the one under test, so the
+    // job counter and the verify/repair/delivery counters have already
+    // moved apart by different amounts when the second job starts. A
+    // post-download stage that keys on the publishing context's
+    // aggregate would then work on the wrong job — with one job in the
+    // database it works on the right one by accident.
+    const first_name = release_name ++ ".First";
+    var first_release = try tsfixture.generate(gpa, .{
+        .name = first_name,
+        .file_count = 1,
+        .file_size = 32 * 1024,
+        .article_size = 16 * 1024,
+        .par2_slice_size = 16 * 1024,
+        .recovery_slices = 1,
+    });
+    defer first_release.deinit();
+    try fx.serveFixture(&first_release);
+    const first_id = try fx.addFixture(&first_release, first_name);
+    try testing.expectEqual(h.JobState.completed, try fx.runUntilTerminal(first_id, 60_000));
+
     const id = try fx.addRelease(release_name);
+    try testing.expect(id != first_id);
     try testing.expectEqual(h.JobState.completed, try fx.runUntilTerminal(id, 60_000));
+
+    // The two jobs' aggregates really are separate numbers, in both
+    // directions: nothing of the second job's is reachable by reading
+    // one of the first job's ids as a job id.
+    try fx.expectIdsDistinct(first_id);
+    try fx.expectIdsDistinct(id);
+    const first_ids = try fx.aggregateIds(first_id);
+    const second_ids = try fx.aggregateIds(id);
+    try testing.expect(first_ids.verify_set != second_ids.verify_set);
+    try testing.expect(first_ids.delivery != second_ids.delivery);
+    try testing.expect(second_ids.verify_set != id);
+    try testing.expect(second_ids.delivery != id);
+
+    // Both releases landed, each under its own name — the failure a
+    // mis-routed delivery produces is one job's files under another
+    // job's directory.
+    try fx.expectDeliveredMatches(&first_release, first_name);
 
     // Verify ran and said OK. Repair must not have been reached at all:
     // a clean set that still goes through reconstruction means the

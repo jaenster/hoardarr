@@ -256,6 +256,43 @@ pub const Pool = struct {
         };
     }
 
+    /// Withdraw an acquire that has not been answered yet.
+    ///
+    /// A caller that gives up — a cancelled download fiber, whose
+    /// `ctx` is a frame on the stack it is unwinding — must not leave its
+    /// address in the queue. The pool would otherwise hand a connection to
+    /// something that no longer exists and, worse, count that connection
+    /// as checked out for the rest of the process.
+    ///
+    /// A queued waiter is simply dropped. One whose connection is already
+    /// dialling cannot be, because `Entry.onError` decides whether to
+    /// un-count `connecting` by whether a waiter is attached; it is
+    /// redirected instead at a stub that takes delivery and releases at
+    /// once, which is also what makes the freshly dialled connection
+    /// available to whoever asks next rather than wasted.
+    pub fn cancelAcquire(self: *Pool, ctx: ?*anyopaque) void {
+        var i: usize = 0;
+        while (i < self.waiters.items.len) {
+            if (self.waiters.items[i].ctx == ctx) {
+                _ = self.waiters.orderedRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        for (self.all.items) |e| {
+            const w = e.pending orelse continue;
+            if (w.ctx != ctx) continue;
+            e.pending = .{ .callback = onAbandoned, .ctx = e };
+        }
+    }
+
+    /// Stand-in waiter installed by `cancelAcquire`.
+    fn onAbandoned(ctx: ?*anyopaque, result: Error!*Conn) void {
+        const e: *Entry = @ptrCast(@alignCast(ctx.?));
+        const c = result catch return;
+        e.pool.release(c, false);
+    }
+
     /// Give a connection back.
     ///
     /// `failed` says whether the caller's last use of it errored. A failed

@@ -33,6 +33,19 @@ const release_opts: tsfixture.Options = .{
     .recovery_slices = 4,
 };
 
+/// The provider's throttle, *per connection*.
+///
+/// `testserver/nntp.zig` paces each session independently, so the rate a
+/// job actually sees is this times the number of connections it opens —
+/// and `Harness.withRelease` sells it four. The number below is a quarter
+/// of the aggregate the test wants, which is the whole point of stating
+/// it as a constant: an engine that fetches its segments in parallel
+/// finishes a throttled download N times sooner than one that walks them
+/// in order, and a pause that arrives after the last byte is a completed
+/// job, not a bug. Slow enough that the download is reliably still
+/// running when the button is pressed, and no slower.
+const per_conn_bytes_per_sec: u64 = 64 * 1024;
+
 /// Advances the loop until at least one segment of `id` is persisted as
 /// done and at least one is not, so an operator action lands on a job
 /// that genuinely has work outstanding.
@@ -54,7 +67,7 @@ test "lifecycle: pause mid-flight leaves the outstanding segments pending, and r
 
     var fx = try h.Harness.init(gpa, "pause", .{});
     defer fx.deinit();
-    try fx.withRelease(release_opts, .{ .bytes_per_sec = 512 * 1024 });
+    try fx.withRelease(release_opts, .{ .bytes_per_sec = per_conn_bytes_per_sec });
 
     const id = try fx.addRelease(release_name);
     try runUntilPartDone(fx, id);
@@ -122,7 +135,7 @@ test "lifecycle: removing a job mid-flight cancels it and purges its scratch dir
 
     var fx = try h.Harness.init(gpa, "remove", .{});
     defer fx.deinit();
-    try fx.withRelease(release_opts, .{ .bytes_per_sec = 512 * 1024 });
+    try fx.withRelease(release_opts, .{ .bytes_per_sec = per_conn_bytes_per_sec });
 
     const id = try fx.addRelease(release_name);
     try runUntilPartDone(fx, id);

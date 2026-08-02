@@ -18,19 +18,26 @@
 //! `nntp/conn.zig` hands a body to another one.
 //!
 //! `posix/fiber.zig` is the answer, for the same reason it exists for
-//! TLS: give the blocking-shaped code its own stack. One fiber per
-//! in-flight job runs the whole of that job's `Runner` loop; when its
-//! fetch needs the network it `yield`s, and the pool's or the
-//! connection's callback resumes it. From the `Runner`'s point of view
-//! `fetch` returned bytes; from the reactor's point of view nothing ever
-//! blocked.
+//! TLS: give the blocking-shaped code its own stack. When a fetch needs
+//! the network its fiber `yield`s, and the pool's or the connection's
+//! callback resumes it. From the `Runner`'s point of view `fetch`
+//! returned bytes; from the reactor's point of view nothing ever blocked.
 //!
-//! **One fiber per job, not per segment.** A stack is 1 MiB of address
-//! space plus a guard page; forty provider connections' worth of
-//! per-segment fibers would be an absurd way to express "eight sockets".
-//! Concurrency across jobs comes from `max_concurrent_jobs`, concurrency
-//! within a provider from its connection cap, and a single job walks its
-//! segments in order.
+//! **One fiber per connection slot, not one per job.** A blocking-shaped
+//! fetch holds its stack for a whole round trip, so a job driven by a
+//! single fiber has a single article outstanding: against a provider 30ms
+//! away that is one article per 30ms however fast the link is, and the
+//! other connection slots the operator paid for stay empty. So a
+//! `JobSlot` is a coordinator fiber plus a set of `Worker` fibers, all
+//! drawing from one cursor over the batch the `Runner` handed back —
+//! a slow article then costs the worker that drew it rather than a fixed
+//! share of the batch.
+//!
+//! The provider's `Pool` is what actually bounds the sockets, so workers
+//! belonging to different jobs contend for one provider's slots by
+//! queueing rather than by overshooting its cap. A stack is 1 MiB of
+//! *address space*, demand-paged; `max_fetch_workers` bounds how many of
+//! them a job can ask for whatever its `max_conns` claims.
 //!
 //! ### Every fiber entry happens from a timer
 //!
@@ -136,6 +143,18 @@ const ServerId = dserver.ServerId;
 /// job touches the pages it uses.
 const job_stack_size = fiber_mod.default_stack_size;
 
+/// Ceiling on a job's fetch fibers, whatever its provider's `max_conns`
+/// says.
+///
+/// Two reasons for a ceiling rather than trusting the row. One is that
+/// `max_conns` is operator input and a typo must not turn into gigabytes
+/// of mappings: the reservation is `max_concurrent_jobs × this`, and at
+/// 32 that is 32 MiB of address space for the shipped single-job default.
+/// The other is that it buys nothing past this — 32 articles in flight at
+/// a 50ms round trip is several hundred MiB/s of headroom, which is
+/// already far past the uplink of anything this daemon runs on.
+const max_fetch_workers: u16 = 32;
+
 /// Ceiling on how long the daemon stalls for one operator-initiated
 /// connection test. See `Probe`.
 const probe_deadline_ns: u64 = 8 * std.time.ns_per_s;
@@ -226,6 +245,9 @@ pub const ServerPool = struct {
     /// `pool.addr` holds a real address. False for a hostname until the
     /// first fetch resolves it on a fiber.
     resolved: bool = false,
+    /// A worker is asking the resolver right now. The others wait for its
+    /// answer instead of each sending the same query.
+    resolving: bool = false,
 
     fn deinit(self: *ServerPool) void {
         if (self.dialable) self.pool.deinit();
@@ -348,14 +370,14 @@ pub const CaRoots = struct {
 // One in-flight job
 // =====================================================================
 
-/// The state of the NNTP round trip a fiber is currently inside.
+/// The state of the NNTP round trip a worker is currently inside.
 ///
-/// Lives on the fiber's stack for exactly the duration of one
-/// `fetchOne`; the slot holds a pointer to it so the callbacks can find
+/// Lives on the worker's stack for exactly the duration of one
+/// `fetchOne`; the worker holds a pointer to it so the callbacks can find
 /// it. Nothing here is touched after the fiber has returned from that
 /// call.
 const Request = struct {
-    slot: *JobSlot,
+    worker: *Worker,
     /// Allocator the body is duped with — the one the `Runner` passed
     /// into `fetch`, so the bytes belong to the caller's arena.
     a: Allocator,
@@ -425,7 +447,7 @@ const Request = struct {
     fn settle(self: *Request) void {
         self.settled = true;
         // Never enter the fiber from here — see the module comment.
-        if (self.slot.awaiting) self.slot.armTimer(0);
+        if (self.worker.awaiting) self.worker.armTimer(0);
     }
 
     /// `dns.ResolveFn`. Fires before `resolve` returns for a literal or a
@@ -441,7 +463,342 @@ const Request = struct {
     }
 };
 
-/// One job being driven, and the fiber driving it.
+/// How long a worker waits before looking again at a provider another
+/// worker is currently resolving. Runs once per provider per process, so
+/// the granularity costs nothing measurable.
+const resolve_poll_ns: u64 = 5 * std.time.ns_per_ms;
+
+/// One of a job's fetch fibers: claim a segment, drive it to a verdict,
+/// repeat until the batch is empty.
+///
+/// Everything that talks to a provider lives here rather than on the
+/// `JobSlot`, because the state of a round trip — the `Request` the
+/// callbacks write into, the fiber they resume — is per fetch, and a job
+/// keeps several fetches outstanding at once.
+const Worker = struct {
+    slot: *JobSlot,
+    /// Per worker, not per job. The `PoolSet` it holds has *this worker*
+    /// as its context, which is what lets `fetchOne` park the right fiber
+    /// without a "current fiber" global that a second worker would
+    /// corrupt.
+    fetcher: tiered.TieredFetcher = undefined,
+
+    fiber: Fiber = undefined,
+    fiber_ready: bool = false,
+    /// Resume clock, exactly as the coordinator's: one timer serves both
+    /// "the runner asked for a backoff" and "a callback answered,
+    /// continue at the top of the next dispatch", because a worker is
+    /// only ever waiting for one of them.
+    timer: reactor.Timer = .{ .callback = onTimer },
+    request: ?*Request = null,
+
+    /// The fiber is yielded and something is expected to resume it.
+    awaiting: bool = false,
+    /// Parked with nothing in hand, waiting to be given the next batch.
+    ///
+    /// Only an idle worker may be woken by the coordinator. Waking one
+    /// that is mid-round-trip would return it from `park` with its
+    /// `Request` unsettled and the connection's callback still aimed at
+    /// its stack.
+    idle: bool = false,
+    /// The fiber has been entered at least once, so there is something on
+    /// its stack to unwind.
+    entered: bool = false,
+    /// The body has returned; the stack is idle.
+    done: bool = false,
+
+    // -- the fiber body -----------------------------------------------
+
+    fn entry(f: *Fiber, ctx: ?*anyopaque) void {
+        _ = f;
+        const self: *Worker = @ptrCast(@alignCast(ctx.?));
+        self.run() catch |e| {
+            if (e == error.Canceled) return;
+            // The segments this worker held stay pending and a later
+            // dispatch re-takes them. What must not happen is the
+            // coordinator waiting on a fetch nobody is going to make, so
+            // the failure is recorded where it will surface.
+            self.slot.fatal = e;
+            self.slot.rt.logger.err("download: fetch worker stopped", &.{
+                log.int("job_id", self.slot.job_id),
+                log.errv("err", e),
+            });
+        };
+    }
+
+    fn run(self: *Worker) !void {
+        const slot = self.slot;
+        while (true) {
+            if (slot.canceled) return error.Canceled;
+            if (slot.claim()) |seg| {
+                defer slot.resolveOne();
+                try self.driveSegment(seg);
+                continue;
+            }
+            // Nothing left in this batch. Workers outlive it so the next
+            // one costs no `mmap`; only the end of the job retires them.
+            if (slot.draining) return;
+            self.idle = true;
+            self.park();
+            self.idle = false;
+        }
+    }
+
+    /// One segment, from dispatch to a verdict, honouring every backoff
+    /// the runner asks for as a reactor timer.
+    fn driveSegment(self: *Worker, seg: *orchestrator.Segment) !void {
+        const slot = self.slot;
+        const runner = slot.runner orelse return;
+
+        // An arena per worker, reset between attempts: a body is hundreds
+        // of kilobytes and is dead the instant the segment resolves, so
+        // one arena shared across the batch would hold every body of it
+        // until the batch ended.
+        var arena = std.heap.ArenaAllocator.init(slot.rt.gpa);
+        defer arena.deinit();
+
+        var task: orchestrator.SegmentTask = .{
+            .segment_id = seg.id,
+            .message_id = seg.message_id,
+        };
+        while (true) {
+            if (slot.canceled) return error.Canceled;
+            const now = slot.rt.clock.now();
+            switch (runner.step(arena.allocator(), self.fetcher.fetcher(), &task, now)) {
+                .resolved => |r| return runner.submit(r),
+                .wait_until => |at| {
+                    _ = arena.reset(.retain_capacity);
+                    try self.sleepUntil(at);
+                },
+            }
+        }
+    }
+
+    /// Park until `at` (Unix millis). Zero and past deadlines still go
+    /// through the timer, so the loop gets a chance to dispatch between
+    /// segments instead of one worker monopolising it.
+    fn sleepUntil(self: *Worker, at: app_ports.Timestamp) !void {
+        const now = self.slot.rt.clock.now();
+        const delay_ms: u64 = if (at > now) @intCast(at - now) else 0;
+        self.armTimer(delay_ms * std.time.ns_per_ms);
+        self.park();
+        if (self.slot.canceled) return error.Canceled;
+    }
+
+    /// Switch back to the loop. Only an explicit `enter` — from this
+    /// worker's timer, and from nowhere else — brings the fiber back.
+    fn park(self: *Worker) void {
+        self.awaiting = true;
+        self.fiber.yield();
+        self.awaiting = false;
+    }
+
+    fn armTimer(self: *Worker, delay_ns: u64) void {
+        const loop = self.slot.rt.loop;
+        if (self.timer.isArmed()) loop.cancelTimer(&self.timer);
+        loop.addTimer(&self.timer, delay_ns) catch {
+            // The heap could not grow. The worker would otherwise wait
+            // forever, so take the whole job down instead of stranding it.
+            self.slot.canceled = true;
+            loop.addTimer(&self.timer, 0) catch {};
+        };
+    }
+
+    fn onTimer(t: *reactor.Timer) void {
+        const self: *Worker = @fieldParentPtr("timer", t);
+        self.enter();
+    }
+
+    /// The one place a worker fiber is switched into.
+    fn enter(self: *Worker) void {
+        if (self.done or !self.fiber_ready) return;
+        if (self.fiber.isDone()) {
+            self.retire();
+            return;
+        }
+        self.entered = true;
+        self.fiber.enter();
+        if (self.fiber.isDone()) self.retire();
+    }
+
+    /// The fiber has returned. Nudge the coordinator, which is very
+    /// likely parked waiting for exactly this — through its timer, never
+    /// by entering it from here.
+    fn retire(self: *Worker) void {
+        if (self.done) return;
+        self.done = true;
+        self.slot.live -= 1;
+        self.slot.armTimer(0);
+    }
+
+    fn deinit(self: *Worker) void {
+        if (self.timer.isArmed()) self.slot.rt.loop.cancelTimer(&self.timer);
+        if (self.fiber_ready) self.fiber.deinit();
+        self.fiber_ready = false;
+    }
+
+    // -- the PoolSet the tiered fetcher sees --------------------------
+
+    fn poolSet(self: *Worker) dl_ports.PoolSet {
+        return .{
+            .ctx = @ptrCast(self),
+            .snapshotFn = &snapshotFn,
+            .fetchOneFn = &fetchOneFn,
+        };
+    }
+
+    fn snapshotFn(ctx: *anyopaque, a: Allocator) Allocator.Error![]dl_ports.PoolInfo {
+        const self: *Worker = @ptrCast(@alignCast(ctx));
+        return self.slot.rt.poolSnapshot(a);
+    }
+
+    fn fetchOneFn(
+        ctx: *anyopaque,
+        a: Allocator,
+        id: ServerId,
+        message_id: []const u8,
+    ) dl_ports.FetchError![]u8 {
+        const self: *Worker = @ptrCast(@alignCast(ctx));
+        const sp = self.slot.rt.poolById(id) orelse return error.NoPoolsAvailable;
+        return self.fetchOne(a, sp, message_id);
+    }
+
+    /// A blocking-shaped `BODY <id>` over a callback transport.
+    ///
+    /// Runs on the worker's stack. Every wait is a `park`; every resume
+    /// comes from `Request.settle` arming this worker's timer.
+    fn fetchOne(
+        self: *Worker,
+        a: Allocator,
+        sp: *ServerPool,
+        message_id: []const u8,
+    ) dl_ports.FetchError![]u8 {
+        const slot = self.slot;
+        if (slot.canceled or slot.rt.stopping) return error.Canceled;
+
+        var req: Request = .{ .worker = self, .a = a, .sp = sp };
+        self.request = &req;
+        defer self.request = null;
+
+        try self.resolveProvider(sp, &req);
+
+        // ---- a connection ----
+        sp.pool.acquire(onAcquired, &req);
+        while (!req.settled) {
+            self.park();
+            if (slot.canceled) {
+                // The queue still holds this frame's address, and this
+                // frame is about to stop existing.
+                sp.pool.cancelAcquire(&req);
+                return error.Canceled;
+            }
+        }
+        if (req.err) |e| return mapPoolError(e);
+        const c = req.conn orelse return error.Network;
+
+        // ---- the body ----
+        req.settled = false;
+        req.saved = c.handler;
+        c.context = @ptrCast(&req);
+        c.handler = &Request.handler;
+
+        c.fetchBody(message_id) catch |e| {
+            // The write failed but the connection object is intact, so it
+            // is ours to hand back — as failed, because the stream's
+            // framing is now a guess.
+            c.handler = req.saved.?;
+            c.context = null;
+            sp.pool.release(c, true);
+            return mapConnError(e);
+        };
+
+        while (!req.settled) {
+            self.park();
+            if (slot.canceled) {
+                // Shutdown mid-body. The connection is still registered
+                // with the loop and still owned by the pool; giving it
+                // back as failed is what stops it being handed to another
+                // fiber with a half-consumed block in its buffer.
+                if (!req.conn_dead) {
+                    c.handler = req.saved.?;
+                    c.context = null;
+                    sp.pool.release(c, true);
+                }
+                return error.Canceled;
+            }
+        }
+
+        if (!req.conn_dead) {
+            c.handler = req.saved.?;
+            c.context = null;
+            sp.pool.release(c, req.err != null);
+        }
+
+        if (req.err) |e| return mapConnError(e);
+        return req.body orelse error.Network;
+    }
+
+    /// Turn a provider's hostname into an address. Once per provider per
+    /// process: `Pool.addr` is what every later dial uses, so a hostname
+    /// costs one round trip here and nothing afterwards.
+    ///
+    /// Serialised on `sp.resolving`, because a job's workers all reach
+    /// their first fetch in the same instant and N queries for one name
+    /// would be N answers aimed at N stacks. The latecomers look again on
+    /// a short timer rather than asking.
+    fn resolveProvider(self: *Worker, sp: *ServerPool, req: *Request) dl_ports.FetchError!void {
+        if (sp.resolved) return;
+        const slot = self.slot;
+
+        if (sp.resolving) {
+            while (sp.resolving and !sp.resolved) {
+                self.armTimer(resolve_poll_ns);
+                self.park();
+                if (slot.canceled) return error.Canceled;
+            }
+            return if (sp.resolved) {} else error.Network;
+        }
+
+        const resolver = slot.rt.resolver orelse return error.NoPoolsAvailable;
+        sp.resolving = true;
+        defer sp.resolving = false;
+
+        resolver.resolve(sp.host, sp.port, Request.onResolved, @ptrCast(req));
+        while (!req.settled) {
+            self.park();
+            if (slot.canceled) return error.Canceled;
+        }
+        if (req.err) |e| {
+            slot.rt.logger.warn("nntp: cannot resolve provider", &.{
+                log.str("server", sp.name),
+                log.str("host", sp.host),
+                log.errv("err", e),
+            });
+            return error.Network;
+        }
+        sp.pool.addr = req.addr orelse return error.Network;
+        sp.resolved = true;
+        req.settled = false;
+    }
+
+    fn onAcquired(ctx: ?*anyopaque, result: nntp_pool.Error!*nntp_conn.Conn) void {
+        const req: *Request = @ptrCast(@alignCast(ctx.?));
+        if (result) |c| {
+            req.conn = c;
+        } else |e| {
+            req.err = e;
+        }
+        req.settle();
+    }
+};
+
+/// One job being driven: the fiber that decides, and the fibers that
+/// fetch.
+///
+/// The coordinator owns the `Runner` and therefore every decision —
+/// which segments are eligible, when to flush, when the job is done. It
+/// never touches the network itself; it hands a batch to the workers and
+/// parks until they have resolved all of it.
 pub const JobSlot = struct {
     rt: *Runtime,
     job_id: JobId,
@@ -449,16 +806,16 @@ pub const JobSlot = struct {
 
     fiber: Fiber = undefined,
     fiber_ready: bool = false,
-    /// Resume clock. One timer serves both purposes a slot ever has —
-    /// "the runner asked to be woken at T" and "a callback answered,
-    /// continue at the top of the next dispatch" — because a slot is
-    /// only ever waiting for one of them.
+    /// Resume clock. One timer serves every reason a coordinator ever
+    /// waits — a poll gap the runner asked for, or a worker reporting in —
+    /// because it is only ever waiting for one of them.
     timer: reactor.Timer = .{ .callback = onTimer },
 
     /// The fiber is yielded and something is expected to resume it.
     awaiting: bool = false,
-    /// Shutdown, pause or removal. Checked after every yield; the fiber
-    /// unwinds through its own defers rather than being discarded.
+    /// Shutdown, pause or removal. Checked after every yield, by the
+    /// coordinator and by every worker; each unwinds through its own
+    /// defers rather than being discarded.
     canceled: bool = false,
     /// The body returned. The slot is reaped from a timer, never from
     /// inside the frame that entered the fiber.
@@ -466,8 +823,38 @@ pub const JobSlot = struct {
     /// Set once the fiber has been entered at least once.
     entered: bool = false,
 
-    fetcher: tiered.TieredFetcher = undefined,
-    request: ?*Request = null,
+    /// The runner the workers step. Borrowed from `body`'s frame, which
+    /// outlives every worker because `drainWorkers` runs before it
+    /// returns.
+    runner: ?*orchestrator.Runner = null,
+
+    workers: std.ArrayList(*Worker) = .empty,
+    /// Workers whose fibers have not returned yet.
+    live: usize = 0,
+    /// No more batches are coming: a worker that finds nothing to claim
+    /// exits instead of parking for the next one.
+    draining: bool = false,
+    /// What killed a worker, surfaced by the coordinator so a job whose
+    /// fetchers have all died fails rather than hangs.
+    fatal: ?anyerror = null,
+
+    /// The segments handed to the workers, the next one nobody has
+    /// claimed, and how many are claimed but unresolved. A shared cursor
+    /// rather than a slice each: one slow article then costs the worker
+    /// that drew it, not a fixed share of the batch.
+    batch: []*orchestrator.Segment = &.{},
+    cursor: usize = 0,
+    busy: usize = 0,
+    /// Segments resolved since the last flush, and how many of them are
+    /// worth one. A batch is several times the worker count so that a
+    /// worker finishing early has the next segment waiting, but the
+    /// aggregate only learns a segment resolved when the batch is
+    /// applied — so progress, `done_bytes` and the outbox would
+    /// otherwise move in steps of a whole batch. Flushing every
+    /// `flush_every` completions keeps the write cadence, and what the
+    /// UI reads, at the granularity of the connection count.
+    since_flush: usize = 0,
+    flush_every: usize = 1,
 
     // -- the fiber body -----------------------------------------------
 
@@ -491,7 +878,7 @@ pub const JobSlot = struct {
         };
     }
 
-    /// The whole of one job: load the aggregate, walk its segments to a
+    /// The whole of one job: load the aggregate, drive its segments to a
     /// verdict, persist. Every wait in here is a yield, never a sleep.
     fn body(self: *JobSlot) !void {
         const rt = self.rt;
@@ -500,10 +887,10 @@ pub const JobSlot = struct {
         defer rt.job_store.release(job);
 
         var opts = rt.orchestrator_opts;
-        // The worker count sizes the batch the runner hands back, so it
-        // tracks the provider's connection cap even though this fiber
-        // walks the batch in order.
-        opts.workers = @max(self.hint.max_conns, 1);
+        // One fetch fiber per connection slot the provider sold, because
+        // a segment is a round trip and a job with one of them in flight
+        // leaves the rest of what was bought idle.
+        opts.workers = @max(@min(self.hint.max_conns, max_fetch_workers), 1);
         if (rt.settings_ratio) |k| {
             const raw = k.read();
             if (raw > 0) opts.fail_hopeless_ratio = @as(f64, @floatFromInt(raw)) / 100.0;
@@ -512,7 +899,6 @@ pub const JobSlot = struct {
         var runner = try orchestrator.Runner.init(.{
             .gpa = rt.gpa,
             .store = rt.job_store,
-            .fetcher = self.fetcher.fetcher(),
             .sink = rt.sink,
             .txm = rt.txm,
             .fs = rt.fs,
@@ -524,6 +910,13 @@ pub const JobSlot = struct {
             .incomplete_dir = rt.incomplete_dir,
         });
         defer runner.deinit();
+        self.runner = &runner;
+
+        // Declared after `runner.deinit` so it runs *before* it: a worker
+        // holds the runner for as long as its fiber has a frame, and
+        // tearing the runner down under a live worker is a use-after-free
+        // rather than a failing test.
+        defer self.drainWorkers();
 
         try runner.begin(rt.clock.now());
 
@@ -539,21 +932,14 @@ pub const JobSlot = struct {
                 .wait_until => |at| try self.sleepUntil(at),
                 .work => |ready| {
                     defer a.free(ready);
-                    for (ready) |seg| {
-                        if (self.canceled) return error.Canceled;
-                        var task: orchestrator.SegmentTask = .{
-                            .segment_id = seg.id,
-                            .message_id = seg.message_id,
-                        };
-                        try self.driveSegment(a, &runner, &task);
-                    }
+                    try self.runBatch(ready, opts.workers);
                     // Unconditional, not `flushIfDue`: the aggregate only
                     // learns a segment resolved when the batch is
                     // applied, so an unflushed batch would make the next
                     // `verdict` hand back the very segments just
-                    // fetched. The batch is already capped at
-                    // `opts.workers`, which is what keeps the write rate
-                    // sane.
+                    // fetched. The batch is already capped by
+                    // `Options.batchSize`, which is what keeps the write
+                    // rate sane.
                     try runner.flush(rt.clock.now());
                 },
             }
@@ -561,26 +947,122 @@ pub const JobSlot = struct {
         try runner.flush(rt.clock.now());
     }
 
-    /// One segment, from dispatch to a verdict, honouring every backoff
-    /// the runner asks for as a reactor timer.
-    fn driveSegment(
-        self: *JobSlot,
-        a: Allocator,
-        runner: *orchestrator.Runner,
-        task: *orchestrator.SegmentTask,
-    ) !void {
-        while (true) {
+    /// Hand `ready` to the workers and park until every segment of it has
+    /// a verdict.
+    fn runBatch(self: *JobSlot, ready: []*orchestrator.Segment, want: u16) !void {
+        self.batch = ready;
+        self.cursor = 0;
+        defer {
+            self.batch = &.{};
+            self.cursor = 0;
+        }
+
+        self.flush_every = @max(want, 1);
+        self.since_flush = 0;
+
+        self.ensureWorkers(@min(ready.len, @as(usize, want)));
+        if (self.live == 0) return error.NoFetchWorkers;
+        // Only the idle ones: a worker still inside a round trip has a
+        // callback aimed at its stack and must be left to its own timer.
+        for (self.workers.items) |w| {
+            if (w.idle) w.armTimer(0);
+        }
+
+        while (self.cursor < self.batch.len or self.busy > 0) {
+            if (self.live == 0) break;
+            self.park();
             if (self.canceled) return error.Canceled;
-            switch (runner.step(a, task, self.rt.clock.now())) {
-                .resolved => |r| return runner.submit(r),
-                .wait_until => |at| try self.sleepUntil(at),
+            if (self.since_flush >= self.flush_every) {
+                self.since_flush = 0;
+                // Safe with fetches outstanding: a worker only runs while
+                // this fiber is parked, so the aggregate and the store see
+                // one writer, and the segments still in flight are exactly
+                // the ones not in the batch being applied.
+                if (self.runner) |r| try r.flush(self.rt.clock.now());
             }
         }
+        if (self.fatal) |e| return e;
+    }
+
+    /// Grow the worker set to `want`, which only happens on the first
+    /// batch of a job unless a later one is wider.
+    fn ensureWorkers(self: *JobSlot, want: usize) void {
+        const rt = self.rt;
+        while (self.workers.items.len < want) {
+            const w = rt.gpa.create(Worker) catch break;
+            w.* = .{ .slot = self };
+            w.fetcher = .{
+                .gpa = rt.gpa,
+                .pools = w.poolSet(),
+                .logger = rt.logger,
+                .accounter = rt.accounter,
+                .limiter = rt.limiter,
+                .clock = rt.clock,
+            };
+            w.fiber.init(rt.gpa, rt.loop, job_stack_size, Worker.entry, w) catch {
+                rt.gpa.destroy(w);
+                break;
+            };
+            w.fiber_ready = true;
+            self.workers.append(rt.gpa, w) catch {
+                w.fiber.deinit();
+                rt.gpa.destroy(w);
+                break;
+            };
+            self.live += 1;
+            w.armTimer(0);
+        }
+        if (self.workers.items.len < want) {
+            // Fewer fetchers than connection slots is slower, not wrong,
+            // and is the right answer to memory pressure — but it is not
+            // something to discover from a throughput graph.
+            rt.logger.warn("download: could not start every fetch worker", &.{
+                log.int("job_id", self.job_id),
+                log.uint("workers", self.workers.items.len),
+                log.uint("wanted", want),
+            });
+        }
+    }
+
+    /// Stop every worker and wait for its fiber to return.
+    ///
+    /// Runs on every exit path, before the runner is torn down. Waking a
+    /// worker that is mid-round-trip is safe here and only here: it
+    /// resumes, sees `canceled` or `draining`, and unwinds through
+    /// `fetchOne`'s own cancel handling, which is what gives its
+    /// connection back.
+    fn drainWorkers(self: *JobSlot) void {
+        self.draining = true;
+        for (self.workers.items) |w| {
+            if (!w.done) w.armTimer(0);
+        }
+        // No guard on this loop on purpose: giving up would leave live
+        // fibers pointing at a runner that is about to be destroyed, and
+        // a wedged job is a better failure than that. `Runtime.cancelSlot`
+        // is what guarantees progress when the loop is no longer running.
+        while (self.live > 0) self.park();
+    }
+
+    /// The next unclaimed segment of the batch, if any.
+    fn claim(self: *JobSlot) ?*orchestrator.Segment {
+        if (self.cursor >= self.batch.len) return null;
+        const seg = self.batch[self.cursor];
+        self.cursor += 1;
+        self.busy += 1;
+        return seg;
+    }
+
+    /// A claimed segment reached a verdict.
+    fn resolveOne(self: *JobSlot) void {
+        self.busy -= 1;
+        self.since_flush += 1;
+        const batch_done = self.cursor >= self.batch.len and self.busy == 0;
+        if (batch_done or self.since_flush >= self.flush_every) self.armTimer(0);
     }
 
     /// Park the fiber until `at` (Unix millis). Zero and past deadlines
     /// still go through the timer, so the loop gets a chance to dispatch
-    /// between segments instead of one job monopolising it.
+    /// instead of one job monopolising it.
     fn sleepUntil(self: *JobSlot, at: app_ports.Timestamp) !void {
         const now = self.rt.clock.now();
         const delay_ms: u64 = if (at > now) @intCast(at - now) else 0;
@@ -612,7 +1094,8 @@ pub const JobSlot = struct {
         self.enter();
     }
 
-    /// The one place a fiber is switched into, outside shutdown.
+    /// The one place the coordinator fiber is switched into, outside
+    /// shutdown.
     fn enter(self: *JobSlot) void {
         if (self.finished or !self.fiber_ready) return;
         if (self.fiber.isDone()) {
@@ -632,142 +1115,13 @@ pub const JobSlot = struct {
 
     fn deinit(self: *JobSlot) void {
         if (self.timer.isArmed()) self.rt.loop.cancelTimer(&self.timer);
+        for (self.workers.items) |w| {
+            w.deinit();
+            self.rt.gpa.destroy(w);
+        }
+        self.workers.deinit(self.rt.gpa);
         if (self.fiber_ready) self.fiber.deinit();
         self.fiber_ready = false;
-    }
-
-    // -- the PoolSet the tiered fetcher sees --------------------------
-    //
-    // Per slot rather than shared, and that is the whole trick: the
-    // vtable's context *is* the fiber's slot, so `fetchOne` knows which
-    // fiber to park without a "current fiber" global that a second job
-    // would corrupt.
-
-    fn poolSet(self: *JobSlot) dl_ports.PoolSet {
-        return .{
-            .ctx = @ptrCast(self),
-            .snapshotFn = &snapshotFn,
-            .fetchOneFn = &fetchOneFn,
-        };
-    }
-
-    fn snapshotFn(ctx: *anyopaque, a: Allocator) Allocator.Error![]dl_ports.PoolInfo {
-        const self: *JobSlot = @ptrCast(@alignCast(ctx));
-        return self.rt.poolSnapshot(a);
-    }
-
-    fn fetchOneFn(
-        ctx: *anyopaque,
-        a: Allocator,
-        id: ServerId,
-        message_id: []const u8,
-    ) dl_ports.FetchError![]u8 {
-        const self: *JobSlot = @ptrCast(@alignCast(ctx));
-        const sp = self.rt.poolById(id) orelse return error.NoPoolsAvailable;
-        return self.fetchOne(a, sp, message_id);
-    }
-
-    /// A blocking-shaped `BODY <id>` over a callback transport.
-    ///
-    /// Runs on the fiber's stack. Both waits are `park`; both resumes
-    /// come from `Request.settle` arming the slot timer.
-    fn fetchOne(
-        self: *JobSlot,
-        a: Allocator,
-        sp: *ServerPool,
-        message_id: []const u8,
-    ) dl_ports.FetchError![]u8 {
-        if (self.canceled or self.rt.stopping) return error.Canceled;
-
-        var req: Request = .{ .slot = self, .a = a, .sp = sp };
-        self.request = &req;
-        defer self.request = null;
-
-        // ---- an address ----
-        //
-        // Once per provider per process. `Pool.addr` is what every later
-        // dial uses, so a hostname costs one round trip here and nothing
-        // afterwards; the resolver's own cache covers a re-resolve after
-        // the operator edits the row.
-        if (!sp.resolved) {
-            const resolver = self.rt.resolver orelse return error.NoPoolsAvailable;
-            resolver.resolve(sp.host, sp.port, Request.onResolved, @ptrCast(&req));
-            if (!req.settled) {
-                self.park();
-                if (self.canceled) return error.Canceled;
-            }
-            if (req.err) |e| {
-                self.rt.logger.warn("nntp: cannot resolve provider", &.{
-                    log.str("server", sp.name),
-                    log.str("host", sp.host),
-                    log.errv("err", e),
-                });
-                return error.Network;
-            }
-            sp.pool.addr = req.addr orelse return error.Network;
-            sp.resolved = true;
-            req.settled = false;
-        }
-
-        // ---- a connection ----
-        sp.pool.acquire(onAcquired, &req);
-        if (!req.settled) {
-            self.park();
-            if (self.canceled) return error.Canceled;
-        }
-        if (req.err) |e| return mapPoolError(e);
-        const c = req.conn orelse return error.Network;
-
-        // ---- the body ----
-        req.settled = false;
-        req.saved = c.handler;
-        c.context = @ptrCast(&req);
-        c.handler = &Request.handler;
-
-        c.fetchBody(message_id) catch |e| {
-            // The write failed but the connection object is intact, so it
-            // is ours to hand back — as failed, because the stream's
-            // framing is now a guess.
-            c.handler = req.saved.?;
-            c.context = null;
-            sp.pool.release(c, true);
-            return mapConnError(e);
-        };
-
-        if (!req.settled) {
-            self.park();
-            if (self.canceled) {
-                // Shutdown mid-body. The connection is still registered
-                // with the loop and still owned by the pool; giving it
-                // back as failed is what stops it being handed to another
-                // fiber with a half-consumed block in its buffer.
-                if (!req.conn_dead) {
-                    c.handler = req.saved.?;
-                    c.context = null;
-                    sp.pool.release(c, true);
-                }
-                return error.Canceled;
-            }
-        }
-
-        if (!req.conn_dead) {
-            c.handler = req.saved.?;
-            c.context = null;
-            sp.pool.release(c, req.err != null);
-        }
-
-        if (req.err) |e| return mapConnError(e);
-        return req.body orelse error.Network;
-    }
-
-    fn onAcquired(ctx: ?*anyopaque, result: nntp_pool.Error!*nntp_conn.Conn) void {
-        const req: *Request = @ptrCast(@alignCast(ctx.?));
-        if (result) |c| {
-            req.conn = c;
-        } else |e| {
-            req.err = e;
-        }
-        req.settle();
     }
 };
 
@@ -952,9 +1306,14 @@ pub const Runtime = struct {
         self.ca_roots.deinit();
     }
 
-    /// Unwind one fiber. `cancel` rather than `deinit`, so the body's
-    /// `defer`s run: the job aggregate is released and any checked-out
-    /// connection goes back to its pool.
+    /// Unwind one slot's fibers. `cancel` rather than `deinit`, so each
+    /// body's `defer`s run: the job aggregate is released and any
+    /// checked-out connection goes back to its pool.
+    ///
+    /// The loop is no longer dispatching by the time this is called, so
+    /// the switching the timers would have done has to happen here — and
+    /// in this order, because the coordinator's own unwind ends in
+    /// `drainWorkers`, which parks until the last worker has returned.
     fn cancelSlot(self: *Runtime, slot: *JobSlot) void {
         _ = self;
         slot.canceled = true;
@@ -962,8 +1321,16 @@ pub const Runtime = struct {
         // Never entered: there is nothing on that stack to unwind, and
         // entering it now would run the whole job during shutdown.
         if (!slot.entered) return;
+        // Same for a worker whose first entry never came: retiring it is
+        // what lets `drainWorkers` reach zero rather than park forever.
+        for (slot.workers.items) |w| {
+            if (!w.entered) w.retire();
+        }
         var guard: usize = 0;
-        while (!slot.fiber.isDone() and guard < 64) : (guard += 1) {
+        while (!slot.fiber.isDone() and guard < 1024) : (guard += 1) {
+            for (slot.workers.items) |w| {
+                if (!w.done) w.enter();
+            }
             slot.enter();
         }
         slot.finished = true;
@@ -1145,14 +1512,9 @@ pub const Runtime = struct {
             .job_id = id,
             .hint = self.scheduler.dispatchHint(),
         };
-        slot.fetcher = .{
-            .gpa = self.gpa,
-            .pools = slot.poolSet(),
-            .logger = self.logger,
-            .accounter = self.accounter,
-            .limiter = self.limiter,
-            .clock = self.clock,
-        };
+        // Only the coordinator's fiber here. The fetch workers are made
+        // when the first batch arrives, so a job that turns out to have
+        // nothing to do never reserves a stack it does not use.
         try slot.fiber.init(self.gpa, self.loop, job_stack_size, JobSlot.entry, slot);
         slot.fiber_ready = true;
         errdefer slot.deinit();
@@ -1390,14 +1752,27 @@ pub const Runtime = struct {
 
 /// The job id an envelope is about.
 ///
-/// The download context's own events carry it as the aggregate id; the
-/// post-download contexts key on their own aggregate and put `job_id` in
-/// the payload. Both are checked, aggregate id first.
+/// The payload's `job_id` is the only field that means this across every
+/// context, so it is the only one consulted first. `aggregate_id` names
+/// the *publishing* context's aggregate — a verify set, a repair attempt,
+/// a delivery — and only the download context's aggregate happens to be a
+/// job. Reading it as one routes `verify.ok` for job 7 at whatever job
+/// shares a number with verify set 3, which is a different job the moment
+/// the two counters drift apart: a stage then runs against a stranger, and
+/// a `repair.ok` can re-verify and fail a job that is still downloading.
+///
+/// Every payload carries the field. The post-download contexts declare
+/// `job_id` on each event, and `infra.Publisher` injects it for the
+/// download context, whose job-level events spell it `id`. The fallback
+/// is therefore for rows that predate that injection, and it is confined
+/// to the topics whose aggregate really is the job.
 pub fn aggregateJobId(env: outbox.Envelope) ?JobId {
+    if (payloadJobId(env.payload)) |v| return v;
+    if (!std.mem.startsWith(u8, env.topic, "download.")) return null;
     if (std.fmt.parseInt(JobId, env.aggregate_id, 10)) |v| {
         if (v != 0) return v;
     } else |_| {}
-    return payloadJobId(env.payload);
+    return null;
 }
 
 /// `"job_id":<int>` out of a payload this process encoded.
@@ -1703,8 +2078,20 @@ test "the system CA bundle is found when there is one, and reported when there i
     try testing.expect(dialability("news.example.com", 563, true, roots.haveRoots()) == .needs_dns);
 }
 
-test "the job id comes from the aggregate id, or from the payload" {
-    // A download event keys on the job itself.
+test "the job id comes from the payload, and from the aggregate id only for download topics" {
+    // A download event keys on the job itself, and the publisher injects
+    // the same number into the payload.
+    try testing.expectEqual(@as(?JobId, 42), aggregateJobId(.{
+        .id = @splat(0),
+        .topic = "download.job.created",
+        .aggregate_id = "42",
+        .occurred_at_ms = 0,
+        .payload = "{\"job_id\":42}",
+        .attempts = 1,
+    }));
+
+    // A row from before that injection still resolves, because the
+    // aggregate of a `download.` topic is the job.
     try testing.expectEqual(@as(?JobId, 42), aggregateJobId(.{
         .id = @splat(0),
         .topic = "download.job.created",
@@ -1714,15 +2101,28 @@ test "the job id comes from the aggregate id, or from the payload" {
         .attempts = 1,
     }));
 
-    // A verify event keys on the verify set, so the job id is only in
-    // the payload. Getting this wrong routes the whole post-download
-    // pipeline at aggregate ids that happen to collide with job ids.
+    // The regression this exists for: a verify event keys on the *verify
+    // set*, which is a different counter. With more than one job alive
+    // the two diverge, and preferring the aggregate id sends the whole
+    // post-download pipeline at a stranger — delivering one job's files
+    // under another's name and failing a job that is still downloading.
     try testing.expectEqual(@as(?JobId, 7), aggregateJobId(.{
         .id = @splat(0),
         .topic = "verify.ok",
-        .aggregate_id = "0",
+        .aggregate_id = "3",
         .occurred_at_ms = 0,
         .payload = "{\"id\":3,\"job_id\":7,\"state\":\"ok\"}",
+        .attempts = 1,
+    }));
+
+    // And a post-download event with no job id in it resolves to nothing
+    // rather than to its own aggregate.
+    try testing.expectEqual(@as(?JobId, null), aggregateJobId(.{
+        .id = @splat(0),
+        .topic = "repair.ok",
+        .aggregate_id = "3",
+        .occurred_at_ms = 0,
+        .payload = "{\"id\":3}",
         .attempts = 1,
     }));
 

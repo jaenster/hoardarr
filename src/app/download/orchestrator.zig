@@ -92,9 +92,21 @@ pub const Error = ports.RepoError || app_ports.PublishError ||
 /// Runtime tuning. Every zero means "use the default", exactly as Go's
 /// `OrchestratorOptions` did, so a caller can supply a partial literal.
 pub const Options = struct {
-    /// Cap on concurrently in-flight fetches. The pool is the real
-    /// bound; this is the upper bound on outstanding `SegmentTask`s.
+    /// How many segments of this job may be in flight at once. The
+    /// composition root gives each of them a fiber, so this is the
+    /// number of provider connections the job can occupy; the pool's own
+    /// cap is the real bound and this must not exceed it.
     workers: u16 = 0,
+    /// Segments claimed per poll, as a multiple of `workers`.
+    ///
+    /// A batch has to be resolved and flushed before the next `verdict`,
+    /// because a segment stays `pending` until the flush applies it and
+    /// would otherwise be handed out twice. Claiming exactly `workers`
+    /// would therefore stall every worker at the end of each batch until
+    /// the slowest article of it arrived; claiming a multiple lets a
+    /// worker that finished early take the next segment instead, so the
+    /// only stall is at the tail of a much longer run.
+    batch_per_worker: u16 = 0,
     /// How often the drainer flushes a batch to the store and the bus.
     ///
     /// 1s, not Go's original 100ms: on the low-power hardware this ships
@@ -130,6 +142,7 @@ pub const Options = struct {
 
     pub const defaults: Options = .{
         .workers = 1,
+        .batch_per_worker = 4,
         .flush_interval_ms = 1000,
         .flush_batch_max = 1024,
         .max_attempts = 3,
@@ -147,6 +160,7 @@ pub const Options = struct {
         var o = self;
         const d = defaults;
         if (o.workers == 0) o.workers = d.workers;
+        if (o.batch_per_worker == 0) o.batch_per_worker = d.batch_per_worker;
         if (o.flush_interval_ms == 0) o.flush_interval_ms = d.flush_interval_ms;
         if (o.flush_batch_max == 0) o.flush_batch_max = d.flush_batch_max;
         if (o.max_attempts == 0) o.max_attempts = d.max_attempts;
@@ -157,6 +171,11 @@ pub const Options = struct {
         if (o.max_poll_gap_ms == 0) o.max_poll_gap_ms = d.max_poll_gap_ms;
         if (o.pool_wait_ms == 0) o.pool_wait_ms = d.pool_wait_ms;
         return o;
+    }
+
+    /// How many segments one poll claims.
+    pub fn batchSize(self: Options) usize {
+        return @as(usize, @max(self.workers, 1)) * @as(usize, @max(self.batch_per_worker, 1));
     }
 
     /// In-process backoff before the attempt following `attempt`
@@ -319,6 +338,11 @@ pub const SegmentTask = struct {
     attempt: u8 = 0,
     /// Earliest instant the next attempt may run.
     ready_at: Timestamp = 0,
+    /// Which server served the most recent attempt, for byte accounting.
+    /// Per task rather than per runner because several tasks are stepped
+    /// concurrently, and a field on the runner would record whichever of
+    /// them happened to be in `attempt` last.
+    server_id: ServerId = 0,
 
     pub fn isReady(self: SegmentTask, now: Timestamp) bool {
         return self.ready_at <= now;
@@ -351,7 +375,6 @@ pub const Verdict = union(enum) {
 pub const Runner = struct {
     gpa: Allocator,
     store: ports.JobStore,
-    fetcher: ports.ArticleFetcher,
     sink: Sink,
     txm: app_ports.Manager,
     fs: app_ports.Filesystem,
@@ -373,16 +396,10 @@ pub const Runner = struct {
     window_opened_at: Timestamp = 0,
     /// Set once `begin` has run.
     started: bool = false,
-    /// Which server served the most recent successful fetch. Read by
-    /// `step` when it builds the `Result`; the byte accounter needs it,
-    /// and threading it through `Outcome` would put transport detail in
-    /// a domain-shaped type.
-    last_server_id: ServerId = 0,
 
     pub const InitParams = struct {
         gpa: Allocator,
         store: ports.JobStore,
-        fetcher: ports.ArticleFetcher,
         sink: Sink,
         txm: app_ports.Manager,
         fs: app_ports.Filesystem,
@@ -400,7 +417,6 @@ pub const Runner = struct {
         return .{
             .gpa = p.gpa,
             .store = p.store,
-            .fetcher = p.fetcher,
             .sink = p.sink,
             .txm = p.txm,
             .fs = p.fs,
@@ -440,7 +456,7 @@ pub const Runner = struct {
     }
 
     /// The segments eligible for dispatch right now, capped at `max`
-    /// (pass `opts.workers` for the configured concurrency).
+    /// (pass `batchSize()` for the configured concurrency).
     ///
     /// The returned pointers stay valid for the aggregate's lifetime;
     /// the slice belongs to `a`.
@@ -456,7 +472,7 @@ pub const Runner = struct {
 
     /// What to do next at the job level. Mirrors Go's outer `Run` loop.
     pub fn verdict(self: *Runner, a: Allocator, now: Timestamp) Allocator.Error!Verdict {
-        const ready = try self.takeReady(a, now, self.opts.workers);
+        const ready = try self.takeReady(a, now, self.opts.batchSize());
         if (ready.len > 0) return .{ .work = ready };
         a.free(ready);
 
@@ -470,16 +486,27 @@ pub const Runner = struct {
     /// Returns `.wait_until` for a backoff the caller must honour before
     /// calling again, and `.resolved` once the segment has a verdict.
     /// Never sleeps.
-    pub fn step(self: *Runner, a: Allocator, task: *SegmentTask, now: Timestamp) Step {
+    ///
+    /// `fetcher` is an argument rather than a field because the caller
+    /// runs several of these at once and each needs its own transport
+    /// state: a fetch is blocking-shaped, so one fetcher per concurrent
+    /// dispatch is what keeps them from sharing a round trip.
+    pub fn step(
+        self: *Runner,
+        a: Allocator,
+        fetcher: ports.ArticleFetcher,
+        task: *SegmentTask,
+        now: Timestamp,
+    ) Step {
         if (!task.isReady(now)) return .{ .wait_until = task.ready_at };
 
         task.attempt += 1;
-        const out = self.attempt(a, task.*, now);
+        const out = self.attempt(a, fetcher, task, now);
         switch (out) {
             .done, .missing, .cancelled => return .{ .resolved = .{
                 .segment_id = task.segment_id,
                 .outcome = out,
-                .server_id = self.last_server_id,
+                .server_id = task.server_id,
             } },
             .failed => |f| {
                 // Nobody to ask is not the segment's fault: wait for a
@@ -510,15 +537,21 @@ pub const Runner = struct {
     }
 
     /// One fetch + decode + write, with no retry of its own.
-    pub fn attempt(self: *Runner, a: Allocator, task: SegmentTask, _: Timestamp) Outcome {
-        self.last_server_id = 0;
-        const body = self.fetcher.fetch(a, self.hint_server, task.message_id) catch |e| {
+    pub fn attempt(
+        self: *Runner,
+        a: Allocator,
+        fetcher: ports.ArticleFetcher,
+        task: *SegmentTask,
+        _: Timestamp,
+    ) Outcome {
+        task.server_id = 0;
+        const body = fetcher.fetch(a, self.hint_server, task.message_id) catch |e| {
             if (e == error.ArticleMissing) return .missing;
             if (e == error.Canceled) return .cancelled;
             return .{ .failed = .{ .fetch = e } };
         };
         defer a.free(body.bytes);
-        self.last_server_id = body.server_id;
+        task.server_id = body.server_id;
 
         var article = yenc.decode(a, body.bytes) catch |e|
             return .{ .failed = .{ .decode = decodeCause(e) } };
@@ -767,7 +800,6 @@ const Harness = struct {
         self.runner = try Runner.init(.{
             .gpa = testing.allocator,
             .store = self.store.store(),
-            .fetcher = self.fetcher.fetcher(),
             .sink = self.sink.sink(),
             .txm = self.ftx.manager(),
             .fs = self.fs.filesystem(),
@@ -777,6 +809,12 @@ const Harness = struct {
             .job = self.job,
             .incomplete_dir = incomplete,
         });
+    }
+
+    /// The transport every `step` below runs through. A pointer into the
+    /// harness, so the scripted fetcher's call count survives `useJob`.
+    fn transport(self: *Harness) ports.ArticleFetcher {
+        return self.fetcher.fetcher();
     }
 
     /// Swaps in a wider aggregate than the default one-segment job.
@@ -791,7 +829,6 @@ const Harness = struct {
         self.runner = try Runner.init(.{
             .gpa = testing.allocator,
             .store = self.store.store(),
-            .fetcher = self.fetcher.fetcher(),
             .sink = self.sink.sink(),
             .txm = self.ftx.manager(),
             .fs = self.fs.filesystem(),
@@ -831,7 +868,7 @@ const Harness = struct {
     /// Records every delay so a test can assert the schedule.
     fn drive(self: *Harness, t: *SegmentTask, waits: *std.ArrayList(Millis)) !Result {
         for (0..64) |_| {
-            switch (self.runner.step(testing.allocator, t, self.clock.t)) {
+            switch (self.runner.step(testing.allocator, self.transport(), t, self.clock.t)) {
                 .resolved => |r| return r,
                 .wait_until => |at| {
                     try waits.append(testing.allocator, at - self.clock.t);
@@ -852,6 +889,7 @@ fn yencBody(a: Allocator, payload: []const u8) ![]u8 {
 test "zero options normalise to the Go defaults" {
     const o = (Options{}).normalized();
     try testing.expectEqual(@as(u16, 1), o.workers);
+    try testing.expectEqual(@as(u16, 4), o.batch_per_worker);
     try testing.expectEqual(@as(Millis, 1000), o.flush_interval_ms);
     try testing.expectEqual(@as(usize, 1024), o.flush_batch_max);
     try testing.expectEqual(@as(u8, 3), o.max_attempts);
@@ -867,6 +905,10 @@ test "zero options normalise to the Go defaults" {
     const custom = (Options{ .max_attempts = 1, .workers = 8 }).normalized();
     try testing.expectEqual(@as(u8, 1), custom.max_attempts);
     try testing.expectEqual(@as(u16, 8), custom.workers);
+    // A poll claims several segments per worker, so a worker that
+    // finishes early has the next one waiting rather than idling until
+    // the whole batch resolves.
+    try testing.expectEqual(@as(usize, 32), custom.batchSize());
 }
 
 test "in-process backoff doubles per attempt and saturates" {
@@ -1156,7 +1198,7 @@ test "no pools available waits without consuming the retry budget" {
     // moves — otherwise a job queued before the operator configured a
     // server would burn its whole budget waiting.
     for (0..3) |_| {
-        switch (h.runner.step(testing.allocator, &t, h.clock.t)) {
+        switch (h.runner.step(testing.allocator, h.transport(), &t, h.clock.t)) {
             .wait_until => |at| {
                 try testing.expectEqual(h.clock.t + 5000, at);
                 h.clock.set(at);
@@ -1550,16 +1592,16 @@ test "two segments interleave through one runner without corrupting state" {
     var t_b: SegmentTask = .{ .segment_id = job.files[0].segments[1].id, .message_id = "b@h" };
 
     // Both fail their first attempt and ask for the same 200ms backoff.
-    const s1 = h.runner.step(testing.allocator, &t_a, h.now());
-    const s2 = h.runner.step(testing.allocator, &t_b, h.now());
+    const s1 = h.runner.step(testing.allocator, h.transport(), &t_a, h.now());
+    const s2 = h.runner.step(testing.allocator, h.transport(), &t_b, h.now());
     try testing.expectEqual(h.now() + 200, s1.wait_until);
     try testing.expectEqual(h.now() + 200, s2.wait_until);
 
     // Time passes once for both — they share the reactor, not a thread
     // each. B resolves first, A second: the reverse of dispatch order.
     h.clock.advance(200);
-    const r_b = h.runner.step(testing.allocator, &t_b, h.now()).resolved;
-    const r_a = h.runner.step(testing.allocator, &t_a, h.now()).resolved;
+    const r_b = h.runner.step(testing.allocator, h.transport(), &t_b, h.now()).resolved;
+    const r_a = h.runner.step(testing.allocator, h.transport(), &t_a, h.now()).resolved;
     try testing.expect(r_b.outcome == .done);
     try testing.expect(r_a.outcome == .done);
 

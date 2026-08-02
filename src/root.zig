@@ -231,6 +231,7 @@ pub const e2e = struct {
     pub const lifecycle_test = @import("e2e/lifecycle_test.zig");
     pub const repair_test = @import("e2e/repair_test.zig");
     pub const multiserver_test = @import("e2e/multiserver_test.zig");
+    pub const load_test = @import("e2e/load_test.zig");
 };
 
 pub const posix = struct {
@@ -394,6 +395,7 @@ test {
     _ = e2e.lifecycle_test;
     _ = e2e.repair_test;
     _ = e2e.multiserver_test;
+    _ = e2e.load_test;
     _ = posix.sys;
     _ = posix.reactor;
     _ = posix.signals;

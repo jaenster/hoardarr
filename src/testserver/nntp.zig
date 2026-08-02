@@ -13,6 +13,22 @@
 //! posting, overview, XOVER, streaming feeds. Pointing a real newsreader
 //! at this will disappoint it.
 //!
+//! # It is strict, and it remembers
+//!
+//! A fake that answers whatever it likes cannot prove the client asked
+//! correctly — which is how a TLS client that never flushed a single
+//! command past the greeting was once "verified by hand" against a
+//! scripted peer. So: every verb is matched whole, every argument is
+//! parsed, and anything malformed or out of sequence is refused with the
+//! code a real server would send instead of being guessed at. A command
+//! is never answered as if it were a different one.
+//!
+//! Every line taken off the wire is recorded with the connection that
+//! sent it (`received`, `commandSequence`, `requestCount`, `sawVerb`), so
+//! a test asserts on what the client *sent* and not only on the bytes
+//! that came back. The two are independent failures: a fetch can decode
+//! perfectly while the handshake skipped AUTHINFO.
+//!
 //! The knobs exist so the e2e suite can reproduce what real providers
 //! do to you:
 //!
@@ -78,6 +94,21 @@ pub const Options = struct {
     busy_greeting: []const u8 = "502 too many connections from your IP\r\n",
 };
 
+/// One command line as the server received it.
+pub const Received = struct {
+    /// Accept order of the connection that sent it, starting at 1. What
+    /// makes "the pool opened four connections and each did its own
+    /// handshake" an assertion rather than a hope.
+    conn: usize,
+    /// The line, terminator stripped. Owned by the server.
+    line: []const u8,
+    /// The message-id argument of a retrieval command, as a slice of
+    /// `line`. Empty for every other verb.
+    id: []const u8 = "",
+    /// False when the server refused the line instead of answering it.
+    accepted: bool = true,
+};
+
 pub const Server = struct {
     gpa: Allocator,
     loop: *reactor.Loop,
@@ -105,10 +136,22 @@ pub const Server = struct {
     open: usize = 0,
     /// Articles served in full.
     served: usize = 0,
+    /// Bytes handed to the transport, response lines included. Counted
+    /// where they are offered rather than where the kernel accepts them,
+    /// because that is the load the server is generating; what a slow
+    /// client has actually drained is its own connection's business.
+    bytes_written: u64 = 0,
     /// Requests answered 430, whether unknown or deliberately dropped.
     missed: usize = 0,
     /// Command lines dispatched, across all connections.
     commands: usize = 0,
+    /// Command lines refused as malformed, unknown or out of sequence.
+    /// Non-zero in a test that did not intend it means the client is
+    /// speaking a protocol this server does not recognise.
+    rejected: usize = 0,
+
+    /// Every command line taken off the wire, in arrival order. Owned.
+    received: std.ArrayList(Received) = .empty,
 
     /// Binds and starts accepting. Returns the bound port. Initialises
     /// in place: the reactor keeps a pointer to `&self.listener.source`,
@@ -144,6 +187,10 @@ pub const Server = struct {
         self.clearCorpus();
         self.corpus.deinit(self.gpa);
         self.corpus = .empty;
+
+        self.clearReceived();
+        self.received.deinit(self.gpa);
+        self.received = .empty;
     }
 
     pub fn deinit(self: *Server) void {
@@ -197,9 +244,12 @@ pub const Server = struct {
     /// which is what a test wants between phases.
     pub fn reset(self: *Server) void {
         self.clearCorpus();
+        self.clearReceived();
         self.served = 0;
         self.missed = 0;
         self.commands = 0;
+        self.rejected = 0;
+        self.bytes_written = 0;
     }
 
     fn clearCorpus(self: *Server) void {
@@ -209,6 +259,77 @@ pub const Server = struct {
             self.gpa.free(e.value_ptr.*);
         }
         self.corpus.clearRetainingCapacity();
+    }
+
+    fn clearReceived(self: *Server) void {
+        for (self.received.items) |r| self.gpa.free(@constCast(r.line));
+        self.received.clearRetainingCapacity();
+    }
+
+    // -- what the client actually sent ---------------------------------
+
+    /// The command lines one connection sent, in order. Caller owns the
+    /// outer slice; the lines belong to the server.
+    ///
+    /// Per connection rather than in aggregate because the handshake is a
+    /// per-connection sequence: a pool that authenticated once and then
+    /// opened three unauthenticated connections would look perfectly
+    /// healthy in a flat list.
+    pub fn commandSequence(self: *const Server, gpa: Allocator, conn: usize) Allocator.Error![][]const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.received.items) |r| {
+            if (r.conn == conn) try out.append(gpa, r.line);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// How many lines began with `verb` — a whole verb, so `MODE` does
+    /// not match `MODEM` and `AUTHINFO USER` does not match a bare
+    /// `AUTHINFO`.
+    pub fn countVerb(self: *const Server, verb: []const u8) usize {
+        var n: usize = 0;
+        for (self.received.items) |r| {
+            if (lineHasVerb(r.line, verb)) n += 1;
+        }
+        return n;
+    }
+
+    pub fn sawVerb(self: *const Server, verb: []const u8) bool {
+        return self.countVerb(verb) != 0;
+    }
+
+    /// How many retrieval commands named `msg_id` (bare, no angle
+    /// brackets), refusals included — a retry asks twice.
+    pub fn requestCount(self: *const Server, msg_id: []const u8) usize {
+        var n: usize = 0;
+        for (self.received.items) |r| {
+            if (r.id.len != 0 and std.mem.eql(u8, r.id, msg_id)) n += 1;
+        }
+        return n;
+    }
+
+    pub fn wasRequested(self: *const Server, msg_id: []const u8) bool {
+        return self.requestCount(msg_id) != 0;
+    }
+
+    /// Distinct message-ids asked for, in first-request order. Caller
+    /// owns the outer slice; the ids belong to the server.
+    pub fn requestedIds(self: *const Server, gpa: Allocator) Allocator.Error![][]const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.received.items) |r| {
+            if (r.id.len == 0) continue;
+            var seen = false;
+            for (out.items) |prev| {
+                if (std.mem.eql(u8, prev, r.id)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) try out.append(gpa, r.id);
+        }
+        return out.toOwnedSlice(gpa);
     }
 
     // -- knobs --------------------------------------------------------
@@ -278,7 +399,7 @@ pub const Server = struct {
             sys.close(fd);
             return;
         };
-        s.* = .{ .stream = undefined, .server = self, .refused = over_cap };
+        s.* = .{ .stream = undefined, .server = self, .refused = over_cap, .conn = self.accepted };
         s.stream.initAccepted(self.gpa, self.loop, fd, &Session.handler) catch {
             sys.close(fd);
             self.gpa.destroy(s);
@@ -345,6 +466,13 @@ const max_line = 1024;
 const Session = struct {
     stream: socket.Stream,
     server: *Server,
+    /// Accept order, starting at 1. Stamped onto every recorded line so
+    /// a test can read one connection's conversation on its own.
+    conn: usize = 0,
+    /// Index into `server.received` of the line being dispatched, when it
+    /// was recorded — null when the recording allocation failed, which a
+    /// test allocator turns into a leak-free failure elsewhere.
+    record_at: ?usize = null,
     /// Serves both the latency delay and the throttle pacing — they are
     /// never armed at the same time.
     timer: reactor.Timer = .{ .callback = onTimer },
@@ -358,6 +486,8 @@ const Session = struct {
 
     user: [128]u8 = undefined,
     user_len: usize = 0,
+    /// An `AUTHINFO USER` is outstanding, so a `PASS` is in sequence.
+    saw_user: bool = false,
     authed: bool = false,
 
     /// True for a connection turned away by the cap; it never gets a
@@ -473,6 +603,7 @@ const Session = struct {
             // speaking NNTP. Say so, then swallow the rest of its line
             // so the next real command is not parsed as its tail.
             if (self.in_len == self.in.len) {
+                self.server.rejected += 1;
                 self.writeLine("501 command line too long");
                 self.in_len = 0;
                 self.discarding = true;
@@ -489,24 +620,105 @@ const Session = struct {
         return true;
     }
 
+    /// Answers one command line, or refuses it.
+    ///
+    /// Every branch matches a *whole* verb and parses its argument. The
+    /// looser "does the line start with BODY" test this replaced could
+    /// not tell a command apart from a truncated or corrupted one, so a
+    /// client that sent `BODYX <a@h>` — or that sent nothing at all and
+    /// had its buffer answered by a scripted peer — still saw a 222.
     fn dispatch(self: *Session) void {
         const cmd = self.line[0..self.line_len];
-        if (cmd.len == 0) return;
         // A refused connection has already been told why; anything it
-        // says now is ignored.
-        if (self.refused) return;
+        // says now is recorded but never answered.
+        if (self.refused) {
+            self.record(cmd);
+            return;
+        }
         self.server.commands += 1;
+        self.record(cmd);
 
-        if (startsWithIgnoreCase(cmd, "AUTHINFO USER")) {
-            const arg = std.mem.trim(u8, cmd["AUTHINFO USER".len..], " \t");
-            self.user_len = @min(arg.len, self.user.len);
-            @memcpy(self.user[0..self.user_len], arg[0..self.user_len]);
+        // An empty line is not a command. Answering it would mean the
+        // server invented a request the client never made.
+        if (cmd.len == 0) return self.reject("500 empty command");
+
+        const verb_end = std.mem.indexOfAny(u8, cmd, " \t") orelse cmd.len;
+        const verb = cmd[0..verb_end];
+        const args = std.mem.trim(u8, cmd[verb_end..], " \t");
+
+        if (eqlIgnoreCase(verb, "AUTHINFO")) {
+            self.authinfo(args);
+        } else if (eqlIgnoreCase(verb, "MODE")) {
+            // A `MODE` this server does not implement gets the code a
+            // real one sends, never the reader-mode answer.
+            if (!eqlIgnoreCase(args, "READER")) return self.reject("501 unsupported MODE");
+            self.writeLine("200 reader mode");
+        } else if (eqlIgnoreCase(verb, "DATE")) {
+            if (args.len != 0) return self.reject("501 DATE takes no argument");
+            var buf: [32]u8 = undefined;
+            self.writeLine(std.fmt.bufPrint(&buf, "111 {s}", .{utcStamp()}) catch "111 19700101000000");
+        } else if (eqlIgnoreCase(verb, "GROUP")) {
+            // Any group exists and has one article. The fetcher only
+            // cares that the command succeeded — but it has to have
+            // named a group.
+            if (args.len == 0) return self.reject("501 GROUP needs a group name");
+            self.writeLine("211 1 1 1 misc.test");
+        } else if (eqlIgnoreCase(verb, "BODY")) {
+            self.serveArticle(args, .body);
+        } else if (eqlIgnoreCase(verb, "ARTICLE")) {
+            self.serveArticle(args, .article);
+        } else if (eqlIgnoreCase(verb, "HEAD")) {
+            self.serveArticle(args, .head);
+        } else if (eqlIgnoreCase(verb, "STAT")) {
+            const id = parseMessageId(args) orelse return self.reject("501 bad command");
+            self.noteId(id);
+            if (self.server.lookup(id) != null and !self.server.wouldDrop(id)) {
+                self.writeFmt("223 0 <{s}>", .{id});
+            } else {
+                self.server.missed += 1;
+                self.writeFmt("430 no such article <{s}>", .{id});
+            }
+        } else if (eqlIgnoreCase(verb, "QUIT")) {
+            if (args.len != 0) return self.reject("501 QUIT takes no argument");
+            self.writeLine("205 bye");
+            self.stream.shutdownWrite();
+            self.markDead();
+        } else if (eqlIgnoreCase(verb, "CAPABILITIES")) {
+            self.write("101 capability list follows\r\nVERSION 2\r\nREADER\r\n.\r\n");
+        } else {
+            self.reject("500 unknown command");
+        }
+    }
+
+    /// `AUTHINFO USER x` / `AUTHINFO PASS y`, in that order.
+    ///
+    /// The ordering is enforced rather than assumed: a client that sent
+    /// PASS first would otherwise authenticate against whatever username
+    /// happened to be left in the session buffer — which is exactly the
+    /// class of "the stub answered a command the client never sent
+    /// properly" this file exists to rule out.
+    fn authinfo(self: *Session, args: []const u8) void {
+        const sub_end = std.mem.indexOfAny(u8, args, " \t") orelse args.len;
+        const sub = args[0..sub_end];
+        const rest = std.mem.trim(u8, args[sub_end..], " \t");
+
+        if (eqlIgnoreCase(sub, "USER")) {
+            if (rest.len == 0) return self.reject("501 AUTHINFO USER needs a username");
+            self.user_len = @min(rest.len, self.user.len);
+            @memcpy(self.user[0..self.user_len], rest[0..self.user_len]);
+            self.saw_user = true;
             self.writeLine("381 enter password");
-        } else if (startsWithIgnoreCase(cmd, "AUTHINFO PASS")) {
-            const pass = std.mem.trim(u8, cmd["AUTHINFO PASS".len..], " \t");
+            return;
+        }
+        if (eqlIgnoreCase(sub, "PASS")) {
+            if (rest.len == 0) return self.reject("501 AUTHINFO PASS needs a password");
+            if (!self.saw_user) return self.reject("482 authentication commands out of sequence");
+            // One PASS answers one USER; a second must name its user
+            // again, as RFC 4643 requires.
+            self.saw_user = false;
             if (self.server.requiresAuth()) {
                 if (std.mem.eql(u8, self.user[0..self.user_len], self.server.opts.username) and
-                    std.mem.eql(u8, pass, self.server.opts.password))
+                    std.mem.eql(u8, rest, self.server.opts.password))
                 {
                     self.authed = true;
                     self.writeLine("281 authentication accepted");
@@ -517,50 +729,25 @@ const Session = struct {
                 self.authed = true;
                 self.writeLine("281 authentication accepted");
             }
-        } else if (eqlIgnoreCase(cmd, "MODE READER")) {
-            self.writeLine("200 reader mode");
-        } else if (eqlIgnoreCase(cmd, "DATE")) {
-            var buf: [32]u8 = undefined;
-            self.writeLine(std.fmt.bufPrint(&buf, "111 {s}", .{utcStamp()}) catch "111 19700101000000");
-        } else if (startsWithIgnoreCase(cmd, "GROUP")) {
-            // Any group exists and has one article. The fetcher only
-            // cares that the command succeeded.
-            self.writeLine("211 1 1 1 misc.test");
-        } else if (startsWithIgnoreCase(cmd, "BODY")) {
-            self.serveArticle(cmd, .body);
-        } else if (startsWithIgnoreCase(cmd, "ARTICLE")) {
-            self.serveArticle(cmd, .article);
-        } else if (startsWithIgnoreCase(cmd, "HEAD")) {
-            self.serveArticle(cmd, .head);
-        } else if (startsWithIgnoreCase(cmd, "STAT")) {
-            const id = extractMessageId(cmd);
-            if (id.len != 0 and self.server.lookup(id) != null and !self.server.wouldDrop(id)) {
-                self.writeFmt("223 0 <{s}>", .{id});
-            } else {
-                self.server.missed += 1;
-                self.writeFmt("430 no such article <{s}>", .{id});
-            }
-        } else if (eqlIgnoreCase(cmd, "QUIT")) {
-            self.writeLine("205 bye");
-            self.stream.shutdownWrite();
-            self.markDead();
-        } else if (eqlIgnoreCase(cmd, "CAPABILITIES")) {
-            self.write("101 capability list follows\r\nVERSION 2\r\nREADER\r\n.\r\n");
-        } else {
-            self.writeLine("500 unknown command");
+            return;
         }
+        self.reject("501 unsupported AUTHINFO variant");
     }
 
-    fn serveArticle(self: *Session, cmd: []const u8, kind: Kind) void {
+    fn serveArticle(self: *Session, args: []const u8, kind: Kind) void {
         if (self.server.requiresAuth() and !self.authed) {
             self.writeLine("480 authentication required");
             return;
         }
-        const id = extractMessageId(cmd);
-        if (id.len == 0) {
-            self.writeLine("501 bad command");
+        // By article number is legal NNTP and deliberately unimplemented:
+        // hoardarr only ever retrieves by message-id, and a stub that
+        // guessed at a numeric argument would be inventing a corpus
+        // position the test never registered.
+        const id = parseMessageId(args) orelse {
+            self.reject("501 bad command");
             return;
-        }
+        };
+        self.noteId(id);
         const latency = self.server.opts.article_latency_ns;
         if (latency == 0) {
             self.beginSend(id, kind);
@@ -659,8 +846,42 @@ const Session = struct {
         self.server.served += 1;
     }
 
+    /// Files the line under the connection that sent it. Recorded before
+    /// it is answered, so a command that is refused — or that kills the
+    /// session — is still in the transcript a test reads.
+    fn record(self: *Session, cmd: []const u8) void {
+        self.record_at = null;
+        const gpa = self.server.gpa;
+        const copy = gpa.dupe(u8, cmd) catch return;
+        self.server.received.append(gpa, .{ .conn = self.conn, .line = copy }) catch {
+            gpa.free(copy);
+            return;
+        };
+        self.record_at = self.server.received.items.len - 1;
+    }
+
+    /// Attaches the parsed message-id to the line being dispatched. A
+    /// slice of the recorded copy, not of `self.line`, which is reused by
+    /// the next command.
+    fn noteId(self: *Session, id: []const u8) void {
+        const at = self.record_at orelse return;
+        const r = &self.server.received.items[at];
+        const off = @intFromPtr(id.ptr) - @intFromPtr(&self.line);
+        r.id = r.line[off..][0..id.len];
+    }
+
+    /// Refuses the line with `reply` and marks it refused in the
+    /// transcript, so "the client sent nothing this server understood"
+    /// is a countable outcome rather than a silent one.
+    fn reject(self: *Session, reply: []const u8) void {
+        self.server.rejected += 1;
+        if (self.record_at) |at| self.server.received.items[at].accepted = false;
+        self.writeLine(reply);
+    }
+
     fn write(self: *Session, bytes: []const u8) void {
         if (self.dead) return;
+        self.server.bytes_written += bytes.len;
         self.stream.write(bytes) catch self.markDead();
     }
 
@@ -711,17 +932,28 @@ fn appendDotStuffed(out: *std.ArrayList(u8), gpa: Allocator, body: []const u8) A
     }
 }
 
-/// `BODY <abc@host>` → `abc@host`. Empty when there is no bracketed
-/// argument, which is the only form hoardarr issues.
-fn extractMessageId(cmd: []const u8) []const u8 {
-    const lt = std.mem.indexOfScalar(u8, cmd, '<') orelse return "";
-    const gt = std.mem.lastIndexOfScalar(u8, cmd, '>') orelse return "";
-    if (gt <= lt + 1) return "";
-    return cmd[lt + 1 .. gt];
+/// The argument of a retrieval command: `<abc@host>` → `abc@host`.
+///
+/// Null for anything else, and that strictness is the point. A scan for
+/// the first '<' and the last '>' would accept `BODY junk <a@h> junk`,
+/// and worse, would accept `BODY <a@h> BODY <b@h>` as a request for one
+/// id spanning both — turning a client that failed to terminate its
+/// commands into a passing test.
+fn parseMessageId(args: []const u8) ?[]const u8 {
+    if (args.len < 3) return null;
+    if (args[0] != '<' or args[args.len - 1] != '>') return null;
+    const inner = args[1 .. args.len - 1];
+    if (inner.len == 0) return null;
+    // Whitespace or a nested bracket means this is not one message-id.
+    if (std.mem.indexOfAny(u8, inner, "<> \t") != null) return null;
+    return inner;
 }
 
-fn startsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
-    return std.ascii.startsWithIgnoreCase(haystack, prefix);
+/// Whether `line` opens with the whole of `verb`. `MODE` does not match
+/// `MODEREADER`, and `AUTHINFO USER` does not match a bare `AUTHINFO`.
+fn lineHasVerb(line: []const u8, verb: []const u8) bool {
+    if (!std.ascii.startsWithIgnoreCase(line, verb)) return false;
+    return line.len == verb.len or line[verb.len] == ' ' or line[verb.len] == '\t';
 }
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -1435,14 +1667,149 @@ test "stop tears down live connections without leaking" {
     try pumpFor(&loop, 20);
 }
 
-test "extractMessageId handles the shapes hoardarr sends" {
-    try t.expectEqualStrings("a@b", extractMessageId("BODY <a@b>"));
-    try t.expectEqualStrings("a@b", extractMessageId("ARTICLE  <a@b>  "));
-    try t.expectEqualStrings("", extractMessageId("BODY"));
-    try t.expectEqualStrings("", extractMessageId("BODY <>"));
-    try t.expectEqualStrings("", extractMessageId("BODY >a@b<"));
-    // A '>' inside the id would be illegal; the last one wins either way.
-    try t.expectEqualStrings("a>b@c", extractMessageId("BODY <a>b@c>"));
+test "parseMessageId takes the shape hoardarr sends and refuses the rest" {
+    try t.expectEqualStrings("a@b", parseMessageId("<a@b>").?);
+    try t.expect(parseMessageId("") == null);
+    try t.expect(parseMessageId("<>") == null);
+    try t.expect(parseMessageId(">a@b<") == null);
+    try t.expect(parseMessageId("123") == null);
+    // The shapes a lenient scan would have accepted: junk around the id,
+    // and two commands run together by a client that forgot its CRLF.
+    try t.expect(parseMessageId("junk <a@b>") == null);
+    try t.expect(parseMessageId("<a@b> junk") == null);
+    try t.expect(parseMessageId("<a@b> BODY <c@d>") == null);
+    try t.expect(parseMessageId("<a>b@c>") == null);
+}
+
+test "lineHasVerb matches whole verbs only" {
+    try t.expect(lineHasVerb("BODY <a@h>", "BODY"));
+    try t.expect(lineHasVerb("body <a@h>", "BODY"));
+    try t.expect(lineHasVerb("QUIT", "QUIT"));
+    try t.expect(lineHasVerb("AUTHINFO USER x", "AUTHINFO USER"));
+    try t.expect(!lineHasVerb("AUTHINFO PASS x", "AUTHINFO USER"));
+    try t.expect(!lineHasVerb("BODYGUARD <a@h>", "BODY"));
+    try t.expect(!lineHasVerb("MODEREADER", "MODE"));
+}
+
+test "a verb that only looks like a command is refused, not served" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+
+    try h.server.addArticle("a@h", "body\r\n");
+
+    // The leniency this closes: a prefix match answered `BODYGUARD` with
+    // the article, so a client whose command was truncated or corrupted
+    // on the way out still saw a 222 and a body.
+    try h.client.send("BODYGUARD <a@h>");
+    try h.awaitText("500 unknown command");
+    try t.expectEqual(@as(usize, 0), h.server.served);
+
+    // A retrieval with junk around the id is a 501, not a fetch.
+    try h.client.send("BODY <a@h> BODY <a@h>");
+    try h.awaitText("501 bad command");
+    try t.expectEqual(@as(usize, 0), h.server.served);
+
+    // An unimplemented MODE gets 501, never the reader-mode answer.
+    try h.client.send("MODE STREAM");
+    try h.awaitText("501 unsupported MODE");
+
+    try t.expectEqual(@as(usize, 3), h.server.rejected);
+    // And the whole exchange is on the record, with none of it accepted.
+    try t.expectEqual(@as(usize, 3), h.server.received.items.len);
+    for (h.server.received.items) |r| try t.expect(!r.accepted);
+
+    // The session is still usable: strictness refuses a command, it does
+    // not poison the connection.
+    try h.client.send("BODY <a@h>");
+    try h.awaitText("222 0 <a@h>");
+}
+
+test "AUTHINFO PASS before AUTHINFO USER is out of sequence" {
+    var h: Harness = undefined;
+    try h.init(.{ .username = "alice", .password = "s3cret" });
+    defer h.deinit();
+
+    try h.server.addArticle("g@h", "body\r\n");
+
+    // Out of order: the old server matched the empty username buffer
+    // against the configured one and answered 481, which reads like a
+    // credential problem rather than a client that skipped a step.
+    try h.client.send("AUTHINFO PASS s3cret");
+    try h.awaitText("482 authentication commands out of sequence");
+    try h.client.send("BODY <g@h>");
+    try h.awaitText("480 authentication required");
+
+    // In order, it works — and PASS is spent, so a second one without a
+    // fresh USER is out of sequence again.
+    try h.client.send("AUTHINFO USER alice");
+    try h.awaitText("381 enter password");
+    try h.client.send("AUTHINFO PASS s3cret");
+    try h.awaitText("281 authentication accepted");
+    try h.client.send("AUTHINFO PASS s3cret");
+    try h.awaitText("482 ");
+
+    try h.client.send("AUTHINFO SASL PLAIN");
+    try h.awaitText("501 unsupported AUTHINFO variant");
+}
+
+test "the transcript records what the client sent, per connection" {
+    var loop: reactor.Loop = undefined;
+    try loop.init(t.allocator);
+    defer loop.deinit();
+
+    var srv: Server = undefined;
+    const p = try srv.start(t.allocator, &loop, .{});
+    defer srv.deinit();
+    try srv.addArticle("one@h", "1\r\n");
+    try srv.addArticle("two@h", "2\r\n");
+
+    var c1: Client = .{ .gpa = t.allocator };
+    defer c1.deinit();
+    var c2: Client = .{ .gpa = t.allocator };
+    defer c2.deinit();
+    try c1.connect(&loop, p);
+    try c2.connect(&loop, p);
+    try pumpUntil(&loop, 2000, &c2, struct {
+        fn f(c: *Client) bool {
+            return c.rx.items.len > 0;
+        }
+    }.f);
+
+    try c1.send("MODE READER");
+    try c1.send("BODY <one@h>");
+    try c2.send("BODY <two@h>");
+    try c2.send("BODY <two@h>");
+    try pumpUntil(&loop, 2000, &srv, struct {
+        fn f(s: *Server) bool {
+            return s.served == 3;
+        }
+    }.f);
+
+    // Each connection's own conversation, in order.
+    const first = try srv.commandSequence(t.allocator, 1);
+    defer t.allocator.free(first);
+    try t.expectEqual(@as(usize, 2), first.len);
+    try t.expectEqualStrings("MODE READER", first[0]);
+    try t.expectEqualStrings("BODY <one@h>", first[1]);
+
+    const second = try srv.commandSequence(t.allocator, 2);
+    defer t.allocator.free(second);
+    try t.expectEqual(@as(usize, 2), second.len);
+
+    try t.expectEqual(@as(usize, 1), srv.countVerb("MODE READER"));
+    try t.expectEqual(@as(usize, 3), srv.countVerb("BODY"));
+    try t.expect(!srv.sawVerb("AUTHINFO"));
+
+    try t.expectEqual(@as(usize, 1), srv.requestCount("one@h"));
+    try t.expectEqual(@as(usize, 2), srv.requestCount("two@h"));
+    try t.expect(!srv.wasRequested("three@h"));
+
+    const ids = try srv.requestedIds(t.allocator);
+    defer t.allocator.free(ids);
+    try t.expectEqual(@as(usize, 2), ids.len);
+    try t.expectEqualStrings("one@h", ids[0]);
+    try t.expectEqualStrings("two@h", ids[1]);
 }
 
 test "dot stuffing matches the transport rules" {

@@ -78,6 +78,31 @@ pub const default_deadline_ns: u64 = 20 * std.time.ns_per_s;
 /// key-generation path is covered by `bootstrap.zig`'s unit tests.
 pub const api_key = "0123456789abcdef0123456789abcdef";
 
+/// Where each bounded context's ids start in a harness database.
+///
+/// A job, its verify set, its repair attempt and its delivery are four
+/// different counters that all start at 1. In a test that runs one job
+/// they therefore all *are* 1, and a stage that routes on the wrong one
+/// still lands on the right job — which is precisely how the post-download
+/// pipeline spent months keying on the publishing context's aggregate id
+/// instead of the job id with a green suite. Numbers this far apart, and
+/// none of them 0 or 1, turn that confusion into a wrong answer: an event
+/// routed by a verify-set id names a job that does not exist, and the
+/// pipeline stops instead of quietly working on a stranger.
+///
+/// Do not collapse these back to 1 "for readability" — the readability is
+/// what the bug hid behind.
+pub const id_offset = struct {
+    pub const job: i64 = 1_400;
+    pub const verify_set: i64 = 2_700;
+    pub const repair: i64 = 5_100;
+    pub const delivery: i64 = 8_300;
+};
+
+/// The job the offset sentinels are parked under. Negative, so it can
+/// never be a real job's id and no query keyed on one can reach them.
+const sentinel_job: i64 = -1;
+
 /// A booted daemon, its data directory, and the loop everything shares.
 ///
 /// Heap-allocated in `init` and never moved: the reactor stores
@@ -170,6 +195,7 @@ pub const Harness = struct {
         app.db = try sqlite.Conn.open(gpa, db_path, .{});
         errdefer app.db.close();
         try migrate.migrate(app.db);
+        try seedIdOffsets(app.db);
 
         try app.wire();
         app.started = true;
@@ -300,12 +326,18 @@ pub const Harness = struct {
         const port = try self.startNntp(net);
         try self.serveRelease();
 
+        // The row carries whatever the fake provider demands, so a test
+        // that asks for a provider requiring credentials gets a daemon
+        // configured to present them — and one that does not gets a
+        // daemon that must not send AUTHINFO at all.
         var row = try dserver.UsenetServer.init(self.gpa, .{
             .name = "stub",
             .host = "127.0.0.1",
             .port = @intCast(port),
             .tls = false,
             .max_conns = 4,
+            .username = net.username,
+            .password = net.password,
         }, infra.nowMillis());
         defer row.deinit();
         try repo_server.ServerRepo.init(self.gpa, self.app.db).save(&row);
@@ -315,7 +347,20 @@ pub const Harness = struct {
 
     /// Registers every article of the release with the running provider.
     pub fn serveRelease(self: *Harness) !void {
-        const r = self.release orelse return;
+        // Captured by pointer: a `Fixture` owns an arena, and a by-value
+        // copy of one is a second owner of the same allocator state.
+        if (self.release) |*r| try self.serveFixture(r);
+    }
+
+    /// The same for a release the *caller* owns.
+    ///
+    /// The harness holds one release because almost every test wants
+    /// exactly one. A test that needs several jobs in flight needs
+    /// several *distinct* releases — `add_job` dedupes on the SHA-256 of
+    /// the NZB bytes and hands back the existing job's id, so N adds of
+    /// one release are one job — and it owns them itself rather than the
+    /// harness growing a collection for one caller.
+    pub fn serveFixture(self: *Harness, r: *const tsfixture.Fixture) !void {
         const s = self.nntp orelse return;
         for (r.articles) |a| try s.addArticle(a.message_id, a.body);
     }
@@ -323,7 +368,13 @@ pub const Harness = struct {
     /// Queues the generated release through the same REST port the API
     /// uses, and returns its job id.
     pub fn addRelease(self: *Harness, name: []const u8) !i64 {
-        const r = self.release orelse return error.NoRelease;
+        if (self.release) |*r| return self.addFixture(r, name);
+        return error.NoRelease;
+    }
+
+    /// `addRelease` against a caller-owned release.
+    pub fn addFixture(self: *Harness, r: *const tsfixture.Fixture, name: []const u8) !i64 {
+        try self.nudgeJobIds();
         const added = try self.app.p_queue.port().add(self.app.api.beginRequest(), .{
             .nzb = r.nzb,
             .name = name,
@@ -332,7 +383,92 @@ pub const Harness = struct {
             .category = "",
             .source = "e2e",
         });
+        try self.dropJobIdSentinel();
         return added.id;
+    }
+
+    /// Pushes the `jobs` rowid counter past `id_offset.job` before the
+    /// first job is created.
+    ///
+    /// A parked row, unlike the other three contexts, cannot stay: every
+    /// queue and history listing reads the table unfiltered, so a
+    /// sentinel job would show up in the API a test is asserting on. It
+    /// only has to outlive the insert that follows it — after that the
+    /// real job is the maximum and the counter never falls back.
+    fn nudgeJobIds(self: *Harness) !void {
+        const max = try self.app.db.scalarIntOr("SELECT COALESCE(MAX(id), 0) FROM jobs", .{}, 0);
+        if (max >= id_offset.job) return;
+        try self.app.db.execute(
+            \\INSERT INTO jobs(id, nzb_hash, name, queue_order, state, total_bytes, added_at, nzb_blob)
+            \\VALUES (?, 'id-offset-sentinel', 'id offset sentinel', 0, 'failed', 0, 0, x'')
+        , .{id_offset.job});
+    }
+
+    fn dropJobIdSentinel(self: *Harness) !void {
+        try self.app.db.execute(
+            "DELETE FROM jobs WHERE id = ? AND nzb_hash = 'id-offset-sentinel'",
+            .{id_offset.job},
+        );
+    }
+
+    /// The post-download aggregates a job produced. Zero where that
+    /// context never ran for the job.
+    pub const AggregateIds = struct {
+        job: i64,
+        verify_set: i64,
+        repair: i64,
+        delivery: i64,
+    };
+
+    pub fn aggregateIds(self: *Harness, job_id: i64) !AggregateIds {
+        return .{
+            .job = job_id,
+            .verify_set = try self.app.db.scalarIntOr(
+                "SELECT id FROM par2_sets WHERE job_id = ?",
+                .{job_id},
+                0,
+            ),
+            .repair = try self.app.db.scalarIntOr(
+                "SELECT id FROM repairs WHERE job_id = ?",
+                .{job_id},
+                0,
+            ),
+            .delivery = try self.app.db.scalarIntOr(
+                "SELECT id FROM deliveries WHERE job_id = ?",
+                .{job_id},
+                0,
+            ),
+        };
+    }
+
+    /// Asserts that the ids a test is about to route events by are
+    /// genuinely telling apart — the precondition every "the right job
+    /// got the event" assertion silently depends on. A context that did
+    /// not run for this job (id 0) is skipped rather than failed.
+    pub fn expectIdsDistinct(self: *Harness, job_id: i64) !void {
+        const ids = try self.aggregateIds(job_id);
+        const named = [_]struct { name: []const u8, id: i64 }{
+            .{ .name = "job", .id = ids.job },
+            .{ .name = "verify set", .id = ids.verify_set },
+            .{ .name = "repair", .id = ids.repair },
+            .{ .name = "delivery", .id = ids.delivery },
+        };
+        for (named, 0..) |a, i| {
+            if (a.id == 0) continue;
+            if (a.id == 1) {
+                std.debug.print("\nthe {s} id is 1; the offsets did not take\n", .{a.name});
+                return error.AggregateIdsCoincide;
+            }
+            for (named[i + 1 ..]) |b| {
+                if (b.id == 0) continue;
+                if (a.id != b.id) continue;
+                std.debug.print(
+                    "\nthe {s} id and the {s} id are both {d}; a stage routing on the wrong one would pass\n",
+                    .{ a.name, b.name, a.id },
+                );
+                return error.AggregateIdsCoincide;
+            }
+        }
     }
 
     // -- job progress ----------------------------------------------------
@@ -441,8 +577,16 @@ pub const Harness = struct {
     /// while the output is corrupt, which is why this — not the state —
     /// is what a download test ends on.
     pub fn expectDeliveredMatchesRelease(self: *Harness, name: []const u8) !void {
-        const r = self.release orelse return error.NoRelease;
+        if (self.release) |*r| return self.expectDeliveredMatches(r, name);
+        return error.NoRelease;
+    }
 
+    /// `expectDeliveredMatchesRelease` against a caller-owned release.
+    pub fn expectDeliveredMatches(
+        self: *Harness,
+        r: *const tsfixture.Fixture,
+        name: []const u8,
+    ) !void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -673,6 +817,36 @@ pub const Harness = struct {
 // ---------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------
+
+/// Parks one row in each post-download table so its rowid counter starts
+/// past `id_offset`.
+///
+/// The rows have to stay there. SQLite hands out `max(rowid) + 1` over
+/// the rows that currently exist, so deleting a sentinel would hand the
+/// offset straight back to the next insert. They are attached to a job id
+/// no job can have, with foreign keys off for the insert alone, and each
+/// is in a terminal state — the recovery scans look for pending and
+/// in-flight rows, and nothing else reads these tables without a job id.
+///
+/// `INSERT OR IGNORE` because `restart` boots over the same file and must
+/// find the offsets already in place rather than fail on the primary key.
+fn seedIdOffsets(db: *sqlite.Conn) !void {
+    try db.exec("PRAGMA foreign_keys = OFF");
+    defer db.exec("PRAGMA foreign_keys = ON") catch {};
+
+    try db.execute(
+        \\INSERT OR IGNORE INTO par2_sets(id, job_id, state, error_msg)
+        \\VALUES (?, ?, 'failed', 'id offset sentinel')
+    , .{ id_offset.verify_set, sentinel_job });
+    try db.execute(
+        \\INSERT OR IGNORE INTO repairs(id, job_id, state, err_msg, created_at)
+        \\VALUES (?, ?, 'failed', 'id offset sentinel', 0)
+    , .{ id_offset.repair, sentinel_job });
+    try db.execute(
+        \\INSERT OR IGNORE INTO deliveries(id, job_id, state, err_msg, created_at)
+        \\VALUES (?, ?, 'skipped', 'id offset sentinel', 0)
+    , .{ id_offset.delivery, sentinel_job });
+}
 
 /// Whole file contents. Caller owns the bytes.
 pub fn readFile(gpa: Allocator, path: []const u8) ![]u8 {

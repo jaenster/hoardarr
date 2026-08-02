@@ -672,6 +672,14 @@ pub const Conn = struct {
 /// unexpected command fails the test rather than being tolerated, because
 /// a client that sends the wrong thing and still passes is worse than no
 /// test at all.
+///
+/// Once the conversation has gone off script the stub stops answering
+/// altogether, on every connection. A stub that kept replying would let
+/// the client finish its exchange and the test then assert happily on the
+/// bytes that came back — which is the failure mode a scripted peer is
+/// most prone to, because the script does not depend on the client having
+/// sent anything at all. Every line is kept in `received` so a test can
+/// assert on what was asked rather than only on what was answered.
 pub const StubServer = struct {
     listener: socket.Listener,
     loop: *reactor.Loop,
@@ -681,8 +689,14 @@ pub const StubServer = struct {
 
     conns: std.ArrayList(*StubConn) = .empty,
     accepted: usize = 0,
-    /// Set when a client sent something the script didn't expect.
+    /// Set when a client sent something the script didn't expect. Holds
+    /// the reason; `unexpected` holds the line that caused it.
     desync: ?[]const u8 = null,
+    /// The offending line, terminator stripped. Owned.
+    unexpected: ?[]u8 = null,
+    /// Every command line, in arrival order, across all connections.
+    /// Owned.
+    received: std.ArrayList([]u8) = .empty,
 
     pub const Exchange = struct {
         /// Matched as a prefix, case-insensitively, against the command
@@ -711,7 +725,15 @@ pub const StubServer = struct {
         fn onReadable(s: *socket.Stream) void {
             const self: *StubConn = @fieldParentPtr("stream", s);
             while (true) {
-                if (self.in_len == self.in.len) return;
+                // A line longer than the buffer is a client bug, not a
+                // reason to stall: returning silently used to leave the
+                // test waiting on a reply for a command the stub had
+                // decided to ignore.
+                if (self.in_len == self.in.len) {
+                    self.server.fail("command line longer than the stub's buffer", self.in[0..self.in_len]);
+                    self.in_len = 0;
+                    return;
+                }
                 const n = s.read(self.in[self.in_len..]) catch return;
                 if (n == 0) return;
                 self.in_len += n;
@@ -728,16 +750,23 @@ pub const StubServer = struct {
         }
 
         fn respond(self: *StubConn, line: []const u8) void {
+            const trimmed = std.mem.trimEnd(u8, line, "\r\n");
+            self.server.note(trimmed);
+
+            // Latched: after one wrong command the stub answers nothing
+            // more, so the client fails on the command it got wrong
+            // instead of on some later one.
+            if (self.server.desync != null) return;
+
             if (self.step >= self.server.script.len) {
-                self.server.desync = "more commands than the script expected";
+                self.server.fail("more commands than the script expected", trimmed);
                 return;
             }
             const ex = self.server.script[self.step];
             self.step += 1;
 
-            const trimmed = std.mem.trimEnd(u8, line, "\r\n");
             if (!std.ascii.startsWithIgnoreCase(trimmed, ex.expect)) {
-                self.server.desync = ex.expect;
+                self.server.fail(ex.expect, trimmed);
                 return;
             }
             if (ex.then_close) {
@@ -779,8 +808,47 @@ pub const StubServer = struct {
             self.gpa.destroy(c);
         }
         self.conns.deinit(self.gpa);
+        for (self.received.items) |line| self.gpa.free(line);
+        self.received.deinit(self.gpa);
+        if (self.unexpected) |u| self.gpa.free(u);
         self.loop.remove(&self.listener.source);
         self.listener.close();
+    }
+
+    /// Records a command line. Recording is unconditional — the lines
+    /// sent *after* things went wrong are usually what explains why.
+    fn note(self: *StubServer, line: []const u8) void {
+        const copy = self.gpa.dupe(u8, line) catch return;
+        self.received.append(self.gpa, copy) catch self.gpa.free(copy);
+    }
+
+    /// Latches the first desync. Later ones are consequences of it.
+    fn fail(self: *StubServer, reason: []const u8, line: []const u8) void {
+        if (self.desync != null) return;
+        self.desync = reason;
+        self.unexpected = self.gpa.dupe(u8, line) catch null;
+    }
+
+    /// Fails the test when the client went off script, naming both what
+    /// was expected and what arrived.
+    ///
+    /// Worth calling even in a test that already asserts on the reply
+    /// bytes: those come from the script, so they are the same whether
+    /// the client sent the right command, the wrong one, or nothing at
+    /// all past its own buffer.
+    pub fn expectClean(self: *const StubServer) !void {
+        const reason = self.desync orelse return;
+        std.debug.print("\nthe stub went off script: expected '{s}', got '{s}'\n", .{
+            reason,
+            self.unexpected orelse "<nothing>",
+        });
+        for (self.received.items) |line| std.debug.print("  sent: {s}\n", .{line});
+        return error.StubDesync;
+    }
+
+    /// The command lines the client sent, in order.
+    pub fn commands(self: *const StubServer) []const []u8 {
+        return self.received.items;
     }
 
     fn onAccept(l: *socket.Listener, fd: sys.Fd) void {
@@ -885,7 +953,15 @@ test "handshake without credentials reaches ready" {
 
     try testing.expectEqual(@as(?Error, null), client.err);
     try testing.expect(client.ready);
-    try testing.expectEqual(@as(?[]const u8, null), stub.desync);
+    try stub.expectClean();
+
+    // With no username configured the handshake is MODE READER and
+    // nothing else. Asserting on the reply alone could not see an
+    // AUTHINFO here: the script answers "200 reader mode" to whatever
+    // arrives first, so a client that offered an empty credential would
+    // reach ready just the same.
+    try testing.expectEqual(@as(usize, 1), stub.commands().len);
+    try testing.expectEqualStrings("MODE READER", stub.commands()[0]);
 }
 
 test "AUTHINFO USER then PASS" {
@@ -917,7 +993,13 @@ test "AUTHINFO USER then PASS" {
 
     try testing.expectEqual(@as(?Error, null), client.err);
     try testing.expect(client.ready);
-    try testing.expectEqual(@as(?[]const u8, null), stub.desync);
+    try stub.expectClean();
+
+    // The whole conversation, in order and with the credentials in it.
+    try testing.expectEqual(@as(usize, 3), stub.commands().len);
+    try testing.expectEqualStrings("AUTHINFO USER alice", stub.commands()[0]);
+    try testing.expectEqualStrings("AUTHINFO PASS s3cret", stub.commands()[1]);
+    try testing.expectEqualStrings("MODE READER", stub.commands()[2]);
 }
 
 test "username alone accepted with 281 skips PASS" {

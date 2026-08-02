@@ -98,6 +98,29 @@ test "multiserver: a primary answering 430 fails over, and the bytes are billed 
     try testing.expectEqual(@as(usize, 0), fx.provider().served);
     try testing.expect(secondary.served > 0);
 
+    // Asked for *what*, though: every article of the release went to the
+    // primary first and only then to the secondary. Counting refusals
+    // cannot tell "tried the primary for each segment" apart from "tried
+    // it once, gave up on it, and fetched the rest from the secondary" —
+    // and those are different failover policies.
+    for (fx.release.?.articles) |a| {
+        if (!fx.provider().wasRequested(a.message_id)) {
+            std.debug.print("\nthe primary was never asked for {s}\n", .{a.message_id});
+            return error.PrimaryNotTriedForEverySegment;
+        }
+        if (!secondary.wasRequested(a.message_id)) {
+            std.debug.print("\nthe secondary was never asked for {s}\n", .{a.message_id});
+            return error.SecondaryNotAskedForEverySegment;
+        }
+    }
+    // Neither provider saw anything it could not parse.
+    try testing.expectEqual(@as(usize, 0), fx.provider().rejected);
+    try testing.expectEqual(@as(usize, 0), secondary.rejected);
+    // No credentials are configured on either row, so neither may be
+    // offered any.
+    try testing.expect(!fx.provider().sawVerb("AUTHINFO"));
+    try testing.expect(!secondary.sawVerb("AUTHINFO"));
+
     // The bytes match, so the failover delivered the real article and
     // not an empty body the pipeline papered over.
     try fx.expectDeliveredMatchesRelease(release_name);
