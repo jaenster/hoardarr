@@ -32,7 +32,7 @@ jobs:
           - x86_64-macos
           - aarch64-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # `git describe` needs the full history.
           fetch-depth: 0

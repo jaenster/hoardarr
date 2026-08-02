@@ -20,7 +20,7 @@ jobs:
     name: build + push multi-arch image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # No QEMU. The builder cross-compiles with -Dtarget on the native
       # runner and the runtime stage is `scratch` plus one static binary,
