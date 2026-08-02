@@ -312,6 +312,12 @@ pub const Ctx = struct {
     /// For a prefix route, the path with the prefix removed. Empty for an
     /// exact route.
     tail: []const u8 = "",
+    /// The request path the router matched on: `req.path` with `url_base`
+    /// stripped. A handler that looks a path up in a table of its own —
+    /// the embedded frontend does — has to use this rather than
+    /// `req.path`, or every lookup misses under a non-empty base and the
+    /// SPA fallback quietly answers with `index.html`.
+    routed_path: []const u8 = "/",
 
     /// The application object the server was wired with.
     pub fn app(self: *Ctx, comptime T: type) *T {
@@ -897,6 +903,7 @@ pub const Conn = struct {
             .req = req,
             .res = &self.res,
             .tail = if (route.kind == .prefix) path[route.path.len..] else "",
+            .routed_path = path,
         };
 
         route.handler(&ctx) catch |err| {
@@ -1300,6 +1307,10 @@ fn handleTail(ctx: *Ctx) HandlerError!void {
     try ctx.res.send(200, "text/plain", ctx.tail);
 }
 
+fn handleRoutedPath(ctx: *Ctx) HandlerError!void {
+    try ctx.res.send(200, "text/plain", ctx.routed_path);
+}
+
 const test_routes = [_]Route{
     .{ .method = .get, .path = "/api/v1/health", .handler = handleHealth, .access = .public },
     .{ .method = .get, .path = "/healthz", .handler = handleHealth, .access = .public },
@@ -1307,6 +1318,7 @@ const test_routes = [_]Route{
     .{ .method = .post, .path = "/api/v1/echo", .handler = handleEcho, .access = .public },
     .{ .method = .put, .path = "/api/v1/echo", .handler = handleEcho, .access = .public },
     .{ .path = "/files/", .kind = .prefix, .handler = handleTail, .access = .public },
+    .{ .path = "/routed/", .kind = .prefix, .handler = handleRoutedPath, .access = .public },
     .{ .path = "/", .kind = .prefix, .handler = handleOk, .access = .public },
 };
 
@@ -1567,6 +1579,38 @@ test "url_base strips the prefix, redirects the root and 404s outside" {
     const healthz = try h.exchange(gpa, "GET /healthz HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
     defer healthz.destroy();
     try testing.expectEqual(@as(?u16, 200), healthz.status());
+}
+
+test "a handler that looks paths up itself is given the path the router matched" {
+    // The embedded frontend resolves `routed_path` against a table whose
+    // keys are unprefixed. Handing it `req.path` under a `url_base` makes
+    // every lookup miss, and because the asset route falls back to
+    // `index.html` for unknown paths, the script and the stylesheet come
+    // back as the HTML document — a 200 for every request and a blank
+    // page. Nothing in the suite noticed until a browser did.
+    const gpa = testing.allocator;
+    var h: Harness = .{ .api_key = "k" };
+    try h.start(gpa, &test_routes, .{});
+    defer h.deinit();
+    h.server.url_base = "/hoardarr";
+
+    const mounted = try h.exchange(gpa, "GET /hoardarr/routed/assets/app.js HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    defer mounted.destroy();
+    try testing.expectEqual(@as(?u16, 200), mounted.status());
+    try testing.expect(std.mem.endsWith(u8, mounted.got.items, "/routed/assets/app.js"));
+    // The mount prefix must be gone, not merely trailed by the right
+    // suffix: `req.path` ends the same way and would satisfy a weaker
+    // assertion while being exactly the value that breaks the lookup.
+    try testing.expect(std.mem.indexOf(u8, mounted.got.items, "/hoardarr/routed") == null);
+
+    // And with no base the same handler sees the same thing, so a lookup
+    // written against `routed_path` cannot be right in only one of the
+    // two deployments.
+    h.server.url_base = "";
+    const rooted = try h.exchange(gpa, "GET /routed/assets/app.js HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    defer rooted.destroy();
+    try testing.expectEqual(@as(?u16, 200), rooted.status());
+    try testing.expect(std.mem.endsWith(u8, rooted.got.items, "/routed/assets/app.js"));
 }
 
 // -- keep-alive and bodies --------------------------------------------

@@ -159,6 +159,7 @@ pub const app = struct {
 
 pub const api = struct {
     pub const sse = @import("api/sse.zig");
+    pub const ui = @import("api/ui.zig");
     pub const metrics = @import("api/metrics.zig");
     pub const rest = struct {
         pub const json = @import("api/rest/json.zig");
@@ -347,6 +348,7 @@ test {
     _ = app.notify.webhook;
     _ = app.notify.service;
     _ = api.sse;
+    _ = api.ui;
     _ = api.metrics;
     _ = api.rest.json;
     _ = api.rest.ratelimit;

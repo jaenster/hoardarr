@@ -104,6 +104,7 @@ const files = @import("bootstrap/files.zig");
 const pipeline = @import("bootstrap/pipeline.zig");
 const offload_mod = @import("bootstrap/offload.zig");
 const runtime_mod = @import("bootstrap/runtime.zig");
+const ui = @import("api/ui.zig");
 
 const Allocator = std.mem.Allocator;
 const Api = rest_api.Api;
@@ -140,6 +141,10 @@ pub const App = struct {
     db: *sqlite.Conn = undefined,
     bus: *outbox.Bus = undefined,
     server: http.Server = undefined,
+    /// Assets with the frontend's base sentinel resolved to the mount
+    /// path. Owned here rather than by `Api` because it caches across
+    /// requests and has to be freed at teardown; `Api` borrows it.
+    ui_assets: ui.Rewriter = undefined,
     sigs: signals.Signals = undefined,
     /// Whether `sigs` was initialised. A test boots the graph without
     /// signal handling, and tearing down an uninitialised `Signals` would
@@ -275,6 +280,7 @@ pub const App = struct {
         // graph, and only then close the database. Closing it earlier
         // would leave an in-flight handler dereferencing it.
         self.server.deinit();
+        self.ui_assets.deinit();
         self.events_hub.closeAll(.shutdown);
         self.logs_hub.closeAll(.shutdown);
 
@@ -675,6 +681,9 @@ pub const App = struct {
         // ---- the API object ----
         self.api = Api.init(gpa);
         errdefer self.api.deinit();
+
+        self.ui_assets = .{ .gpa = gpa };
+        self.api.ui_assets = &self.ui_assets;
 
         self.api.queue = self.p_queue.port();
         self.api.events = self.p_events.port();
@@ -1555,12 +1564,32 @@ fn handleAsset(ctx: *http.Ctx) http.HandlerError!void {
         return;
     }
 
-    const req_path = ctx.req.path;
+    // `routed_path`, not `req.path`: under a `url_base` the request still
+    // carries the mount prefix, which is in no asset's name, so every
+    // lookup would miss and the SPA fallback would answer `index.html`
+    // for the script and the stylesheet too.
+    const req_path = ctx.routed_path;
     const path = if (req_path.len == 0 or std.mem.eql(u8, req_path, "/")) "/index.html" else req_path;
     const asset = assets.find(path) orelse assets.find("/index.html") orelse {
         try ctx.res.send(404, "application/json", "{\"error\":\"not found\"}");
         return;
     };
+
+    // Anything carrying the frontend's base sentinel has to be served
+    // from the rewritten copy, or the browser is handed URLs that 404 and
+    // the page renders empty behind a 200. See `bootstrap/ui.zig`.
+    if (ctx.app(Api).uiAsset(ctx.server.url_base, asset.path)) |rewritten| {
+        if (rewritten.gz) |gz| {
+            if (acceptsGzip(ctx)) {
+                try ctx.res.setHeader("Content-Encoding", "gzip");
+                try ctx.res.setHeader("Vary", "Accept-Encoding");
+                try ctx.res.send(200, rewritten.content_type, gz);
+                return;
+            }
+        }
+        try ctx.res.send(200, rewritten.content_type, rewritten.raw);
+        return;
+    }
 
     if (asset.gz) |gz| {
         if (acceptsGzip(ctx)) {

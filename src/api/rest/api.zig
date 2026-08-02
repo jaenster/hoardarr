@@ -16,6 +16,7 @@ const sse = @import("../sse.zig");
 const metrics = @import("../metrics.zig");
 const ports = @import("ports.zig");
 const ratelimit = @import("ratelimit.zig");
+const ui = @import("../ui.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,6 +46,11 @@ pub const Api = struct {
     disk: ?ports.DiskSpace = null,
     subscriptions: ?ports.Subscriptions = null,
     config: ?ports.RuntimeConfig = null,
+
+    /// Assets rewritten for the mount path, owned by the composition
+    /// root. Null in a build with no frontend and in tests that never
+    /// serve one, in which case the embedded bytes are served as-is.
+    ui_assets: ?*ui.Rewriter = null,
     bandwidth: ?ports.Bandwidth = null,
     auth: ?ports.Auth = null,
 
@@ -137,5 +143,13 @@ pub const Api = struct {
 
     pub fn now(self: *const Api) u64 {
         return self.nowFn();
+    }
+
+    /// The copy of `path` with the frontend's base sentinel resolved to
+    /// `base`, or null when this asset carries no sentinel and the
+    /// embedded bytes are already correct.
+    pub fn uiAsset(self: *Api, base: []const u8, path: []const u8) ?*const ui.Rewriter.Entry {
+        const rw = self.ui_assets orelse return null;
+        return rw.find(base, path);
     }
 };
